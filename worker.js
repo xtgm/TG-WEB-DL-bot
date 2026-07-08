@@ -1,5 +1,9 @@
 const COOKIE_NAME = "tg_dualbot_session";
 const DEFAULT_PANEL_USER = "admin";
+const VERIFY_SESSION_HOURS = 24;
+const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
+let verificationSchemaReady = false;
 
 export default {
     async fetch(request, env, ctx) {
@@ -27,11 +31,21 @@ export async function handleRequest(request, env, ctx) {
     if (path === "/telegram/webhook" && method === "POST") {
         return telegramWebhook(request, env);
     }
+    if (path === "/verify/ip-probe" && method === "GET") {
+        return verifyIpProbe(request);
+    }
+    let verifyMatch = path.match(/^\/verify\/([A-Za-z0-9_-]{8,80})$/);
+    if (verifyMatch && method === "GET") {
+        return html(await verifyPage(request, env, verifyMatch[1]));
+    }
+    if (verifyMatch && method === "POST") {
+        return verifySubmit(request, env, verifyMatch[1]);
+    }
     if (path === "/verify" && method === "GET") {
-        return html(verifyPage(request, env));
+        return html(await verifyPage(request, env, "", "请从 Telegram 内的验证按钮打开页面。"));
     }
     if (path === "/verify" && method === "POST") {
-        return verifySubmit(request, env);
+        return verifySubmit(request, env, "");
     }
     if (path === "/login" && method === "GET") {
         if (await isLoggedIn(request, env)) return redirect("/", request);
@@ -75,6 +89,9 @@ export async function handleRequest(request, env, ctx) {
 
     match = path.match(/^\/users\/(-?\d+)\/unblock$/);
     if (match && method === "POST") return userBlockSet(request, env, Number(match[1]), false);
+
+    match = path.match(/^\/users\/(-?\d+)\/unverify$/);
+    if (match && method === "POST") return userVerifyCancel(request, env, Number(match[1]));
 
     return html(layout("未找到", `<div class="card"><p>页面不存在。</p></div>`), 404);
 }
@@ -218,9 +235,11 @@ pre{white-space:pre-wrap;background:#0f172a;color:#e2e8f0;border-radius:10px;pad
 }
 
 async function dashboard(request, env) {
+    await ensureVerificationSchema(env);
     const stats = await Promise.all([
         scalar(env, "SELECT COUNT(*) FROM users"),
         scalar(env, "SELECT COUNT(*) FROM users WHERE blocked=1"),
+        scalar(env, "SELECT COUNT(*) FROM users WHERE verified=1"),
         scalar(env, "SELECT COUNT(*) FROM inbox_messages"),
         scalar(env, "SELECT COUNT(*) FROM ip_verifications WHERE passed=1"),
     ]);
@@ -228,11 +247,12 @@ async function dashboard(request, env) {
     const body = `<div class="grid">
 <div class="card"><div class="muted">用户数</div><div class="metric">${stats[0]}</div></div>
 <div class="card"><div class="muted">封禁用户</div><div class="metric">${stats[1]}</div></div>
-<div class="card"><div class="muted">消息记录</div><div class="metric">${stats[2]}</div></div>
-<div class="card"><div class="muted">CF 验证通过</div><div class="metric">${stats[3]}</div></div>
+<div class="card"><div class="muted">已验证用户</div><div class="metric">${stats[2]}</div></div>
+<div class="card"><div class="muted">消息记录</div><div class="metric">${stats[3]}</div></div>
+<div class="card"><div class="muted">CF 验证通过</div><div class="metric">${stats[4]}</div></div>
 </div>
-<div class="card"><h2>项目状态</h2><p class="muted">当前版本提供 Telegram 私聊双向通信、管理员回复、收件箱、用户管理、备注、封禁、广告拦截、多管理员、Cloudflare Turnstile 验证和 IP 记录，并同时支持 Workers 和 Pages Functions 部署。</p>
-<p><b>公开地址：</b><code>${h(base)}</code></p><p><b>验证页：</b><code>${h(`${base}/verify`)}</code></p></div>`;
+<div class="card"><h2>项目状态</h2><p class="muted">当前版本提供 Telegram 私聊双向通信、验证后聊天门禁、管理员回复、收件箱、用户管理、备注、封禁、广告拦截、多管理员、Cloudflare Turnstile 验证、IPv4/IPv6/UDP WebRTC 记录，并同时支持 Workers 和 Pages Functions 部署。</p>
+<p><b>公开地址：</b><code>${h(base)}</code></p><p><b>验证入口：</b><code>${h(`${base}/verify/{token}`)}</code></p></div>`;
     return html(layout("总览", body));
 }
 
@@ -283,16 +303,29 @@ async function retryInbox(request, env, id) {
 }
 
 async function usersPage(request, env) {
+    await ensureVerificationSchema(env);
     const rows = await env.DB.prepare("SELECT * FROM users ORDER BY updated_at DESC LIMIT 300").all();
     const bodyRows = (rows.results || []).map((u) => {
-        const status = u.blocked ? `<span class="badge red">封禁</span>` : `<span class="badge green">正常</span>`;
+        const status = u.blocked ? `<span class="badge red">封禁</span>` : u.verified ? `<span class="badge green">已验证</span>` : `<span class="badge red">未验证</span>`;
         const actionPath = u.blocked ? "unblock" : "block";
         const actionText = u.blocked ? "解封" : "封禁";
         const actionClass = u.blocked ? "ok" : "danger";
-        const ip = u.last_verified_ip ? `${h(u.last_verified_ip)}<br><small>${h(u.last_cf_country || "")} · ${h(u.last_verified_at || "")}</small>` : "-";
-        return `<tr><td><b>${h(u.full_name || u.user_id)}</b><br><small>${u.user_id} @${h(u.username || "")}</small></td><td>${status}<br><small>${h(u.updated_at)}</small></td><td>${ip}</td><td>${h(u.note || "")}</td><td><form method="post" action="/users/${u.user_id}/note"><input name="note" value="${h(u.note || "")}"><button type="submit">保存备注</button></form><form method="post" action="/users/${u.user_id}/${actionPath}" style="margin-top:8px"><button class="${actionClass}" type="submit">${actionText}</button></form></td></tr>`;
+        const http = [
+            u.last_http_ipv4 ? `IPv4: ${h(u.last_http_ipv4)}` : "IPv4: -",
+            u.last_http_ipv6 ? `IPv6: ${h(u.last_http_ipv6)}` : "IPv6: -",
+            u.last_asn ? `ASN: ${h(u.last_asn)}` : "ASN: -",
+            u.last_as_organization ? h(u.last_as_organization) : "运营商: -",
+        ].join("<br>");
+        const udp = [
+            u.last_webrtc_ipv4 ? `UDP IPv4: ${h(u.last_webrtc_ipv4)}` : "UDP IPv4: -",
+            u.last_webrtc_ipv6 ? `UDP IPv6: ${h(u.last_webrtc_ipv6)}` : "UDP IPv6: -",
+            `UDP 状态: ${h(u.last_udp_status || "-")}`,
+            u.last_device_os ? `设备: ${h(u.last_device_os)}` : "设备: -",
+        ].join("<br>");
+        const unverify = u.verified ? `<form method="post" action="/users/${u.user_id}/unverify" style="margin-top:8px"><button type="submit">取消验证</button></form>` : "";
+        return `<tr><td><b>${h(u.full_name || u.user_id)}</b><br><small>${u.user_id} @${h(u.username || "")}<br>语言: ${h(u.language_code || "-")}</small></td><td>${status}<br><small>${h(u.verification_status || "")}<br>${h(u.updated_at)}</small></td><td>${http}<br><small>${h(u.last_verified_at || "")}</small></td><td>${udp}</td><td>${h(u.note || "")}</td><td><form method="post" action="/users/${u.user_id}/note"><input name="note" value="${h(u.note || "")}"><button type="submit">保存备注</button></form><form method="post" action="/users/${u.user_id}/${actionPath}" style="margin-top:8px"><button class="${actionClass}" type="submit">${actionText}</button></form>${unverify}</td></tr>`;
     }).join("");
-    return html(layout("用户管理", `<div class="card"><h2>用户管理</h2><p class="muted">展示已私聊过 Bot 的用户、封禁状态、备注和最近一次 CF 验证 IP。</p><table><tr><th>用户</th><th>状态</th><th>验证 IP</th><th>备注</th><th>操作</th></tr>${bodyRows}</table></div>`));
+    return html(layout("用户管理", `<div class="card"><h2>用户管理</h2><p class="muted">展示已私聊过 Bot 的用户、验证状态、IPv4/IPv6、UDP WebRTC、封禁状态和备注。</p><table><tr><th>用户</th><th>状态</th><th>公网 HTTP 信息</th><th>UDP / WebRTC</th><th>备注</th><th>操作</th></tr>${bodyRows}</table></div>`));
 }
 
 async function userNoteSave(request, env, userId) {
@@ -305,6 +338,11 @@ async function userNoteSave(request, env, userId) {
 
 async function userBlockSet(request, env, userId, blocked) {
     await setBlock(env, userId, blocked);
+    return redirect("/users", request);
+}
+
+async function userVerifyCancel(request, env, userId) {
+    await setUserVerified(env, userId, false, "cancelled");
     return redirect("/users", request);
 }
 
@@ -330,9 +368,27 @@ async function rulesSave(request, env) {
 }
 
 async function verificationsPage(request, env) {
+    await ensureVerificationSchema(env);
     const rows = await env.DB.prepare("SELECT v.*, u.full_name, u.username FROM ip_verifications v LEFT JOIN users u ON u.user_id=v.user_id ORDER BY v.id DESC LIMIT 300").all();
-    const bodyRows = (rows.results || []).map((r) => `<tr><td>#${r.id}<br><span class="badge green">通过</span></td><td>${r.user_id ? `<b>${h(r.full_name || r.user_id)}</b><br><small>${r.user_id} @${h(r.username || "")}</small>` : "-"}</td><td><b>${h(r.ip)}</b><br><small>${h(r.country || "")} · ${h(r.colo || "")}</small></td><td>${h(r.user_agent || "")}</td><td>${h(r.created_at)}</td></tr>`).join("");
-    return html(layout("CF 验证记录", `<div class="card"><h2>CF 验证记录</h2><p class="muted">访客通过 Cloudflare Turnstile 后会记录真实访问 IP。验证链接可用 <code>/verify?user_id=用户ID</code> 关联到 Telegram 用户。</p><table><tr><th>ID</th><th>用户</th><th>IP</th><th>User-Agent</th><th>时间</th></tr>${bodyRows}</table></div>`));
+    const bodyRows = (rows.results || []).map((r) => {
+        const http = [
+            `HTTP: ${h(r.http_ip || r.ip || "-")}`,
+            `类型: ${h(r.http_ip_version || "-")}`,
+            `IPv4: ${h(r.http_ipv4 || "-")}`,
+            `IPv6: ${h(r.http_ipv6 || "-")}`,
+            `ASN: ${h(r.asn || "-")}`,
+            h(r.as_organization || ""),
+        ].join("<br>");
+        const udp = [
+            `UDP IPv4: ${h(r.webrtc_ipv4 || "-")}`,
+            `UDP IPv6: ${h(r.webrtc_ipv6 || "-")}`,
+            `协议: ${h(r.webrtc_protocol || "-")}`,
+            `类型: ${h(r.webrtc_candidate_type || "-")}`,
+            `状态: ${h(r.udp_status || "-")}`,
+        ].join("<br>");
+        return `<tr><td>#${r.id}<br><span class="badge green">通过</span></td><td>${r.user_id ? `<b>${h(r.full_name || r.user_id)}</b><br><small>${r.user_id} @${h(r.username || "")}</small>` : "-"}</td><td>${http}<br><small>${h(r.country || "")} · ${h(r.colo || "")}</small></td><td>${udp}</td><td>${h(r.device_os || "-")}<br><small>${h(r.user_agent || "")}</small></td><td>${h(r.created_at)}</td></tr>`;
+    }).join("");
+    return html(layout("CF 验证记录", `<div class="card"><h2>CF 验证记录</h2><p class="muted">访客通过 Cloudflare Turnstile 后会记录 HTTP IPv4/IPv6、UDP WebRTC IPv4/IPv6、ASN、设备系统和 User-Agent。验证入口使用一次性 token 关联 Telegram 用户。</p><table><tr><th>ID</th><th>用户</th><th>公网 HTTP</th><th>UDP / WebRTC</th><th>设备/User-Agent</th><th>时间</th></tr>${bodyRows}</table></div>`));
 }
 
 async function settingsPage(request, env) {
@@ -342,7 +398,7 @@ async function settingsPage(request, env) {
     const body = `<div class="card"><h2>后台设置</h2><form method="post">
 <label>管理员 Telegram Chat ID（最多 3 个，逗号分隔）</label><input name="admin_chat_ids" value="${h(adminIds.join(","))}">
 <label>用户 /start 欢迎语</label><textarea name="welcome_message">${h(welcome)}</textarea>
-<div class="grid"><div><label>公开地址</label><input value="${h(base)}" readonly></div><div><label>验证页</label><input value="${h(`${base}/verify`)}" readonly></div></div>
+<div class="grid"><div><label>公开地址</label><input value="${h(base)}" readonly></div><div><label>验证入口</label><input value="${h(`${base}/verify/{token}`)}" readonly></div></div>
 <div class="actions"><button class="primary" type="submit">保存设置</button></div></form></div>
 <div class="card"><h2>Cloudflare Secrets 状态</h2>
 <table><tr><th>名称</th><th>状态</th><th>说明</th></tr>
@@ -373,61 +429,224 @@ async function logsPage(request, env) {
     return html(layout("日志", `<div class="card"><h2>最近日志</h2><table><tr><th>ID</th><th>内容</th><th>时间</th></tr>${bodyRows}</table></div>`));
 }
 
-function verifyPage(request, env, error = "") {
-    const url = new URL(request.url);
-    const userId = url.searchParams.get("user_id") || "";
+async function verifyPage(request, env, token = "", error = "") {
+    await ensureVerificationSchema(env);
     const ip = visitorIp(request);
-    if (!env.TURNSTILE_SITE_KEY) {
-        return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CF 验证</title>${verifyStyle()}</head><body><main><div class="card"><h1>CF 验证未配置</h1><p>请先配置 <code>TURNSTILE_SITE_KEY</code> 和 <code>TURNSTILE_SECRET_KEY</code>。</p><p class="muted">当前访问 IP：${h(ip || "-")}</p></div></main></body></html>`;
+    const cfInfo = requestCfInfo(request);
+    if (!token) {
+        return verifyMessagePage("继续聊天前需要验证", `<p class="muted">${h(error || "请回到 Telegram，点击机器人发送的验证按钮。")}</p><p class="muted">当前连接 IP：${h(ip || "-")}</p>`);
     }
-    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CF 验证</title>${verifyStyle()}<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body><main><form class="card" method="post" action="/verify">
-<h1>Cloudflare 验证</h1><p class="muted">通过验证后会显示你的访问 IP，并记录到后台。</p>${error ? `<div class="error">${h(error)}</div>` : ""}
-<input type="hidden" name="user_id" value="${h(userId)}">
+    const session = await getVerificationSession(env, token);
+    if (!session) {
+        return verifyMessagePage("验证链接无效", `<p class="muted">请回到 Telegram 重新点击验证按钮。</p><p class="muted">当前连接 IP：${h(ip || "-")}</p>`);
+    }
+    if (session.expires_at && Date.parse(session.expires_at) < Date.now()) {
+        await markVerificationSession(env, token, "expired");
+        return verifyMessagePage("验证链接已过期", `<p class="muted">请回到 Telegram 重新获取验证链接。</p><p class="muted">当前连接 IP：${h(ip || "-")}</p>`);
+    }
+    if (session.status === "verified") {
+        return verifySuccessPage(ip, cfInfo, session.verified_at || nowIso());
+    }
+    if (!env.TURNSTILE_SITE_KEY) {
+        return verifyMessagePage("CF 验证未配置", `<p>请先配置 <code>TURNSTILE_SITE_KEY</code> 和 <code>TURNSTILE_SECRET_KEY</code>。</p><p class="muted">当前访问 IP：${h(ip || "-")}</p>`);
+    }
+    const tokenJson = JSON.stringify(token);
+    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>继续聊天前需要验证</title>${verifyStyle()}<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body><main><form id="verifyForm" class="card" method="post" action="/verify/${h(token)}">
+<h1>继续聊天前需要验证</h1><p class="muted">此页面使用 Cloudflare Turnstile 进行人机验证。验证通过后，机器人会为你建立独立话题并转发后续消息。</p>${error ? `<div class="error">${h(error)}</div>` : ""}
+<input type="hidden" id="client_data" name="client_data" value="">
 <div class="cf-turnstile" data-sitekey="${h(env.TURNSTILE_SITE_KEY)}"></div>
-<button type="submit">提交验证</button><p class="muted">当前连接 IP：${h(ip || "-")}</p></form></main></body></html>`;
+<button id="submitBtn" type="submit">完成验证</button><p id="probeStatus" class="muted">当前连接 IP：${h(ip || "-")}<br>国家/地区：${h(cfInfo.country || "-")} · 机房：${h(cfInfo.colo || "-")}</p><p class="muted small">页面会尝试记录 HTTP IPv4/IPv6 与 UDP WebRTC 信息。浏览器、网络或代理限制时，UDP 信息可能为空。</p></form></main><script>
+const VERIFY_TOKEN = ${tokenJson};
+const form = document.getElementById("verifyForm");
+const button = document.getElementById("submitBtn");
+const statusEl = document.getElementById("probeStatus");
+form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    button.disabled = true;
+    button.textContent = "正在采集网络信息...";
+    try {
+        const data = await collectClientData();
+        document.getElementById("client_data").value = JSON.stringify(data).slice(0, 6000);
+    } catch (error) {
+        document.getElementById("client_data").value = JSON.stringify({ error: String(error && error.message || error) }).slice(0, 6000);
+    }
+    button.textContent = "正在提交验证...";
+    form.submit();
+});
+async function collectClientData() {
+    const data = {
+        language: navigator.language || "",
+        platform: navigator.platform || "",
+        user_agent: navigator.userAgent || "",
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+        screen: { width: screen.width || 0, height: screen.height || 0, pixel_ratio: window.devicePixelRatio || 1 },
+        probe: null,
+        webrtc: null,
+    };
+    const tasks = [httpProbe(), collectWebRtcCandidates()];
+    const results = await Promise.allSettled(tasks);
+    data.probe = results[0].status === "fulfilled" ? results[0].value : { error: String(results[0].reason || "failed") };
+    data.webrtc = results[1].status === "fulfilled" ? results[1].value : { udp_status: "failed", error: String(results[1].reason || "failed") };
+    if (statusEl && data.webrtc) statusEl.innerHTML += "<br>UDP 状态：" + escapeHtml(data.webrtc.udp_status || "unknown");
+    return data;
+}
+async function httpProbe() {
+    const response = await fetch("/verify/ip-probe?token=" + encodeURIComponent(VERIFY_TOKEN) + "&t=" + Date.now(), { cache: "no-store" });
+    return response.json();
+}
+function collectWebRtcCandidates() {
+    return new Promise(async (resolve) => {
+        if (!window.RTCPeerConnection) {
+            resolve({ udp_status: "unsupported", candidates: [] });
+            return;
+        }
+        const candidates = [];
+        const pc = new RTCPeerConnection({ iceServers: [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }] });
+        const finish = () => {
+            try { pc.close(); } catch (error) {}
+            const parsed = candidates.map(parseCandidate).filter(Boolean);
+            const udp = parsed.filter((x) => x.protocol === "udp");
+            const ipv4 = firstPublicIp(udp, "IPv4");
+            const ipv6 = firstPublicIp(udp, "IPv6");
+            resolve({
+                udp_status: udp.length ? "success" : "empty",
+                webrtc_ipv4: ipv4,
+                webrtc_ipv6: ipv6,
+                webrtc_protocol: udp.length ? "udp" : "",
+                webrtc_candidate_type: udp.map((x) => x.type).filter(Boolean).join(",").slice(0, 80),
+                candidates: parsed.slice(0, 20),
+            });
+        };
+        pc.onicecandidate = (event) => {
+            if (event.candidate && event.candidate.candidate) candidates.push(event.candidate.candidate);
+            if (!event.candidate) finish();
+        };
+        try {
+            pc.createDataChannel("probe");
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            setTimeout(finish, 3500);
+        } catch (error) {
+            try { pc.close(); } catch (closeError) {}
+            resolve({ udp_status: "failed", error: String(error && error.message || error), candidates: [] });
+        }
+    });
+}
+function parseCandidate(candidate) {
+    const parts = String(candidate || "").split(/\s+/);
+    const typIndex = parts.indexOf("typ");
+    const ip = parts[4] || "";
+    const protocol = String(parts[2] || "").toLowerCase();
+    const type = typIndex >= 0 ? parts[typIndex + 1] || "" : "";
+    if (!ip || ip.endsWith(".local")) return null;
+    return { ip, version: ip.includes(":") ? "IPv6" : "IPv4", protocol, type, raw: candidate.slice(0, 500) };
+}
+function firstPublicIp(items, version) {
+    const item = items.find((x) => x.version === version && x.type !== "host" && !isPrivateIp(x.ip));
+    return item ? item.ip : "";
+}
+function isPrivateIp(ip) {
+    return /^(10\.|127\.|172\.(1[6-9]|2\d|3[0-1])\.|192\.168\.|169\.254\.)/.test(ip) || /^f[cd][0-9a-f]{2}:/i.test(ip) || /^fe80:/i.test(ip) || ip === "::1";
+}
+function escapeHtml(value) {
+    return String(value || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+</script></body></html>`;
+}
+
+function verifyMessagePage(title, body) {
+    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${h(title)}</title>${verifyStyle()}</head><body><main><div class="card"><h1>${h(title)}</h1>${body}</div></main></body></html>`;
+}
+
+function verifySuccessPage(ip, cfInfo, ts) {
+    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>验证成功</title>${verifyStyle()}</head><body><main><div class="card"><h1>验证成功</h1><p>验证已通过，请回到 Telegram 继续聊天。</p><p class="muted">HTTP IP：${h(ip || "-")}<br>国家/地区：${h(cfInfo.country || "-")}<br>Cloudflare 机房：${h(cfInfo.colo || "-")}<br>时间：${h(ts)}</p></div></main></body></html>`;
 }
 
 function verifyStyle() {
-    return `<style>body{margin:0;background:#f4f6fb;color:#111827;font-family:system-ui,-apple-system,Segoe UI,sans-serif}main{min-height:100vh;display:grid;place-items:center;padding:20px}.card{width:min(480px,100%);background:white;border:1px solid #d8dee9;border-radius:12px;padding:28px;box-shadow:0 18px 50px rgba(15,23,42,.12)}h1{margin:0 0 10px}.muted{color:#64748b;line-height:1.5}.error{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;border-radius:8px;padding:10px;margin:12px 0}button{margin-top:18px;border:0;border-radius:8px;background:#2563eb;color:white;font-weight:800;padding:12px 15px;cursor:pointer}</style>`;
+    return `<style>body{margin:0;background:#f4f0e8;color:#111827;font-family:system-ui,-apple-system,Segoe UI,sans-serif}main{min-height:100vh;display:grid;place-items:center;padding:20px}.card{width:min(520px,100%);background:#fffaf3;border:1px solid #e5d5bf;border-radius:22px;padding:30px;box-shadow:0 22px 70px rgba(86,64,38,.16)}h1{margin:0 0 14px;font-size:30px;line-height:1.2}.muted{color:#4b5563;line-height:1.65}.small{font-size:13px}.error{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;border-radius:10px;padding:10px;margin:12px 0}button{width:100%;margin-top:20px;border:0;border-radius:999px;background:linear-gradient(90deg,#de6b22,#9f430f);color:white;font-weight:900;padding:14px 18px;cursor:pointer;font-size:16px}button:disabled{opacity:.65;cursor:wait}.cf-turnstile{margin:20px 0 8px}code,pre{background:#f3f4f6;border-radius:8px;padding:2px 5px}</style>`;
 }
 
-async function verifySubmit(request, env) {
+async function verifySubmit(request, env, token = "") {
+    await ensureVerificationSchema(env);
+    if (!token) return html(await verifyPage(request, env, "", "验证链接缺少 token，请从 Telegram 重新打开。"), 400);
+    const session = await getVerificationSession(env, token);
+    if (!session) return html(await verifyPage(request, env, "", "验证链接无效，请从 Telegram 重新打开。"), 404);
+    if (session.expires_at && Date.parse(session.expires_at) < Date.now()) {
+        await markVerificationSession(env, token, "expired");
+        return html(await verifyPage(request, env, "", "验证链接已过期，请从 Telegram 重新获取。"), 400);
+    }
     const form = await request.formData();
-    const token = String(form.get("cf-turnstile-response") || "");
-    const userIdRaw = String(form.get("user_id") || "").trim();
+    const turnstileToken = String(form.get("cf-turnstile-response") || "");
+    const clientData = parseClientData(form.get("client_data"));
     const ip = visitorIp(request);
-    if (!token) return html(verifyPage(request, env, "请先完成人机验证。"), 400);
-    if (!env.TURNSTILE_SECRET_KEY) return html(verifyPage(request, env, "Turnstile Secret 未配置。"), 500);
+    if (!turnstileToken) return html(await verifyPage(request, env, token, "请先完成人机验证。"), 400);
+    if (!env.TURNSTILE_SECRET_KEY) return html(await verifyPage(request, env, token, "Turnstile Secret 未配置。"), 500);
 
     const verifyForm = new FormData();
     verifyForm.append("secret", env.TURNSTILE_SECRET_KEY);
-    verifyForm.append("response", token);
+    verifyForm.append("response", turnstileToken);
     if (ip) verifyForm.append("remoteip", ip);
-    const result = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-        method: "POST",
-        body: verifyForm,
-    }).then((r) => r.json());
+    const result = await fetch(TURNSTILE_VERIFY_URL, { method: "POST", body: verifyForm }).then((r) => r.json());
     if (!result.success) {
         await logEvent(env, "warn", "turnstile verification failed", result);
-        return html(verifyPage(request, env, "验证失败，请刷新后重试。"), 400);
+        return html(await verifyPage(request, env, token, "验证失败，请刷新后重试。"), 400);
     }
 
-    const userId = userIdRaw && /^-?\d+$/.test(userIdRaw) ? Number(userIdRaw) : null;
-    const country = String(request.cf?.country || request.headers.get("CF-IPCountry") || "");
-    const colo = String(request.cf?.colo || "");
-    const userAgent = request.headers.get("User-Agent") || "";
     const ts = nowIso();
-    await env.DB.prepare("INSERT INTO ip_verifications(user_id, ip, country, colo, user_agent, passed, turnstile_action, created_at) VALUES(?,?,?,?,?,?,?,?)")
-        .bind(userId, ip || "", country, colo, userAgent.slice(0, 500), 1, String(result.action || ""), ts)
+    const cfInfo = requestCfInfo(request);
+    const userAgent = request.headers.get("User-Agent") || "";
+    const network = extractClientNetwork(clientData, ip);
+    const deviceOs = detectDeviceOs(userAgent, clientData);
+    const rawClientData = JSON.stringify(clientData || {}).slice(0, 6000);
+    const userId = Number(session.user_id);
+    await env.DB.prepare(`UPDATE verification_sessions SET status='verified', verified_at=?, http_ip=?, http_ip_version=?, http_ipv4=?, http_ipv6=?, webrtc_ipv4=?, webrtc_ipv6=?, webrtc_protocol=?, webrtc_candidate_type=?, udp_status=?, asn=?, as_organization=?, country=?, colo=?, device_os=?, user_agent=?, raw_client_data=? WHERE token=?`)
+        .bind(ts, ip || "", ipVersion(ip), network.http_ipv4, network.http_ipv6, network.webrtc_ipv4, network.webrtc_ipv6, network.webrtc_protocol, network.webrtc_candidate_type, network.udp_status, cfInfo.asn, cfInfo.asOrganization, cfInfo.country, cfInfo.colo, deviceOs, userAgent.slice(0, 500), rawClientData, token)
         .run();
-    if (userId) {
-        await env.DB.prepare("UPDATE users SET last_verified_ip=?, last_verified_at=?, last_cf_country=?, updated_at=? WHERE user_id=?")
-            .bind(ip || "", ts, country, ts, userId)
-            .run();
-    }
-    await notifyAdmins(env, `[CF 验证通过]\nuser_id: <code>${userId || "-"}</code>\nIP: <code>${h(ip || "-")}</code>\n国家/地区: ${h(country || "-")}\n机房: ${h(colo || "-")}`);
-    const body = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>验证通过</title>${verifyStyle()}</head><body><main><div class="card"><h1>验证通过</h1><p>你的访问 IP：</p><pre>${h(ip || "-")}</pre><p class="muted">国家/地区：${h(country || "-")}<br>Cloudflare 机房：${h(colo || "-")}<br>时间：${h(ts)}</p></div></main></body></html>`;
-    return html(body);
+    await env.DB.prepare(`INSERT INTO ip_verifications(user_id, ip, country, colo, user_agent, passed, turnstile_action, http_ip, http_ip_version, http_ipv4, http_ipv6, webrtc_ipv4, webrtc_ipv6, webrtc_protocol, webrtc_candidate_type, udp_status, asn, as_organization, device_os, token, raw_client_data, created_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .bind(userId, ip || "", cfInfo.country, cfInfo.colo, userAgent.slice(0, 500), 1, String(result.action || ""), ip || "", ipVersion(ip), network.http_ipv4, network.http_ipv6, network.webrtc_ipv4, network.webrtc_ipv6, network.webrtc_protocol, network.webrtc_candidate_type, network.udp_status, cfInfo.asn, cfInfo.asOrganization, deviceOs, token, rawClientData, ts)
+        .run();
+    await env.DB.prepare(`UPDATE users SET verified=1, verification_status='verified', verification_token=?, language_code=COALESCE(NULLIF(language_code,''), ?), last_verified_ip=?, last_verified_at=?, last_cf_country=?, last_http_ip=?, last_http_ip_version=?, last_http_ipv4=?, last_http_ipv6=?, last_webrtc_ipv4=?, last_webrtc_ipv6=?, last_udp_status=?, last_asn=?, last_as_organization=?, last_device_os=?, last_user_agent=?, updated_at=? WHERE user_id=?`)
+        .bind(token, session.language_code || "", ip || "", ts, cfInfo.country, ip || "", ipVersion(ip), network.http_ipv4, network.http_ipv6, network.webrtc_ipv4, network.webrtc_ipv6, network.udp_status, cfInfo.asn, cfInfo.asOrganization, deviceOs, userAgent.slice(0, 500), ts, userId)
+        .run();
+    await notifyVerificationSuccess(env, userId, token, {
+        username: session.username || "",
+        fullName: session.full_name || String(userId),
+        languageCode: session.language_code || "",
+        httpIp: ip || "",
+        httpIpVersion: ipVersion(ip),
+        httpIpv4: network.http_ipv4,
+        httpIpv6: network.http_ipv6,
+        webrtcIpv4: network.webrtc_ipv4,
+        webrtcIpv6: network.webrtc_ipv6,
+        udpStatus: network.udp_status,
+        candidateType: network.webrtc_candidate_type,
+        asn: cfInfo.asn,
+        asOrganization: cfInfo.asOrganization,
+        country: cfInfo.country,
+        colo: cfInfo.colo,
+        deviceOs,
+    });
+    await tgSendMessage(env, userId, "验证已通过，现在可以回到 Telegram 继续聊天。").catch(() => {});
+    return html(verifySuccessPage(ip, cfInfo, ts));
+}
+
+function verifyIpProbe(request) {
+    const ip = visitorIp(request);
+    const cfInfo = requestCfInfo(request);
+    const body = {
+        http_ip: ip,
+        http_ip_version: ipVersion(ip),
+        http_ipv4: ipVersion(ip) === "IPv4" ? ip : "",
+        http_ipv6: ipVersion(ip) === "IPv6" ? ip : "",
+        country: cfInfo.country,
+        colo: cfInfo.colo,
+        asn: cfInfo.asn,
+        as_organization: cfInfo.asOrganization,
+        user_agent: request.headers.get("User-Agent") || "",
+        ts: nowIso(),
+    };
+    return new Response(JSON.stringify(body), { headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
 }
 
 function visitorIp(request) {
@@ -443,12 +662,17 @@ async function telegramWebhook(request, env) {
         await logEvent(env, "error", "BOT_TOKEN is missing", {});
         return text("BOT_TOKEN missing", 500);
     }
+    await ensureVerificationSchema(env);
     const update = await request.json();
     await handleTelegramUpdate(env, update);
     return json({ ok: true });
 }
 
 async function handleTelegramUpdate(env, update) {
+    if (update.callback_query) {
+        await handleCallbackQuery(env, update.callback_query);
+        return;
+    }
     const message = update.message || update.edited_message;
     if (!message || !message.chat) return;
     const chatId = Number(message.chat.id);
@@ -488,14 +712,17 @@ async function handleCommand(env, message, command, isAdmin) {
     if (command.name === "start") {
         const user = message.from || {};
         await upsertUser(env, user);
+        if (!(await isVerified(env, user.id))) {
+            await sendVerificationPrompt(env, chatId, user, "请先完成验证后再开始聊天。验证通过前，你发送的消息不会被转发。");
+            return;
+        }
         const welcome = await getSetting(env, "welcome_message", "已连接机器人后台。你的消息会转交给管理员。");
-        const link = verifyLinkForUser(env, user.id);
-        await tgSendMessage(env, chatId, `${welcome}${link ? `\n\nCF 验证链接：${link}` : ""}`);
+        await tgSendMessage(env, chatId, `${welcome}\n\n当前状态：已验证，可以开始聊天。`);
         return;
     }
     if (command.name === "verify") {
-        const link = verifyLinkForUser(env, message.from?.id);
-        await tgSendMessage(env, chatId, link ? `打开以下链接完成 CF 验证：\n${link}` : "未配置 PUBLIC_BASE_URL，暂时无法生成验证链接。");
+        await upsertUser(env, message.from || {});
+        await sendVerificationPrompt(env, chatId, message.from || {}, "请打开验证页面完成 Cloudflare 验证。");
         return;
     }
     if (!isAdmin) {
@@ -538,7 +765,8 @@ async function handleCommand(env, message, command, isAdmin) {
             await tgSendMessage(env, chatId, `已删除广告关键词：${word}`);
         } else if (command.name === "verifylink") {
             const uid = parseUserId(command.args);
-            const link = verifyLinkForUser(env, uid);
+            const row = await getUser(env, uid);
+            const link = await createVerificationLink(env, row || { user_id: uid, id: uid, full_name: String(uid) }, uid);
             await tgSendMessage(env, chatId, link || "未配置 PUBLIC_BASE_URL。");
         } else {
             await tgSendMessage(env, chatId, "可用命令：/reply /block /unblock /note /who /spamwords /spamadd /spamdel /verifylink");
@@ -561,7 +789,7 @@ function parseUserIdAndText(args) {
 }
 
 function formatUserInfo(row) {
-    return `用户信息\nuser_id: ${row.user_id}\nusername: @${row.username || ""}\nfull_name: ${row.full_name || ""}\nblocked: ${Boolean(row.blocked)}\nnote: ${row.note || ""}\nlast_ip: ${row.last_verified_ip || "-"}\nupdated_at: ${row.updated_at}`;
+    return `用户信息\nuser_id: ${row.user_id}\nusername: @${row.username || ""}\nfull_name: ${row.full_name || ""}\nblocked: ${Boolean(row.blocked)}\nverified: ${Boolean(row.verified)}\nstatus: ${row.verification_status || "-"}\nnote: ${row.note || ""}\nHTTP IPv4: ${row.last_http_ipv4 || "-"}\nHTTP IPv6: ${row.last_http_ipv6 || "-"}\nUDP IPv4: ${row.last_webrtc_ipv4 || "-"}\nUDP IPv6: ${row.last_webrtc_ipv6 || "-"}\nASN: ${row.last_asn || "-"}\nupdated_at: ${row.updated_at}`;
 }
 
 async function relayUserMessage(env, message) {
@@ -569,6 +797,10 @@ async function relayUserMessage(env, message) {
     await upsertUser(env, user);
     if (await isBlocked(env, user.id)) {
         await tgSendMessage(env, message.chat.id, "你当前无法发送消息。");
+        return;
+    }
+    if (!(await isVerified(env, user.id))) {
+        await sendVerificationPrompt(env, message.chat.id, user, "请先完成验证后再开始聊天。验证通过前，你发送的消息不会被转发。");
         return;
     }
     if (await rateLimited(env, user.id)) {
@@ -661,11 +893,11 @@ async function sendTextToUser(env, userId, textValue, source) {
     return sent.result;
 }
 
-async function notifyAdmins(env, textValue) {
+async function notifyAdmins(env, textValue, extraPayload = {}) {
     const ids = await adminChatIds(env);
     for (const id of ids) {
         try {
-            await tgCall(env, "sendMessage", { chat_id: id, text: textValue, parse_mode: "HTML", disable_web_page_preview: true });
+            await tgCall(env, "sendMessage", { chat_id: id, text: textValue, parse_mode: "HTML", disable_web_page_preview: true, ...extraPayload });
         } catch (error) {
             await logEvent(env, "error", "failed to notify admin", { id, error: String(error) });
         }
@@ -704,11 +936,12 @@ async function upsertUser(env, from) {
     const userId = Number(from.id);
     const fullName = [from.first_name, from.last_name].filter(Boolean).join(" ") || String(userId);
     const username = from.username || "";
+    const languageCode = from.language_code || "";
     const ts = nowIso();
-    await env.DB.prepare(`INSERT INTO users(user_id, username, full_name, created_at, updated_at)
-VALUES(?,?,?,?,?)
-ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name, updated_at=excluded.updated_at`)
-        .bind(userId, username, fullName, ts, ts)
+    await env.DB.prepare(`INSERT INTO users(user_id, username, full_name, language_code, created_at, updated_at)
+VALUES(?,?,?,?,?,?)
+ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name, language_code=excluded.language_code, updated_at=excluded.updated_at`)
+        .bind(userId, username, fullName, languageCode, ts, ts)
         .run();
 }
 
@@ -723,6 +956,18 @@ async function isBlocked(env, userId) {
 
 async function setBlock(env, userId, blocked) {
     await env.DB.prepare("UPDATE users SET blocked=?, updated_at=? WHERE user_id=?").bind(blocked ? 1 : 0, nowIso(), userId).run();
+}
+
+async function isVerified(env, userId) {
+    const row = await getUser(env, userId);
+    return Boolean(row?.verified);
+}
+
+async function setUserVerified(env, userId, verified, status = null) {
+    await ensureVerificationSchema(env);
+    await env.DB.prepare("UPDATE users SET verified=?, verification_status=?, updated_at=? WHERE user_id=?")
+        .bind(verified ? 1 : 0, status || (verified ? "verified" : "pending"), nowIso(), userId)
+        .run();
 }
 
 function getMessageType(message) {
@@ -840,8 +1085,265 @@ function publicBaseUrl(env, request = null) {
     return "";
 }
 
-function verifyLinkForUser(env, userId) {
-    const base = publicBaseUrl(env);
-    if (!base || !userId) return "";
-    return `${base}/verify?user_id=${encodeURIComponent(String(userId))}`;
+function verifyLinkForToken(env, token, request = null) {
+    const base = publicBaseUrl(env, request);
+    if (!base || !token) return "";
+    return `${base}/verify/${encodeURIComponent(String(token))}`;
+}
+
+async function createVerificationLink(env, from, chatId = null, request = null) {
+    await ensureVerificationSchema(env);
+    const token = randomToken();
+    const userId = Number(from.id ?? from.user_id);
+    if (!userId) return "";
+    const fullName = from.full_name || [from.first_name, from.last_name].filter(Boolean).join(" ") || String(userId);
+    const username = from.username || "";
+    const languageCode = from.language_code || "";
+    const ts = nowIso();
+    const expiresAt = new Date(Date.now() + VERIFY_SESSION_HOURS * 60 * 60 * 1000).toISOString();
+    await env.DB.prepare(`INSERT INTO verification_sessions(token, user_id, chat_id, username, full_name, language_code, status, created_at, expires_at)
+VALUES(?,?,?,?,?,?,?,?,?)`)
+        .bind(token, userId, chatId ? Number(chatId) : userId, username, fullName, languageCode, "pending", ts, expiresAt)
+        .run();
+    await env.DB.prepare(`INSERT INTO users(user_id, username, full_name, language_code, verification_status, verification_token, created_at, updated_at)
+VALUES(?,?,?,?,?,?,?,?)
+ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name, language_code=excluded.language_code, verification_status='pending', verification_token=excluded.verification_token, updated_at=excluded.updated_at`)
+        .bind(userId, username, fullName, languageCode, "pending", token, ts, ts)
+        .run();
+    return verifyLinkForToken(env, token, request);
+}
+
+async function sendVerificationPrompt(env, chatId, from, textValue) {
+    const link = await createVerificationLink(env, from, chatId);
+    if (!link) {
+        await tgSendMessage(env, chatId, "未配置 PUBLIC_BASE_URL，暂时无法生成验证链接。");
+        return;
+    }
+    await tgCall(env, "sendMessage", {
+        chat_id: chatId,
+        text: `${textValue}\n\n验证通过前，你发送的消息不会被转发。`,
+        reply_markup: { inline_keyboard: [[{ text: "打开验证页面", url: link }]] },
+        disable_web_page_preview: true,
+    });
+}
+
+async function getVerificationSession(env, token) {
+    return env.DB.prepare("SELECT * FROM verification_sessions WHERE token=?").bind(token).first();
+}
+
+async function markVerificationSession(env, token, status) {
+    await env.DB.prepare("UPDATE verification_sessions SET status=? WHERE token=?").bind(status, token).run();
+}
+
+function randomToken() {
+    const bytes = new Uint8Array(24);
+    crypto.getRandomValues(bytes);
+    return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function handleCallbackQuery(env, query) {
+    const data = String(query.data || "");
+    const adminId = Number(query.from?.id || query.message?.chat?.id || 0);
+    if (!(await isAdminChat(env, adminId))) {
+        await answerCallbackQuery(env, query.id, "无权限");
+        return;
+    }
+    const [action, rawUserId] = data.split(":");
+    const userId = Number(rawUserId);
+    if (!Number.isFinite(userId)) {
+        await answerCallbackQuery(env, query.id, "参数错误");
+        return;
+    }
+    if (action === "unverify") {
+        await setUserVerified(env, userId, false, "cancelled");
+        await tgSendMessage(env, userId, "你的验证已被管理员取消，请重新完成验证后继续聊天。").catch(() => {});
+        await answerCallbackQuery(env, query.id, "已取消验证");
+        await tgSendMessage(env, adminId, `已取消用户 ${userId} 的验证状态。`);
+        return;
+    }
+    if (action === "block") {
+        await setBlock(env, userId, true);
+        await answerCallbackQuery(env, query.id, "已拉黑");
+        await tgSendMessage(env, adminId, `已拉黑用户 ${userId}。`);
+        return;
+    }
+    if (action === "who") {
+        const row = await getUser(env, userId);
+        await answerCallbackQuery(env, query.id, "已发送用户信息");
+        await tgSendMessage(env, adminId, row ? formatUserInfo(row) : `找不到用户 ${userId}`);
+        return;
+    }
+    await answerCallbackQuery(env, query.id, "未知操作");
+}
+
+async function answerCallbackQuery(env, callbackQueryId, textValue) {
+    if (!callbackQueryId) return;
+    await tgCall(env, "answerCallbackQuery", { callback_query_id: callbackQueryId, text: textValue || "OK" });
+}
+
+async function notifyVerificationSuccess(env, userId, token, info) {
+    const username = info.username ? `@${h(info.username)}` : "无";
+    const textValue = `新用户验证通过\n用户 ID：<code>${userId}</code>\n昵称：${h(info.fullName || "-")}\n用户名：${username}\n语言：${h(info.languageCode || "-")}\n\n本次验证信息\n设备系统：${h(info.deviceOs || "-")}\nHTTP IP：<code>${h(info.httpIp || "-")}</code>\nHTTP IP 类型：${h(info.httpIpVersion || "-")}\n公网 IPv4：<code>${h(info.httpIpv4 || "-")}</code>\n公网 IPv6：<code>${h(info.httpIpv6 || "-")}</code>\n公网 ASN：${h(info.asn || "-")}\n运营商：${h(info.asOrganization || "-")}\n国家/地区：${h(info.country || "-")}\nCloudflare 机房：${h(info.colo || "-")}\n\nUDP / WebRTC 信息\nWebRTC IPv4：<code>${h(info.webrtcIpv4 || "-")}</code>\nWebRTC IPv6：<code>${h(info.webrtcIpv6 || "-")}</code>\nUDP 状态：${h(info.udpStatus || "-")}\nCandidate 类型：${h(info.candidateType || "-")}`;
+    await notifyAdmins(env, textValue, {
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: "取消验证", callback_data: `unverify:${userId}` }],
+                [{ text: "拉黑", callback_data: `block:${userId}` }],
+                [{ text: "获取用户名", callback_data: `who:${userId}` }],
+            ],
+        },
+    });
+}
+
+function parseClientData(value) {
+    const raw = String(value || "").slice(0, 6000);
+    if (!raw) return {};
+    try {
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (error) {
+        return { parse_error: String(error.message || error) };
+    }
+}
+
+function extractClientNetwork(clientData, httpIp) {
+    const probe = clientData?.probe && typeof clientData.probe === "object" ? clientData.probe : {};
+    const webrtc = clientData?.webrtc && typeof clientData.webrtc === "object" ? clientData.webrtc : {};
+    const httpIps = [httpIp, probe.http_ip, probe.http_ipv4, probe.http_ipv6].filter(Boolean).map(String);
+    const httpIpv4 = firstIpByVersion(httpIps, "IPv4");
+    const httpIpv6 = firstIpByVersion(httpIps, "IPv6");
+    const webrtcIpv4 = cleanIp(webrtc.webrtc_ipv4, "IPv4");
+    const webrtcIpv6 = cleanIp(webrtc.webrtc_ipv6, "IPv6");
+    const udpStatus = String(webrtc.udp_status || (webrtcIpv4 || webrtcIpv6 ? "success" : "empty")).slice(0, 40);
+    return {
+        http_ipv4: httpIpv4,
+        http_ipv6: httpIpv6,
+        webrtc_ipv4: webrtcIpv4,
+        webrtc_ipv6: webrtcIpv6,
+        webrtc_protocol: String(webrtc.webrtc_protocol || "").slice(0, 20),
+        webrtc_candidate_type: String(webrtc.webrtc_candidate_type || "").slice(0, 80),
+        udp_status: udpStatus,
+    };
+}
+
+function firstIpByVersion(values, version) {
+    for (const value of values) {
+        const ip = cleanIp(value, version);
+        if (ip) return ip;
+    }
+    return "";
+}
+
+function cleanIp(value, version = "") {
+    const ip = String(value || "").trim();
+    if (!ip || ip.length > 80) return "";
+    if (version && ipVersion(ip) !== version) return "";
+    return /^[0-9a-fA-F:.]+$/.test(ip) ? ip : "";
+}
+
+function ipVersion(ip) {
+    const value = String(ip || "").trim();
+    if (!value) return "";
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(value)) return "IPv4";
+    if (value.includes(":")) return "IPv6";
+    return "";
+}
+
+function requestCfInfo(request) {
+    return {
+        country: String(request.cf?.country || request.headers.get("CF-IPCountry") || ""),
+        colo: String(request.cf?.colo || ""),
+        asn: request.cf?.asn ? String(request.cf.asn) : "",
+        asOrganization: String(request.cf?.asOrganization || ""),
+    };
+}
+
+function detectDeviceOs(userAgent, clientData = {}) {
+    const ua = String(userAgent || clientData.user_agent || "");
+    const platform = String(clientData.platform || "");
+    if (/Android/i.test(ua)) return "Android";
+    if (/iPhone|iPad|iPod/i.test(ua)) return "iOS";
+    if (/Windows/i.test(ua) || /Win/i.test(platform)) return "Windows";
+    if (/Mac OS|Macintosh/i.test(ua) || /Mac/i.test(platform)) return "macOS";
+    if (/Linux/i.test(ua)) return "Linux";
+    return platform || "Unknown";
+}
+
+async function ensureVerificationSchema(env) {
+    if (verificationSchemaReady) return;
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS verification_sessions (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        chat_id INTEGER,
+        username TEXT DEFAULT '',
+        full_name TEXT DEFAULT '',
+        language_code TEXT DEFAULT '',
+        status TEXT DEFAULT 'pending',
+        http_ip TEXT DEFAULT '',
+        http_ip_version TEXT DEFAULT '',
+        http_ipv4 TEXT DEFAULT '',
+        http_ipv6 TEXT DEFAULT '',
+        webrtc_ipv4 TEXT DEFAULT '',
+        webrtc_ipv6 TEXT DEFAULT '',
+        webrtc_protocol TEXT DEFAULT '',
+        webrtc_candidate_type TEXT DEFAULT '',
+        udp_status TEXT DEFAULT '',
+        asn TEXT DEFAULT '',
+        as_organization TEXT DEFAULT '',
+        country TEXT DEFAULT '',
+        colo TEXT DEFAULT '',
+        device_os TEXT DEFAULT '',
+        user_agent TEXT DEFAULT '',
+        raw_client_data TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        verified_at TEXT
+    )`).run();
+    const userColumns = [
+        "language_code TEXT DEFAULT ''",
+        "verified INTEGER DEFAULT 0",
+        "verification_status TEXT DEFAULT 'pending'",
+        "verification_token TEXT DEFAULT ''",
+        "last_http_ip TEXT DEFAULT ''",
+        "last_http_ip_version TEXT DEFAULT ''",
+        "last_http_ipv4 TEXT DEFAULT ''",
+        "last_http_ipv6 TEXT DEFAULT ''",
+        "last_webrtc_ipv4 TEXT DEFAULT ''",
+        "last_webrtc_ipv6 TEXT DEFAULT ''",
+        "last_udp_status TEXT DEFAULT ''",
+        "last_asn TEXT DEFAULT ''",
+        "last_as_organization TEXT DEFAULT ''",
+        "last_device_os TEXT DEFAULT ''",
+        "last_user_agent TEXT DEFAULT ''",
+    ];
+    const verificationColumns = [
+        "http_ip TEXT DEFAULT ''",
+        "http_ip_version TEXT DEFAULT ''",
+        "http_ipv4 TEXT DEFAULT ''",
+        "http_ipv6 TEXT DEFAULT ''",
+        "webrtc_ipv4 TEXT DEFAULT ''",
+        "webrtc_ipv6 TEXT DEFAULT ''",
+        "webrtc_protocol TEXT DEFAULT ''",
+        "webrtc_candidate_type TEXT DEFAULT ''",
+        "udp_status TEXT DEFAULT ''",
+        "asn TEXT DEFAULT ''",
+        "as_organization TEXT DEFAULT ''",
+        "device_os TEXT DEFAULT ''",
+        "token TEXT DEFAULT ''",
+        "raw_client_data TEXT DEFAULT ''",
+    ];
+    for (const column of userColumns) await addColumnIfMissing(env, "users", column);
+    for (const column of verificationColumns) await addColumnIfMissing(env, "ip_verifications", column);
+    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_verification_sessions_user_created ON verification_sessions(user_id, created_at)").run();
+    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_verification_sessions_status ON verification_sessions(status)").run();
+    verificationSchemaReady = true;
+}
+
+async function addColumnIfMissing(env, table, columnSql) {
+    try {
+        await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${columnSql}`).run();
+    } catch (error) {
+        const message = String(error?.message || error).toLowerCase();
+        if (!message.includes("duplicate") && !message.includes("exists") && !message.includes("duplicate column")) throw error;
+    }
 }

@@ -4,11 +4,26 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     username TEXT DEFAULT '',
     full_name TEXT DEFAULT '',
+    language_code TEXT DEFAULT '',
     note TEXT DEFAULT '',
     blocked INTEGER DEFAULT 0,
+    verified INTEGER DEFAULT 0,
+    verification_status TEXT DEFAULT 'pending',
+    verification_token TEXT DEFAULT '',
     last_verified_ip TEXT DEFAULT '',
     last_verified_at TEXT DEFAULT '',
     last_cf_country TEXT DEFAULT '',
+    last_http_ip TEXT DEFAULT '',
+    last_http_ip_version TEXT DEFAULT '',
+    last_http_ipv4 TEXT DEFAULT '',
+    last_http_ipv6 TEXT DEFAULT '',
+    last_webrtc_ipv4 TEXT DEFAULT '',
+    last_webrtc_ipv6 TEXT DEFAULT '',
+    last_udp_status TEXT DEFAULT '',
+    last_asn TEXT DEFAULT '',
+    last_as_organization TEXT DEFAULT '',
+    last_device_os TEXT DEFAULT '',
+    last_user_agent TEXT DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -64,10 +79,6 @@ CREATE TABLE IF NOT EXISTS rate_events (
     ts INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_rate_events_user_ts ON rate_events(user_id, ts);
-CREATE INDEX IF NOT EXISTS idx_inbox_user_created ON inbox_messages(user_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_inbox_created ON inbox_messages(created_at);
-
 CREATE TABLE IF NOT EXISTS ip_verifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
@@ -77,8 +88,56 @@ CREATE TABLE IF NOT EXISTS ip_verifications (
     user_agent TEXT DEFAULT '',
     passed INTEGER DEFAULT 1,
     turnstile_action TEXT DEFAULT '',
+    http_ip TEXT DEFAULT '',
+    http_ip_version TEXT DEFAULT '',
+    http_ipv4 TEXT DEFAULT '',
+    http_ipv6 TEXT DEFAULT '',
+    webrtc_ipv4 TEXT DEFAULT '',
+    webrtc_ipv6 TEXT DEFAULT '',
+    webrtc_protocol TEXT DEFAULT '',
+    webrtc_candidate_type TEXT DEFAULT '',
+    udp_status TEXT DEFAULT '',
+    asn TEXT DEFAULT '',
+    as_organization TEXT DEFAULT '',
+    device_os TEXT DEFAULT '',
+    token TEXT DEFAULT '',
+    raw_client_data TEXT DEFAULT '',
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS verification_sessions (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    chat_id INTEGER,
+    username TEXT DEFAULT '',
+    full_name TEXT DEFAULT '',
+    language_code TEXT DEFAULT '',
+    status TEXT DEFAULT 'pending',
+    http_ip TEXT DEFAULT '',
+    http_ip_version TEXT DEFAULT '',
+    http_ipv4 TEXT DEFAULT '',
+    http_ipv6 TEXT DEFAULT '',
+    webrtc_ipv4 TEXT DEFAULT '',
+    webrtc_ipv6 TEXT DEFAULT '',
+    webrtc_protocol TEXT DEFAULT '',
+    webrtc_candidate_type TEXT DEFAULT '',
+    udp_status TEXT DEFAULT '',
+    asn TEXT DEFAULT '',
+    as_organization TEXT DEFAULT '',
+    country TEXT DEFAULT '',
+    colo TEXT DEFAULT '',
+    device_os TEXT DEFAULT '',
+    user_agent TEXT DEFAULT '',
+    raw_client_data TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    verified_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_rate_events_user_ts ON rate_events(user_id, ts);
+CREATE INDEX IF NOT EXISTS idx_inbox_user_created ON inbox_messages(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_inbox_created ON inbox_messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_ip_verifications_user_created ON ip_verifications(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_ip_verifications_created ON ip_verifications(created_at);
+CREATE INDEX IF NOT EXISTS idx_verification_sessions_user_created ON verification_sessions(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_verification_sessions_status ON verification_sessions(status);
