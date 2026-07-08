@@ -13,7 +13,7 @@ export default {
     },
 };
 
-async function handleRequest(request, env, ctx) {
+export async function handleRequest(request, env, ctx) {
     const url = new URL(request.url);
     const path = normalizePath(url.pathname);
     const method = request.method.toUpperCase();
@@ -231,7 +231,7 @@ async function dashboard(request, env) {
 <div class="card"><div class="muted">消息记录</div><div class="metric">${stats[2]}</div></div>
 <div class="card"><div class="muted">CF 验证通过</div><div class="metric">${stats[3]}</div></div>
 </div>
-<div class="card"><h2>项目状态</h2><p class="muted">当前版本保留 Telegram 私聊双向通信、管理员回复、收件箱、用户管理、备注、封禁、广告拦截、多管理员、Cloudflare Turnstile 验证和 IP 记录。监控、RSS、群监听、AI 摘要、频道媒体、Docker/systemd 已从 Cloudflare 版本移除。</p>
+<div class="card"><h2>项目状态</h2><p class="muted">当前版本提供 Telegram 私聊双向通信、管理员回复、收件箱、用户管理、备注、封禁、广告拦截、多管理员、Cloudflare Turnstile 验证和 IP 记录，并同时支持 Workers 和 Pages Functions 部署。</p>
 <p><b>公开地址：</b><code>${h(base)}</code></p><p><b>验证页：</b><code>${h(`${base}/verify`)}</code></p></div>`;
     return html(layout("总览", body));
 }

@@ -1,31 +1,287 @@
 # TG DualBot Cloudflare
 
-Cloudflare Workers + D1 版本的 Telegram 双向机器人后台。
+Cloudflare Workers / Pages Functions + D1 版本的 Telegram 双向机器人后台。
 
-项目定位：把 Telegram Bot 的私聊消息接入 Cloudflare Worker，通过 Webhook 实现用户和管理员之间的双向消息转发，并提供一个 Web 后台用于查看消息、回复用户、管理用户、维护拦截规则和查看 Cloudflare 验证 IP。
+项目定位：把 Telegram Bot 的私聊消息接入 Cloudflare Workers 或 Pages Functions，通过 Webhook 实现用户和管理员之间的双向消息转发，并提供一个 Web 后台用于查看消息、回复用户、管理用户、维护拦截规则和查看 Cloudflare 验证 IP。
 
 ## 功能说明
 
-- Telegram 用户私聊 Bot 后，消息自动转发给管理员。
-- 管理员在 Telegram 里回复 Bot 转发的消息，Bot 自动回给原用户。
-- Web 后台收件箱可查看入站消息、出站回复、转发状态和错误信息。
-- Web 后台可直接回复用户。
-- 用户管理支持备注、封禁、解封，并显示最近一次 Cloudflare 验证 IP。
-- 私聊广告词拦截，命中后可自动封禁并通知管理员。
-- 支持最多 3 个管理员 Chat ID。
-- 转发失败的入站消息可在收件箱手动重试。
-- Cloudflare Turnstile 验证页 `/verify`，验证通过后显示访问者 IP，并写入后台验证记录。
-- 后台日志和 `/health` 健康检查。
+这个版本保留的是 Telegram 私聊双向机器人后台和 Cloudflare 验证能力，主要功能如下：
 
+- Telegram 用户私聊 Bot 后，消息自动写入 D1，并转发给管理员。
+- 入站消息支持文本和常见 Telegram 消息类型识别，包括 `text`、`photo`、`video`、`document`、`audio`、`voice`、`sticker` 等；转发管理员时优先使用 `copyMessage` 保留原消息形态，失败时自动降级为文本 fallback。
+- 管理员可以在 Telegram 里直接回复 Bot 转发的消息，系统根据 `message_map` 自动找到原用户并回发。
+- 管理员也可以使用 Telegram 命令 `/reply <user_id> <内容>` 主动按用户 ID 回复。
+- Web 后台收件箱可查看入站消息、出站回复、消息方向、消息来源、转发状态和错误信息。
+- Web 后台可直接回复用户，并把回复结果同步记录到收件箱。
+- 转发失败的入站消息可在收件箱手动重试。
+- 用户管理支持查看用户资料、备注、封禁、解封，并显示最近一次 Cloudflare 验证 IP。
+- 支持最多 3 个管理员 Chat ID，可通过后台设置保存，也可通过 Cloudflare 环境变量或 Secret 兜底配置。
+- 私聊广告词拦截支持一行一个关键词，命中后可自动封禁用户并通知管理员。
+- Cloudflare Turnstile 验证页 `/verify` 支持独立访问，也支持 `/verify?user_id=123456789` 绑定 Telegram 用户。
+- 验证通过后页面会显示访问者 IP、国家/地区、Cloudflare 机房和验证时间，并写入后台 `CF 验证记录`。
+- 绑定用户的验证通过后，会更新用户管理中的最近验证 IP，并向管理员发送 Telegram 通知。
+- 后台设置页可维护管理员 Chat ID、用户 `/start` 欢迎语，并检查关键 Cloudflare Secrets 是否已配置。
+- 后台日志页可查看最近运行事件，`/health` 可用于健康检查。
+- 后台登录使用用户名、密码和 Cookie Session；敏感值通过 Cloudflare Secrets 保存。
+- 同一套业务代码同时支持 Cloudflare Workers 部署和 Cloudflare Pages Functions 部署。
+
+## 完整功能清单
+
+| 功能大类 | 包含能力 | 使用入口 |
+|---|---|---|
+| Telegram 用户接入 | `/start` 注册或更新用户、返回欢迎语、返回专属 CF 验证链接 | Telegram 私聊 Bot |
+| 用户消息转发 | 用户私聊消息入库、识别消息类型、转发给所有管理员、记录转发结果 | `/telegram/webhook` |
+| Telegram 管理员回复 | 回复 Bot 转发消息自动回给原用户；也支持 `/reply` 命令按 user_id 回复 | Telegram 管理员对话 |
+| Telegram 管理命令 | `/block`、`/unblock`、`/note`、`/who`、`/spamwords`、`/spamadd`、`/spamdel`、`/verifylink` | Telegram 管理员对话 |
+| Web 收件箱 | 查看双向消息、查看错误、回复用户、重试失败转发 | `/inbox` |
+| 用户管理 | 查看用户 ID、username、昵称、备注、封禁状态、最近验证 IP，支持备注和封禁操作 | `/users` |
+| 广告拦截 | 维护私聊关键词，控制命中后是否自动封禁，命中后通知管理员 | `/rules` |
+| CF 验证与 IP 展示 | Turnstile 验证、显示访问 IP、记录国家/地区、机房、User-Agent，可关联 Telegram 用户 | `/verify`、`/verifications` |
+| 后台设置 | 配置管理员 Chat ID、修改欢迎语、查看公开地址、查看验证页、检查 Secrets 状态 | `/settings` |
+| 运行日志 | 记录关键错误、通知失败、Turnstile 失败等事件，后台可查看最近日志 | `/logs` |
+| 健康检查 | 返回 `ok`，用于确认 Workers 或 Pages Functions 是否可访问 | `/health` |
+| Cloudflare 部署 | Workers 使用 `worker.js`，Pages Functions 使用 `functions/[[path]].js` 复用同一套逻辑 | `wrangler deploy` / `wrangler pages deploy` |
+
+## 完整目录定位
+
+```text
+tg-dualbot-cloudflare/
+├─ .gitignore
+│  └─ Git 忽略规则，防止提交 node_modules、.env、.dev.vars、.wrangler 等本地或敏感文件。
+├─ package.json
+│  ├─ 项目包信息。
+│  ├─ npm run dev：按 Workers 模式本地启动 wrangler dev。
+│  ├─ npm run deploy：按 Workers 模式部署。
+│  ├─ npm run pages:deploy：按 Pages Functions 模式部署。
+│  ├─ npm run check：检查主 Worker 和 Pages 入口语法。
+│  └─ npm run db:apply：对远程 D1 执行初始化 SQL。
+├─ wrangler.toml
+│  ├─ Cloudflare Workers 部署配置。
+│  ├─ main = "worker.js" 指向主 Worker 入口。
+│  ├─ compatibility_date 固定运行时兼容日期。
+│  ├─ [[d1_databases]] 绑定 D1 数据库到 env.DB。
+│  └─ [vars] 保存非敏感公开变量：PUBLIC_BASE_URL、TURNSTILE_SITE_KEY、ADMIN_CHAT_IDS。
+├─ worker.js
+│  ├─ 项目核心业务代码。
+│  ├─ Workers 部署时由 wrangler.toml 的 main 直接加载。
+│  ├─ Pages 部署时由 functions/[[path]].js 导入复用。
+│  ├─ HTTP 路由分发。
+│  ├─ Web 后台页面渲染。
+│  ├─ Telegram Webhook 处理。
+│  ├─ Telegram Bot API 调用。
+│  ├─ D1 数据读写。
+│  ├─ Turnstile 验证和 IP 记录。
+│  └─ 登录、Cookie、日志、限流、转义等工具函数。
+├─ functions/
+│  └─ [[path]].js
+│     ├─ Cloudflare Pages Functions 的 catch-all 入口。
+│     ├─ 捕获 Pages 上的所有路径。
+│     └─ 调用 ../worker.js 里的 handleRequest()，保证 Pages 和 Workers 使用同一套逻辑。
+├─ public/
+│  └─ .keep
+│     └─ Pages 静态目录占位文件；Pages 部署上传 public，不把源码作为静态文件上传。
+├─ README.md
+│  └─ 项目说明、功能说明、部署步骤、运维命令、常见问题和目录定位。
+└─ migrations/
+   └─ 0001_initial.sql
+      ├─ D1 初始化数据库结构。
+      ├─ users：Telegram 用户、备注、封禁、最近验证 IP。
+      ├─ message_map：管理员消息 ID 到用户 ID 的映射。
+      ├─ inbox_messages：入站/出站消息记录。
+      ├─ spam_keywords：广告拦截关键词。
+      ├─ settings：后台配置。
+      ├─ event_logs：后台日志。
+      ├─ rate_events：用户限流记录。
+      └─ ip_verifications：Turnstile 验证和 IP 记录。
+```
+## 功能定位索引
+
+### Cloudflare Worker / Pages 入口
+
+| 功能 | 文件位置 | 说明 |
+|---|---|---|
+| Workers 入口 | `worker.js` -> `export default.fetch()` | 使用 `wrangler deploy` 部署 Workers 时，从这里进入。 |
+| Pages 入口 | `functions/[[path]].js` -> `onRequest()` | 使用 Pages 部署时，catch-all 函数把请求交给 `worker.js` 的 `handleRequest()`。 |
+| 主路由分发 | `worker.js` -> `handleRequest()` | 按 URL 和 HTTP method 分发到 Telegram Webhook、后台页面、验证页等功能。 |
+| HTML 响应工具 | `text()`、`html()`、`json()`、`redirect()` | 统一返回文本、HTML、JSON、跳转响应。 |
+| HTML 转义 | `h()` | 防止用户内容直接进入后台页面造成 HTML 注入。 |
+| 时间格式 | `nowIso()` | 统一使用 ISO 时间写入 D1。 |
+
+### 公开路由
+
+| 路由 | 方法 | 功能 | 处理函数 |
+|---|---|---|---|
+| `/health` | GET | 健康检查，返回 `ok` | `text("ok")` |
+| `/telegram/webhook` | POST | Telegram Webhook 入口 | `telegramWebhook()` |
+| `/verify` | GET | Cloudflare Turnstile 验证页面 | `verifyPage()` |
+| `/verify` | POST | 提交 Turnstile 验证并显示 IP | `verifySubmit()` |
+| `/login` | GET | 后台登录页 | `loginPage()` |
+| `/login` | POST | 后台登录提交 | `loginSubmit()` |
+| `/logout` | GET | 退出后台 | 清除 `tg_dualbot_session` Cookie |
+
+### 后台路由
+
+这些路由需要先登录后台。
+
+| 路由 | 方法 | 功能 | 处理函数 |
+|---|---|---|---|
+| `/` | GET | 后台总览，显示用户数、封禁数、消息数、验证数 | `dashboard()` |
+| `/inbox` | GET | 收件箱，显示入站/出站消息和转发状态 | `inboxPage()` |
+| `/inbox/{id}/reply` | GET | 打开某条消息的回复页面 | `inboxReplyPage()` |
+| `/inbox/{id}/reply` | POST | 从 Web 后台回复用户 | `inboxReplySave()` |
+| `/inbox/{id}/retry` | POST | 重试转发失败的入站消息 | `retryInbox()` |
+| `/users` | GET | 用户列表、备注、封禁状态、最近验证 IP | `usersPage()` |
+| `/users/{user_id}/note` | POST | 保存用户备注 | `userNoteSave()` |
+| `/users/{user_id}/block` | POST | 封禁用户 | `userBlockSet(..., true)` |
+| `/users/{user_id}/unblock` | POST | 解封用户 | `userBlockSet(..., false)` |
+| `/rules` | GET | 广告拦截规则页面 | `rulesPage()` |
+| `/rules` | POST | 保存广告关键词和自动封禁设置 | `rulesSave()` |
+| `/verifications` | GET | Cloudflare 验证 IP 记录 | `verificationsPage()` |
+| `/settings` | GET | 后台设置页，显示管理员 ID、欢迎语、Secrets 状态 | `settingsPage()` |
+| `/settings` | POST | 保存管理员 ID 和欢迎语 | `settingsSave()` |
+| `/logs` | GET | 查看最近后台日志 | `logsPage()` |
+
+### Telegram Webhook 功能
+
+| 功能 | 处理函数 | 过程 |
+|---|---|---|
+| Webhook 安全校验 | `telegramWebhook()` | 如果配置了 `TELEGRAM_SECRET_TOKEN`，校验 Telegram 请求头 `X-Telegram-Bot-Api-Secret-Token`。 |
+| Telegram update 分发 | `handleTelegramUpdate()` | 判断消息来源、命令、管理员回复、普通用户私聊。 |
+| `/start` | `handleCommand()` | 写入用户，回复欢迎语，并附带 `/verify?user_id=...` 验证链接。 |
+| `/verify` | `handleCommand()` | 给用户返回专属 Cloudflare 验证链接。 |
+| 管理员 `/reply` | `handleCommand()` | 管理员用 `/reply <user_id> <内容>` 发送给用户。 |
+| 管理员 `/block` | `handleCommand()` | 封禁指定用户。 |
+| 管理员 `/unblock` | `handleCommand()` | 解封指定用户。 |
+| 管理员 `/note` | `handleCommand()` | 给指定用户写备注。 |
+| 管理员 `/who` | `handleCommand()` | 查询指定用户信息和最近验证 IP。 |
+| 管理员 `/spamwords` | `handleCommand()` | 查看广告关键词。 |
+| 管理员 `/spamadd` | `handleCommand()` | 添加广告关键词。 |
+| 管理员 `/spamdel` | `handleCommand()` | 删除广告关键词。 |
+| 管理员 `/verifylink` | `handleCommand()` | 给指定 user_id 生成验证链接。 |
+| 用户普通消息 | `relayUserMessage()` | 写入用户和消息，检查封禁/限流/广告词，然后转发给管理员。 |
+| 管理员回复转发消息 | `adminReplyByMessage()` | 根据 `message_map` 找到原用户，把管理员回复发回用户。 |
+
+### Web 后台功能
+
+| 页面 | 作用 | 数据来源 |
+|---|---|---|
+| 总览 | 用户数、封禁数、消息记录数、验证通过数 | `users`、`inbox_messages`、`ip_verifications` |
+| 收件箱 | 查看所有入站和出站消息，回复用户，重试失败转发 | `inbox_messages`、`message_map` |
+| 用户管理 | 查看用户资料、备注、封禁/解封、最近验证 IP | `users` |
+| 广告拦截 | 管理私聊广告关键词，控制命中后是否自动封禁 | `spam_keywords`、`settings.spam_auto_block` |
+| CF 验证记录 | 查看通过 Turnstile 的 IP、国家、机房、User-Agent | `ip_verifications`、`users` |
+| 设置 | 配置管理员 Chat ID、欢迎语，查看 Secrets 配置状态 | `settings`、Worker env |
+| 日志 | 查看运行时记录的最近事件 | `event_logs` |
+
+### Cloudflare Turnstile 和 IP 显示
+
+| 功能 | 处理函数 | 说明 |
+|---|---|---|
+| 验证页渲染 | `verifyPage()` | 显示 Turnstile Widget，支持 `?user_id=` 关联 Telegram 用户。 |
+| 验证提交 | `verifySubmit()` | 调用 `https://challenges.cloudflare.com/turnstile/v0/siteverify` 校验 token。 |
+| 访客 IP 获取 | `visitorIp()` | 优先读取 `CF-Connecting-IP`，其次读取 `X-Forwarded-For`。 |
+| 验证记录 | `verifySubmit()` | 写入 `ip_verifications` 表。 |
+| 用户最近 IP | `verifySubmit()` | 如果带 `user_id`，更新 `users.last_verified_ip`、`last_verified_at`、`last_cf_country`。 |
+| 管理员通知 | `notifyAdmins()` | 验证通过后给管理员发送 `[CF 验证通过]` 通知。 |
+
+### D1 数据表定位
+
+| 表 | 字段重点 | 负责功能 |
+|---|---|---|
+| `users` | `user_id`、`username`、`full_name`、`note`、`blocked`、`last_verified_ip` | 用户管理、封禁、备注、验证 IP 展示 |
+| `message_map` | `admin_chat_id`、`admin_message_id`、`user_id`、`user_message_id` | 管理员 Telegram 回复映射到原用户 |
+| `inbox_messages` | `direction`、`source`、`message_type`、`text`、`forwarded`、`error` | 收件箱、Web 回复、失败重试、对话历史 |
+| `spam_keywords` | `keyword` | 私聊广告词拦截 |
+| `settings` | `key`、`value` | 管理员 Chat ID、欢迎语、广告拦截开关 |
+| `event_logs` | `level`、`message`、`data` | 后台日志 |
+| `rate_events` | `user_id`、`ts` | 用户私聊限流 |
+| `ip_verifications` | `user_id`、`ip`、`country`、`colo`、`user_agent` | Turnstile 验证记录和 IP 展示 |
+
+### 配置和密钥定位
+
+| 名称 | 类型 | 位置 | 作用 |
+|---|---|---|---|
+| `DB` | D1 binding | `wrangler.toml` -> `[[d1_databases]]` | Worker 通过 `env.DB` 访问 D1。 |
+| `PUBLIC_BASE_URL` | 普通变量 | `wrangler.toml` -> `[vars]` | 生成 Webhook 地址和用户验证链接。 |
+| `TURNSTILE_SITE_KEY` | 普通变量 | `wrangler.toml` -> `[vars]` | 前端显示 Turnstile Widget。 |
+| `ADMIN_CHAT_IDS` | 普通变量或 Secret | `wrangler.toml` / Cloudflare Secret | 管理员 Chat ID fallback。 |
+| `BOT_TOKEN` | Secret | `wrangler secret put BOT_TOKEN` | Telegram Bot API 调用。 |
+| `PANEL_USER` | Secret，可选 | `wrangler secret put PANEL_USER` | 后台用户名，不设置默认 `admin`。 |
+| `PANEL_PASSWORD` | Secret | `wrangler secret put PANEL_PASSWORD` | 后台登录密码。 |
+| `PANEL_SECRET` | Secret | `wrangler secret put PANEL_SECRET` | 后台 Cookie session 签名。 |
+| `TELEGRAM_SECRET_TOKEN` | Secret | `wrangler secret put TELEGRAM_SECRET_TOKEN` | Telegram Webhook 请求校验。 |
+| `TURNSTILE_SECRET_KEY` | Secret | `wrangler secret put TURNSTILE_SECRET_KEY` | Turnstile 服务端校验。 |
+
+### 关键数据流
+
+#### 用户发消息到管理员
+
+```text
+Telegram 用户私聊 Bot
+  -> Telegram Webhook POST /telegram/webhook
+  -> telegramWebhook()
+  -> handleTelegramUpdate()
+  -> relayUserMessage()
+  -> upsertUser()
+  -> createInboxMessage()
+  -> spamHits() / rateLimited() / isBlocked()
+  -> relayStoredInboxToAdmins()
+  -> tgCall(sendMessage/copyMessage)
+  -> saveMessageMap()
+  -> markInboxForwarded()
+```
+
+#### 管理员 Telegram 回复用户
+
+```text
+管理员回复 Bot 转发消息
+  -> Telegram Webhook POST /telegram/webhook
+  -> handleTelegramUpdate()
+  -> adminReplyByMessage()
+  -> message_map 查 user_id
+  -> sendTextToUser()
+  -> tgCall(sendMessage)
+  -> createOutboxMessage()
+```
+
+#### Web 后台回复用户
+
+```text
+管理员打开 /inbox/{id}/reply
+  -> inboxReplyPage()
+  -> POST /inbox/{id}/reply
+  -> inboxReplySave()
+  -> sendTextToUser()
+  -> createOutboxMessage()
+  -> notifyAdmins()
+```
+
+#### Cloudflare 验证并显示 IP
+
+```text
+访问 /verify 或 /verify?user_id=123456789
+  -> verifyPage()
+  -> Turnstile 前端验证
+  -> POST /verify
+  -> verifySubmit()
+  -> Turnstile siteverify
+  -> visitorIp() 读取 CF-Connecting-IP
+  -> 写入 ip_verifications
+  -> 如果有 user_id，更新 users 最近验证 IP
+  -> notifyAdmins()
+  -> 页面显示访问 IP
+```
 ## 部署后会用到的 Cloudflare 服务
 
 | 服务 | 作用 |
 |---|---|
-| Cloudflare Workers | 运行 Telegram Webhook、Web 后台和验证页 |
+| Cloudflare Workers | Workers 部署模式：运行 Telegram Webhook、Web 后台和验证页 |
 | Cloudflare D1 | 保存用户、消息、映射关系、广告词、设置、日志、验证记录 |
 | Cloudflare Turnstile | 提供 CF 验证，验证通过后显示并记录访问 IP |
 | Cloudflare Secrets | 保存 Bot Token、后台密码、Webhook Secret、Turnstile Secret 等敏感信息 |
-| workers.dev 或自定义域名 | 作为后台和 Telegram Webhook 的公网 HTTPS 地址 |
+| Cloudflare Pages | Pages 部署模式：通过 `functions/[[path]].js` 运行同一套后台逻辑 |
+| workers.dev、pages.dev 或自定义域名 | 作为后台和 Telegram Webhook 的公网 HTTPS 地址 |
 
 ## 部署前需要准备
 
@@ -88,7 +344,7 @@ https://api.telegram.org/bot<BOT_TOKEN>/getUpdates
 3. 点击 `Add widget`。
 4. Widget name 可填：`tg-dualbot-verify`。
 5. Widget mode 建议选择 `Managed`。
-6. Hostname 添加你的 Worker 域名或自定义域名。
+6. Hostname 添加你的 Workers、Pages 或自定义域名。
    - 如果先用 workers.dev，可以部署后再回到这里补域名。
    - 如果已有自定义域名，可以直接填自定义域名。
 7. 创建后记录两个值：
@@ -115,7 +371,9 @@ Get-ChildItem
 package.json
 wrangler.toml
 README.md
-src
+worker.js
+functions
+public
 migrations
 ```
 
@@ -345,12 +603,12 @@ npm run check
 等价于：
 
 ```powershell
-node --check src\worker.js
+node --check worker.js && node --check functions\[[path]].js
 ```
 
-如果没有输出错误，说明 Worker 语法正常。
+如果没有输出错误，说明 Workers 主入口和 Pages Functions 入口语法正常。
 
-## 第 9 步：部署 Worker
+## 第 9A 步：部署到 Cloudflare Workers
 
 ```powershell
 npx wrangler deploy
@@ -374,33 +632,134 @@ PUBLIC_BASE_URL = "https://tg-dualbot-cloudflare.xxx.workers.dev"
 npx wrangler deploy
 ```
 
+## 第 9B 步：部署到 Cloudflare Pages Functions
+
+如果你想使用 Cloudflare Pages 部署，也可以使用同一套业务代码。
+
+Pages 部署模式的入口是：
+
+```text
+functions/[[path]].js
+```
+
+这个文件会捕获 Pages 上的所有路径，并调用主目录 `worker.js` 中的 `handleRequest()`。因此 Workers 和 Pages 两种部署模式的功能一致。
+
+### Pages 部署前需要额外确认
+
+Pages 项目也需要同样的绑定和环境变量：
+
+| 名称 | 类型 | Pages 中如何配置 |
+|---|---|---|
+| `DB` | D1 binding | Pages 项目 Settings -> Functions -> D1 database bindings，绑定名必须是 `DB` |
+| `PUBLIC_BASE_URL` | Environment variable | Pages 项目 Settings -> Environment variables |
+| `TURNSTILE_SITE_KEY` | Environment variable | Pages 项目 Settings -> Environment variables |
+| `ADMIN_CHAT_IDS` | Environment variable 或 Secret | 可在 Pages 环境变量里设置，也可登录后台设置 |
+| `BOT_TOKEN` | Secret | `wrangler pages secret put BOT_TOKEN --project-name tg-dualbot-cloudflare` |
+| `PANEL_USER` | Secret，可选 | `wrangler pages secret put PANEL_USER --project-name tg-dualbot-cloudflare` |
+| `PANEL_PASSWORD` | Secret | `wrangler pages secret put PANEL_PASSWORD --project-name tg-dualbot-cloudflare` |
+| `PANEL_SECRET` | Secret | `wrangler pages secret put PANEL_SECRET --project-name tg-dualbot-cloudflare` |
+| `TELEGRAM_SECRET_TOKEN` | Secret | `wrangler pages secret put TELEGRAM_SECRET_TOKEN --project-name tg-dualbot-cloudflare` |
+| `TURNSTILE_SECRET_KEY` | Secret | `wrangler pages secret put TURNSTILE_SECRET_KEY --project-name tg-dualbot-cloudflare` |
+
+注意：`wrangler.toml` 主要服务 Workers 部署。Pages 项目在 Cloudflare Dashboard 中也要配置对应的 D1 binding、环境变量和 Secrets，尤其是 D1 绑定名必须叫 `DB`。
+
+### 创建 Pages 项目
+
+如果还没有 Pages 项目，可以先创建：
+
+```powershell
+npx wrangler pages project create tg-dualbot-cloudflare --production-branch main
+```
+
+如果项目已经存在，可以跳过。
+
+### 写入 Pages Secrets
+
+示例：
+
+```powershell
+npx wrangler pages secret put BOT_TOKEN --project-name tg-dualbot-cloudflare
+npx wrangler pages secret put PANEL_PASSWORD --project-name tg-dualbot-cloudflare
+npx wrangler pages secret put PANEL_SECRET --project-name tg-dualbot-cloudflare
+npx wrangler pages secret put TELEGRAM_SECRET_TOKEN --project-name tg-dualbot-cloudflare
+npx wrangler pages secret put TURNSTILE_SECRET_KEY --project-name tg-dualbot-cloudflare
+```
+
+如果要改后台用户名：
+
+```powershell
+npx wrangler pages secret put PANEL_USER --project-name tg-dualbot-cloudflare
+```
+
+### 部署 Pages
+
+项目提供了脚本：
+
+```powershell
+npm run pages:deploy
+```
+
+等价于：
+
+```powershell
+npx wrangler pages deploy public --project-name tg-dualbot-cloudflare
+```
+
+这里上传的是 `public/` 静态目录，业务请求由 `functions/[[path]].js` 接管。这样不会把 `worker.js`、`README.md`、`wrangler.toml` 等源码文件作为静态资源上传。
+
+部署完成后，终端会输出 Pages 地址，例如：
+
+```text
+https://tg-dualbot-cloudflare.pages.dev
+```
+
+把这个地址写入 Pages 项目的 `PUBLIC_BASE_URL` 环境变量，或如果继续使用 Workers 模式，则写入 `wrangler.toml`。
+
+使用 Pages 地址时，Telegram Webhook 应设置为：
+
+```text
+https://tg-dualbot-cloudflare.pages.dev/telegram/webhook
+```
 ## 第 10 步：配置自定义域名，可选
 
-如果你只使用 workers.dev，可以跳过此步。
+如果你只使用 `workers.dev` 或 `pages.dev`，可以跳过此步。
 
-如果要绑定自己的域名，例如 `bot.example.com`：
+如果要绑定自己的域名，例如 `bot.example.com`，按你的部署模式处理：
 
-1. 确认域名已经接入 Cloudflare。
-2. 进入 Cloudflare Dashboard。
-3. 打开 Workers & Pages。
-4. 找到 `tg-dualbot-cloudflare` Worker。
-5. 进入 `Settings` -> `Triggers`。
-6. 添加 `Custom Domain`。
-7. 填入 `bot.example.com`。
-8. 保存后等待证书生效。
-9. 把 `wrangler.toml` 里的 `PUBLIC_BASE_URL` 改成：
+| 部署模式 | 配置位置 | 配置完成后要做什么 |
+|---|---|---|
+| Workers | Cloudflare Dashboard -> Workers & Pages -> 对应 Worker -> Settings -> Triggers -> Custom Domains | 把 `PUBLIC_BASE_URL` 改成自定义域名后重新 `npx wrangler deploy` |
+| Pages Functions | Cloudflare Dashboard -> Workers & Pages -> 对应 Pages 项目 -> Custom domains | 把 Pages 项目的 `PUBLIC_BASE_URL` 环境变量改成自定义域名后重新部署 Pages |
+
+Workers 模式示例：
 
 ```toml
 PUBLIC_BASE_URL = "https://bot.example.com"
 ```
 
-10. 重新部署：
+重新部署 Workers：
 
 ```powershell
 npx wrangler deploy
 ```
 
-同时回到 Turnstile Widget，把 `bot.example.com` 添加到允许的 Hostname。
+Pages 模式则在 Pages 项目环境变量中把 `PUBLIC_BASE_URL` 设置为：
+
+```text
+https://bot.example.com
+```
+
+然后重新部署：
+
+```powershell
+npm run pages:deploy
+```
+
+无论使用 Workers 还是 Pages，都要同时回到 Turnstile Widget，把 `bot.example.com` 添加到允许的 Hostname，并把 Telegram Webhook 更新成：
+
+```text
+https://bot.example.com/telegram/webhook
+```
 
 ## 第 11 步：设置 Telegram Webhook
 
@@ -408,7 +767,7 @@ npx wrangler deploy
 
 ```powershell
 $BOT_TOKEN = "你的 Bot Token"
-$PUBLIC_BASE_URL = "https://你的 Worker 地址或自定义域名"
+$PUBLIC_BASE_URL = "https://你的 Workers、Pages 或自定义域名地址"
 $TELEGRAM_SECRET_TOKEN = "你写入 TELEGRAM_SECRET_TOKEN 的同一个值"
 ```
 
@@ -445,14 +804,14 @@ curl.exe "https://api.telegram.org/bot$BOT_TOKEN/getWebhookInfo"
 }
 ```
 
-如果 `last_error_message` 不为空，说明 Telegram 调用 Worker 失败，需要检查 Worker 地址、Secret Token、部署状态或 Cloudflare 日志。
+如果 `last_error_message` 不为空，说明 Telegram 调用 Workers 或 Pages Functions 失败，需要检查 Workers 或 Pages 地址、Secret Token、部署状态或 Cloudflare 日志。
 
 ## 第 12 步：打开后台并完成初始化
 
 打开：
 
 ```text
-https://你的 Worker 地址/
+https://你的 Workers 或 Pages 地址/
 ```
 
 登录：
@@ -544,7 +903,7 @@ https://你的 Worker 地址/
 打开：
 
 ```text
-https://你的 Worker 地址/verify
+https://你的 Workers 或 Pages 地址/verify
 ```
 
 通过 Turnstile 后，页面会显示：
@@ -561,7 +920,7 @@ https://你的 Worker 地址/verify
 打开：
 
 ```text
-https://你的 Worker 地址/verify?user_id=123456789
+https://你的 Workers 或 Pages 地址/verify?user_id=123456789
 ```
 
 把 `123456789` 换成真实 Telegram 用户 ID。
@@ -620,9 +979,9 @@ npx wrangler secret put SECRET_NAME
 检查：
 
 - `npx wrangler deploy` 是否成功。
-- Worker 地址是否正确。
+- Workers 或 Pages 地址是否正确。
 - 自定义域名证书是否生效。
-- Cloudflare Dashboard 里 Worker 是否有报错。
+- Cloudflare Dashboard 里 Workers 或 Pages Functions 是否有报错。
 
 ### 2. 登录失败
 
@@ -640,7 +999,7 @@ npx wrangler secret put SECRET_NAME
 - `BOT_TOKEN` 是否正确。
 - `getWebhookInfo` 中 URL 是否是 `/telegram/webhook`。
 - `TELEGRAM_SECRET_TOKEN` 是否和 `setWebhook` 传入的一致。
-- Worker 是否能访问 Telegram API。
+- Workers 或 Pages Functions 是否能访问 Telegram API。
 - 管理员 Chat ID 是否配置。
 
 ### 4. 管理员回复没有回到用户
@@ -655,7 +1014,7 @@ npx wrangler secret put SECRET_NAME
 
 - `TURNSTILE_SITE_KEY` 是否写在 `wrangler.toml`。
 - `TURNSTILE_SECRET_KEY` 是否用 Wrangler Secret 写入。
-- Turnstile Widget 的 Hostname 是否包含当前 Worker 域名或自定义域名。
+- Turnstile Widget 的 Hostname 是否包含当前 Workers、Pages 或自定义域名。
 - 浏览器是否能访问 `https://challenges.cloudflare.com`。
 
 ### 6. 验证通过但用户管理页没显示 IP
@@ -679,10 +1038,13 @@ tg-dualbot-cloudflare/
   package.json
   wrangler.toml
   README.md
+  worker.js
+  functions/
+    [[path]].js
+  public/
+    .keep
   migrations/
     0001_initial.sql
-  src/
-    worker.js
 ```
 
 ## 本地检查
@@ -696,5 +1058,5 @@ npm run check
 - `BOT_TOKEN`、`PANEL_PASSWORD`、`PANEL_SECRET`、`TELEGRAM_SECRET_TOKEN`、`TURNSTILE_SECRET_KEY` 必须放在 Cloudflare Secrets，不要写进 Git。
 - 后台密码使用强密码。
 - `PANEL_SECRET` 使用长随机字符串。
-- 如果换了域名，记得同步更新 `PUBLIC_BASE_URL`、Turnstile Hostname 和 Telegram Webhook。
+- 如果换了域名，记得同步更新 `PUBLIC_BASE_URL`、Turnstile Hostname 和 Telegram Webhook；Pages 模式要在 Pages 环境变量中同步更新。
 - 定期查看 `npx wrangler tail` 和后台日志。

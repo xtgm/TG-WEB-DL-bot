@@ -1,5 +1,5 @@
 name = "tg-dualbot-cloudflare"
-main = "src/worker.js"
+main = "worker.js"
 compatibility_date = "2026-07-08"
 
 [[d1_databases]]

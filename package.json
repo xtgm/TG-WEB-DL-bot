@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "check": "node --check src/worker.js",
-    "db:apply": "wrangler d1 execute tg-dualbot-db --file=./migrations/0001_initial.sql --remote"
+    "check": "node --check worker.js && node --check functions/[[path]].js",
+    "db:apply": "wrangler d1 execute tg-dualbot-db --file=./migrations/0001_initial.sql --remote",
+    "pages:deploy": "wrangler pages deploy public --project-name tg-dualbot-cloudflare"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"
