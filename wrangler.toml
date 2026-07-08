@@ -1,0 +1,22 @@
+name = "tg-dualbot-cloudflare"
+main = "src/worker.js"
+compatibility_date = "2026-07-08"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "tg-dualbot-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[vars]
+# Set this after deployment, for example:
+# PUBLIC_BASE_URL = "https://tg-dualbot-cloudflare.your-subdomain.workers.dev"
+PUBLIC_BASE_URL = ""
+
+# Cloudflare Turnstile site key. The secret key must be set with:
+# wrangler secret put TURNSTILE_SECRET_KEY
+TURNSTILE_SITE_KEY = ""
+
+# Optional fallback. Prefer editing admin IDs from the panel after first deploy,
+# or set as a secret with: wrangler secret put ADMIN_CHAT_IDS
+ADMIN_CHAT_IDS = ""
+

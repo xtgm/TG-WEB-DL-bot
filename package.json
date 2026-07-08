@@ -1,0 +1,15 @@
+{
+  "name": "tg-dualbot-cloudflare",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "node --check src/worker.js",
+    "db:apply": "wrangler d1 execute tg-dualbot-db --file=./migrations/0001_initial.sql --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
