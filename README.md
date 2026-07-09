@@ -6,6 +6,8 @@
 
 | 内容 | 跳转 |
 |---|---|
+| 环境变量完整说明 | [环境变量完整说明](#env-vars) |
+| D1 数据库初始化和建表 | [D1 数据库初始化和建表](#d1-setup) |
 | Workers 手动复制部署 | [Workers 手动复制部署](#workers-manual) |
 | Workers + GitHub 部署 | [Workers + GitHub 部署](#workers-github) |
 | Pages + GitHub 部署 | [Pages + GitHub 部署](#pages-github) |
@@ -27,6 +29,151 @@
 | 旧库升级 | [旧库升级](#upgrade) |
 | 常见问题 | [常见问题](#faq) |
 | 安全建议 | [安全建议](#security) |
+
+<a id="env-vars"></a>
+
+## 环境变量完整说明
+
+无论使用 Workers 手动复制部署、Workers + GitHub 部署，还是 Pages + GitHub 部署，都先按这一节准备 Cloudflare 配置。示例值可以照格式填写，正式部署时把域名、Token、密码和管理员 ID 换成你自己的真实值。
+
+### 必须绑定的 Cloudflare 资源
+
+| 类型 | 名称 | 必填 | 说明 |
+|---|---|---|---|
+| D1 Binding | `DB` | 是 | 绑定到你的 D1 数据库，例如 `tg-dualbot-db`。Binding 名称必须是 `DB`，否则代码无法访问数据库。 |
+
+### 普通变量
+
+普通变量可以直接放在 `wrangler.toml` 的 `[vars]`，也可以在 Cloudflare Dashboard 的项目环境变量里添加。
+
+| 变量名 | 示例 | 必填 | 使用方法 |
+|---|---|---|---|
+| `PUBLIC_BASE_URL` | `https://tg-dualbot-cloudflare.example.workers.dev` | 是 | 部署后的公开访问地址，用于生成 Telegram 验证链接和设置 Webhook。首次部署不知道地址时可以先留空，拿到地址后必须补上并重新部署。 |
+| `TURNSTILE_SITE_KEY` | `0x4AAAAA_example` | 是 | Cloudflare Turnstile 前端 Site Key，验证页面会用它显示验证组件。 |
+| `ADMIN_CHAT_IDS` | `123456789,987654321` | 是 | 管理员 Telegram Chat ID，多个用英文逗号分隔，最多取前 3 个；Web 后台设置页也可以保存。 |
+| `CONTROL_MODE` | `both` | 否 | 控制通道：`web` 只用 Web/管理员私聊，`topic` 只用 Telegram 话题，`both` 两边同时启用。默认 `web`。 |
+| `TOPIC_GROUP_ID` | `-1001234567890` | 话题模式必填 | 开启 Topics/Forum 的 Telegram 超级群 ID。只有 `CONTROL_MODE=topic` 或 `both` 时需要。 |
+| `TOPIC_CREATE_POLICY` | `after_verify` | 否 | 话题创建策略：`after_verify` 表示验证通过后创建，`first_message` 表示用户首条消息时创建。默认 `after_verify`。 |
+| `TOPIC_SYNC_WEB_REPLIES` | `true` | 否 | 是否把 Web 后台和管理员私聊回复同步写入用户专属话题。默认 `true`。 |
+
+`wrangler.toml` 示例：
+
+```toml
+[vars]
+PUBLIC_BASE_URL = "https://你的-worker或pages地址"
+TURNSTILE_SITE_KEY = "0x4AAAAA_example"
+ADMIN_CHAT_IDS = "123456789"
+CONTROL_MODE = "both"
+TOPIC_GROUP_ID = "-1001234567890"
+TOPIC_CREATE_POLICY = "after_verify"
+TOPIC_SYNC_WEB_REPLIES = "true"
+```
+
+### Secrets
+
+Secrets 不要写进 `wrangler.toml`、README、GitHub 仓库或截图里，只在 Cloudflare Dashboard 或 Wrangler Secret 命令里填写。
+
+| Secret 名称 | 示例格式 | 必填 | 使用方法 |
+|---|---|---|---|
+| `BOT_TOKEN` | `123456789:ABC_example` | 是 | Telegram Bot Token，Bot API 调用必须使用。 |
+| `PANEL_PASSWORD` | `your-strong-password` | 是 | Web 后台登录密码。 |
+| `PANEL_SECRET` | `random-long-session-secret` | 是 | Cookie Session 签名密钥，建议使用随机长字符串。 |
+| `TELEGRAM_SECRET_TOKEN` | `random-webhook-secret` | 强烈建议 | Telegram Webhook 请求头校验密钥，设置 Webhook 时要填同一个值。 |
+| `TURNSTILE_SECRET_KEY` | `0x4AAAAA_secret_example` | 是 | Turnstile 服务端校验密钥。 |
+| `PANEL_USER` | `admin` | 否 | Web 后台用户名，不设置时默认 `admin`。 |
+
+Wrangler Secret 命令示例：
+
+```powershell
+npx wrangler secret put BOT_TOKEN
+npx wrangler secret put PANEL_PASSWORD
+npx wrangler secret put PANEL_SECRET
+npx wrangler secret put TELEGRAM_SECRET_TOKEN
+npx wrangler secret put TURNSTILE_SECRET_KEY
+```
+
+### Dashboard 填写位置
+
+Workers 项目：
+
+1. D1 Binding：Worker 项目设置里添加 D1 Database Binding，Binding name 填 `DB`。
+2. 普通变量：Worker 项目设置的 Variables 里逐项添加普通变量。
+3. Secrets：同一设置页里添加 Secret 类型变量，填入 `BOT_TOKEN`、`PANEL_PASSWORD` 等敏感值。
+
+Pages 项目：
+
+1. D1 Binding：Pages 项目设置里添加 D1 Database Binding，Binding name 填 `DB`。
+2. 普通变量：Pages 项目设置的 Environment variables 里添加 Production 变量。
+3. Secrets：敏感值只在 Cloudflare Pages 项目设置里填写；如果界面提供 Secret/Encrypted 类型，敏感项选择该类型。
+
+<a id="d1-setup"></a>
+
+## D1 数据库初始化和建表
+
+新部署必须先创建 D1 数据库并执行建表 SQL。空数据库没有基础表时，Bot Webhook、Web 后台、验证页面都会因为找不到表而无法正常运行。
+
+### 需要创建的数据库
+
+| 项目 | 推荐值 | 说明 |
+|---|---|---|
+| Database name | `tg-dualbot-db` | 可以改名，但 README 和脚本默认使用这个名称。 |
+| Binding name | `DB` | 必须是 `DB`，代码固定通过 `env.DB` 访问 D1。 |
+| 初始化 SQL | `migrations/0001_initial.sql` | 新库只需要执行这个文件，它已经包含当前版本需要的完整表结构。 |
+
+### Dashboard 手动建库建表
+
+1. Cloudflare Dashboard 进入 `Workers & Pages`。
+2. 打开 `D1 SQL Database`，创建数据库，名称建议填 `tg-dualbot-db`。
+3. 进入这个 D1 数据库的 Console 或 Query 页面。
+4. 打开项目里的 `migrations/0001_initial.sql`，复制全部 SQL。
+5. 粘贴到 D1 Console 并执行。
+6. 回到 Worker 或 Pages 项目设置，添加 D1 Binding，Binding name 填 `DB`，Database 选择刚创建的数据库。
+
+### Wrangler 命令建库建表
+
+```powershell
+npx wrangler d1 create tg-dualbot-db
+```
+
+创建成功后，把命令输出里的 `database_id` 填进 `wrangler.toml` 的 `[[d1_databases]]`：
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "tg-dualbot-db"
+database_id = "你的 D1 database_id"
+```
+
+然后执行建表：
+
+```powershell
+npm run db:apply
+```
+
+### 新库会创建的表
+
+| 表名 | 作用 |
+|---|---|
+| `users` | Telegram 用户资料、验证状态、封禁状态、IP/设备信息、话题绑定信息。 |
+| `message_map` | 管理员私聊回复和原用户消息之间的映射。 |
+| `inbox_messages` | 用户入站消息、管理员出站消息、Web/话题转发状态。 |
+| `spam_keywords` | 私聊广告拦截关键词。 |
+| `settings` | 后台保存的管理员 ID、欢迎语、控制模式等设置。 |
+| `event_logs` | 系统事件和错误日志。 |
+| `rate_events` | 用户消息限频记录。 |
+| `ip_verifications` | Cloudflare Turnstile、HTTP IP、IPv4/IPv6、UDP WebRTC、ASN、设备记录。 |
+| `verification_sessions` | Telegram 用户一次性验证 token 和验证会话。 |
+
+### 旧库升级
+
+如果你是从旧版数据库升级，不要重复执行 `0001_initial.sql`。按缺少的版本执行：
+
+```powershell
+npm run db:upgrade:verification
+npm run db:upgrade:topics
+```
+
+如果旧库已经运行过新版 Worker，运行时代码可能已经自动补齐字段；这时升级 SQL 遇到重复字段可以停止，不影响新版运行。
 
 <a id="workers-manual"></a>
 
@@ -149,7 +296,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 登录 | `/login` | 输入后台用户名和密码，成功后写入 `tg_dualbot_session` Cookie。 |
 | 总览 | `/` | 显示用户数、封禁用户、已验证用户、消息记录、CF 验证通过数、公开地址和验证入口格式。 |
 | 收件箱 | `/inbox` | 显示用户入站消息、管理员出站回复、消息方向、来源、状态和错误；支持回复与重试。 |
-| 用户管理 | `/users` | 查看用户资料、备注、封禁、验证状态、HTTP IP、UDP WebRTC、ASN、设备系统；支持备注、封禁、解封、取消验证。 |
+| 用户管理 | `/users` | 查看用户资料、备注、封禁、验证状态、HTTP IP、UDP WebRTC、ASN、设备系统和话题绑定；支持备注、封禁、解封、取消验证、创建话题、重建话题、取消绑定。 |
 | 广告拦截 | `/rules` | 一行一个关键词；可开关命中后自动封禁。 |
 | CF 验证记录 | `/verifications` | 展示每次 Turnstile 通过后的 IP、UDP/WebRTC、ASN、设备系统、User-Agent 和时间。 |
 | 设置 | `/settings` | 保存管理员 Chat ID、欢迎语；查看公开地址、验证入口和 Secrets 配置状态。 |
@@ -285,6 +432,9 @@ Telegram 群要求：
 | `/users/{user_id}/block` | POST | 封禁用户。 |
 | `/users/{user_id}/unblock` | POST | 解封用户。 |
 | `/users/{user_id}/unverify` | POST | 取消用户验证状态。 |
+| `/users/{user_id}/topic/create` | POST | 为用户创建 Telegram 专属话题。 |
+| `/users/{user_id}/topic/rebuild` | POST | 强制重建用户专属话题。 |
+| `/users/{user_id}/topic/unbind` | POST | 取消用户和话题的绑定。 |
 | `/rules` | GET/POST | 查看和保存广告关键词。 |
 | `/verifications` | GET | CF 验证记录。 |
 | `/settings` | GET/POST | 后台设置。 |
@@ -296,10 +446,10 @@ Telegram 群要求：
 
 | 表 | 作用 |
 |---|---|
-| `users` | Telegram 用户资料、备注、封禁状态、验证状态、最近 HTTP/UDP/IP/ASN/设备信息。 |
+| `users` | Telegram 用户资料、备注、封禁状态、验证状态、最近 HTTP/UDP/IP/ASN/设备信息和话题绑定信息。 |
 | `verification_sessions` | 一次性验证 token、过期时间、验证状态和本次采集到的网络信息。 |
 | `ip_verifications` | 每次 Turnstile 通过后的验证记录。 |
-| `inbox_messages` | 入站消息、出站回复、消息类型、转发状态、错误信息。 |
+| `inbox_messages` | 入站消息、出站回复、消息类型、Web/话题转发状态、错误信息和话题消息元数据。 |
 | `message_map` | 管理员 Telegram 消息 ID 到用户消息的映射，用于回复定位。 |
 | `spam_keywords` | 广告关键词。 |
 | `settings` | 管理员 Chat ID、欢迎语等后台设置。 |
@@ -347,8 +497,10 @@ tg-dualbot-cloudflare/
 ├─ migrations/
 │  ├─ 0001_initial.sql
 │  │  └─ 新部署完整 D1 表结构。
-│  └─ 0002_verification_gate.sql
-│     └─ 旧数据库升级到验证门禁版本。
+│  ├─ 0002_verification_gate.sql
+│  │  └─ 旧数据库升级到验证门禁版本。
+│  └─ 0003_topic_mode.sql
+│     └─ 旧数据库升级到 Telegram 话题双通道版本。
 └─ README.md
    └─ 功能、部署、配置、验证和排错说明。
 ```
