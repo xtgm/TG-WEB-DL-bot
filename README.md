@@ -6,6 +6,9 @@
 
 | 内容 | 跳转 |
 |---|---|
+| Workers 手动复制部署 | [Workers 手动复制部署](#workers-manual) |
+| Workers + GitHub 部署 | [Workers + GitHub 部署](#workers-github) |
+| Pages + GitHub 部署 | [Pages + GitHub 部署](#pages-github) |
 | 项目定位 | [项目定位](#project-position) |
 | 功能总览 | [功能总览](#feature-overview) |
 | Web 面板功能 | [Web 面板功能](#web-panel) |
@@ -18,15 +21,93 @@
 | 配置项和密钥 | [配置项和密钥](#config) |
 | 新部署准备 | [新部署准备](#requirements) |
 | Workers CLI 部署 | [Workers CLI 部署](#workers-cli) |
-| Workers 手动复制部署 | [Workers 手动复制部署](#workers-manual) |
-| Workers + GitHub 部署 | [Workers + GitHub 部署](#workers-github) |
-| Pages + GitHub 部署 | [Pages + GitHub 部署](#pages-github) |
 | Pages Direct Upload 部署 | [Pages Direct Upload 部署](#pages-upload) |
 | Telegram Webhook 设置 | [Telegram Webhook 设置](#telegram-webhook-setup) |
 | 部署后验证 | [部署后验证](#post-deploy-check) |
 | 旧库升级 | [旧库升级](#upgrade) |
 | 常见问题 | [常见问题](#faq) |
 | 安全建议 | [安全建议](#security) |
+
+<a id="workers-manual"></a>
+
+## Workers 手动复制部署
+
+适合不想用 CLI 上传代码的情况。
+
+1. Cloudflare Dashboard 进入 `Workers & Pages`。
+2. 创建 Worker。
+3. 打开在线编辑器，把 `worker.js` 全部内容复制进去并保存部署。
+4. 在 Worker 设置里添加 D1 Binding：
+   - Binding name：`DB`
+   - Database：选择 `tg-dualbot-db`
+5. 在 Worker 设置里添加普通变量：
+   - `PUBLIC_BASE_URL`
+   - `TURNSTILE_SITE_KEY`
+   - `ADMIN_CHAT_IDS`
+   - `CONTROL_MODE`
+   - `TOPIC_GROUP_ID`
+   - `TOPIC_CREATE_POLICY`
+   - `TOPIC_SYNC_WEB_REPLIES`
+6. 在 Worker 设置里添加 Secret：
+   - `BOT_TOKEN`
+   - `PANEL_PASSWORD`
+   - `PANEL_SECRET`
+   - `TELEGRAM_SECRET_TOKEN`
+   - `TURNSTILE_SECRET_KEY`
+7. 打开 D1 控制台，对 `tg-dualbot-db` 执行 `migrations/0001_initial.sql`。
+8. 访问 `/health`，应返回 `ok`。
+9. 设置 Telegram Webhook。
+
+<a id="workers-github"></a>
+
+## Workers + GitHub 部署
+
+1. 把项目推送到 GitHub。
+2. Cloudflare Dashboard 进入 `Workers & Pages`。
+3. 选择从 GitHub 导入仓库，并选择 Workers 项目。
+4. Root directory 保持仓库根目录。
+5. 如果页面要求填写命令：
+   - Install command：`npm install`
+   - Deploy command：`npm run deploy`
+6. 确认项目使用根目录 `wrangler.toml`。
+7. 在 Cloudflare 项目设置中配置 D1 Binding、普通变量和 Secrets；话题模式需要配置 `CONTROL_MODE`、`TOPIC_GROUP_ID`、`TOPIC_CREATE_POLICY`、`TOPIC_SYNC_WEB_REPLIES`。
+8. 在 D1 控制台执行 `migrations/0001_initial.sql`。
+9. 触发一次部署。
+10. 部署地址确定后，更新 `PUBLIC_BASE_URL` 并重新部署。
+11. 设置 Telegram Webhook。
+
+<a id="pages-github"></a>
+
+## Pages + GitHub 部署
+
+Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker.js`。
+
+1. Cloudflare Dashboard 进入 `Workers & Pages`。
+2. 创建 Pages 项目并连接 GitHub 仓库。
+3. Root directory：仓库根目录。
+4. Build command：可留空；如果界面要求命令，可填 `npm install`。
+5. Build output directory：`public`。
+6. Functions directory：使用仓库里的 `functions`。
+7. 部署完成后，在 Pages 项目设置里添加 D1 Binding：
+   - Binding name：`DB`
+   - Database：`tg-dualbot-db`
+8. 添加普通变量：
+   - `PUBLIC_BASE_URL`
+   - `TURNSTILE_SITE_KEY`
+   - `ADMIN_CHAT_IDS`
+   - `CONTROL_MODE`
+   - `TOPIC_GROUP_ID`
+   - `TOPIC_CREATE_POLICY`
+   - `TOPIC_SYNC_WEB_REPLIES`
+9. 添加 Secrets：
+   - `BOT_TOKEN`
+   - `PANEL_PASSWORD`
+   - `PANEL_SECRET`
+   - `TELEGRAM_SECRET_TOKEN`
+   - `TURNSTILE_SECRET_KEY`
+10. 在 D1 控制台执行 `migrations/0001_initial.sql`。
+11. 重新部署 Pages。
+12. 设置 Telegram Webhook。
 
 <a id="project-position"></a>
 
@@ -410,87 +491,6 @@ npm run deploy
 ```powershell
 npm run deploy
 ```
-
-<a id="workers-manual"></a>
-
-## Workers 手动复制部署
-
-适合不想用 CLI 上传代码的情况。
-
-1. Cloudflare Dashboard 进入 `Workers & Pages`。
-2. 创建 Worker。
-3. 打开在线编辑器，把 `worker.js` 全部内容复制进去并保存部署。
-4. 在 Worker 设置里添加 D1 Binding：
-   - Binding name：`DB`
-   - Database：选择 `tg-dualbot-db`
-5. 在 Worker 设置里添加普通变量：
-   - `PUBLIC_BASE_URL`
-   - `TURNSTILE_SITE_KEY`
-   - `ADMIN_CHAT_IDS`
-   - `CONTROL_MODE`
-   - `TOPIC_GROUP_ID`
-   - `TOPIC_CREATE_POLICY`
-   - `TOPIC_SYNC_WEB_REPLIES`
-6. 在 Worker 设置里添加 Secret：
-   - `BOT_TOKEN`
-   - `PANEL_PASSWORD`
-   - `PANEL_SECRET`
-   - `TELEGRAM_SECRET_TOKEN`
-   - `TURNSTILE_SECRET_KEY`
-7. 打开 D1 控制台，对 `tg-dualbot-db` 执行 `migrations/0001_initial.sql`。
-8. 访问 `/health`，应返回 `ok`。
-9. 设置 Telegram Webhook。
-
-<a id="workers-github"></a>
-
-## Workers + GitHub 部署
-
-1. 把项目推送到 GitHub。
-2. Cloudflare Dashboard 进入 `Workers & Pages`。
-3. 选择从 GitHub 导入仓库，并选择 Workers 项目。
-4. Root directory 保持仓库根目录。
-5. 如果页面要求填写命令：
-   - Install command：`npm install`
-   - Deploy command：`npm run deploy`
-6. 确认项目使用根目录 `wrangler.toml`。
-7. 在 Cloudflare 项目设置中配置 D1 Binding、普通变量和 Secrets；话题模式需要配置 `CONTROL_MODE`、`TOPIC_GROUP_ID`、`TOPIC_CREATE_POLICY`、`TOPIC_SYNC_WEB_REPLIES`。
-8. 在 D1 控制台执行 `migrations/0001_initial.sql`。
-9. 触发一次部署。
-10. 部署地址确定后，更新 `PUBLIC_BASE_URL` 并重新部署。
-11. 设置 Telegram Webhook。
-
-<a id="pages-github"></a>
-
-## Pages + GitHub 部署
-
-Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker.js`。
-
-1. Cloudflare Dashboard 进入 `Workers & Pages`。
-2. 创建 Pages 项目并连接 GitHub 仓库。
-3. Root directory：仓库根目录。
-4. Build command：可留空；如果界面要求命令，可填 `npm install`。
-5. Build output directory：`public`。
-6. Functions directory：使用仓库里的 `functions`。
-7. 部署完成后，在 Pages 项目设置里添加 D1 Binding：
-   - Binding name：`DB`
-   - Database：`tg-dualbot-db`
-8. 添加普通变量：
-   - `PUBLIC_BASE_URL`
-   - `TURNSTILE_SITE_KEY`
-   - `ADMIN_CHAT_IDS`
-   - `CONTROL_MODE`
-   - `TOPIC_GROUP_ID`
-   - `TOPIC_CREATE_POLICY`
-   - `TOPIC_SYNC_WEB_REPLIES`
-9. 添加 Secrets：
-   - `BOT_TOKEN`
-   - `PANEL_PASSWORD`
-   - `PANEL_SECRET`
-   - `TELEGRAM_SECRET_TOKEN`
-   - `TURNSTILE_SECRET_KEY`
-10. 在 D1 控制台执行 `migrations/0001_initial.sql`。
-11. 重新部署 Pages。
-12. 设置 Telegram Webhook。
 
 <a id="pages-upload"></a>
 
