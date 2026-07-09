@@ -1,6 +1,6 @@
 # TG DualBot Cloudflare
 
-一句话介绍：这是一个支持 Cloudflare Workers 和 Cloudflare Pages Functions 部署的 Telegram 私聊双向机器人后台，提供用户消息转发、管理员回复、Web 管理面板、广告拦截、Cloudflare Turnstile 验证门禁以及 IPv4/IPv6/UDP WebRTC 记录。
+一句话介绍：这是一个支持 Cloudflare Workers 和 Cloudflare Pages Functions 部署的 Telegram 私聊双向机器人后台，提供用户消息转发、管理员回复、Web 管理面板、Telegram 群话题双通道控制、广告拦截、Cloudflare Turnstile 验证门禁以及 IPv4/IPv6/UDP WebRTC 记录。
 
 ## 目录
 
@@ -11,6 +11,7 @@
 | Web 面板功能 | [Web 面板功能](#web-panel) |
 | Telegram 功能 | [Telegram 功能](#telegram-features) |
 | Cloudflare 验证门禁 | [Cloudflare 验证门禁](#cloudflare-verification) |
+| Telegram 话题双通道 | [Telegram 话题双通道](#topic-mode) |
 | 路由表 | [路由表](#routes) |
 | 数据表 | [数据表](#database) |
 | 完整目录定位 | [完整目录定位](#project-tree) |
@@ -48,12 +49,13 @@
 |---|---|
 | Telegram 私聊接入 | 用户私聊 Bot 后自动登记用户资料，记录 username、昵称、语言、消息 ID 和消息类型。 |
 | 验证后聊天门禁 | 未通过验证的用户发送 `/start`、`/verify` 或普通消息时，只会收到验证按钮；验证通过前消息不会转发给管理员。 |
-| 双向消息转发 | 用户消息写入收件箱并转发给最多 3 个管理员，管理员回复 Bot 转发消息后自动回到原用户。 |
-| Web 后台回复 | 管理员可在 `/inbox` 页面查看消息、回复用户、重试转发失败的消息。 |
+| 双向消息转发 | 用户消息写入收件箱并转发给最多 3 个管理员；启用话题模式后也会同步到用户专属 Telegram 话题。 |
+| Web 后台回复 | 管理员可在 `/inbox` 页面查看消息、回复用户、重试转发失败的消息；启用话题模式后 Web 回复也可同步到话题。 |
 | 用户管理 | `/users` 展示用户资料、验证状态、备注、封禁状态、HTTP IPv4/IPv6、UDP WebRTC IPv4/IPv6、ASN、设备系统。 |
 | 广告拦截 | `/rules` 支持维护私聊关键词，命中后可自动封禁并通知管理员。 |
 | Cloudflare 验证记录 | `/verifications` 展示 Turnstile 通过记录、HTTP IP、WebRTC UDP 结果、国家、机房、ASN、User-Agent。 |
-| 多管理员 | `ADMIN_CHAT_IDS` 最多取 3 个管理员 ID，可通过后台设置或 Cloudflare 环境变量配置。 |
+| Telegram 话题控制 | `CONTROL_MODE=topic/both` 时，验证通过后可自动创建用户专属群话题，管理员在话题里回复会回到用户。 |
+| 多管理员 | `ADMIN_CHAT_IDS` 最多取 3 个管理员 ID，可通过后台设置或 Cloudflare 环境变量配置；话题回复也只允许这些 ID。 |
 | 后台登录 | `/login` 使用用户名、密码和 Cookie Session；密码、Bot Token 等敏感值通过 Cloudflare Secrets 保存。 |
 | 日志与健康检查 | `/logs` 查看运行事件；`/health` 返回 `ok`。 |
 
@@ -134,6 +136,44 @@
 - WebRTC UDP 记录受浏览器、代理、系统隐私设置、企业网络和运营商网络影响，可能显示 `empty`、`unsupported` 或 `failed`。
 - 本项目会记录字段和状态，不把空值伪造成真实 IP。
 
+<a id="topic-mode"></a>
+
+## Telegram 话题双通道
+
+话题模式让同一个项目同时支持 Web 后台和 Telegram 群话题控制。D1 数据库仍是唯一状态源，Web 后台和话题按钮都会修改同一份用户状态。
+
+控制模式：
+
+| 模式 | 说明 |
+|---|---|
+| `web` | 默认模式，保留 Web 后台和管理员私聊通知，不创建群话题。 |
+| `topic` | 用户消息进入 Web 收件箱并转发到群话题，不再私聊通知管理员。 |
+| `both` | Web 后台、管理员私聊通知、Telegram 群话题同时启用。 |
+
+需要额外配置：
+
+| 配置 | 示例 | 说明 |
+|---|---|---|
+| `CONTROL_MODE` | `both` | 启用双通道建议填 `both`。 |
+| `TOPIC_GROUP_ID` | `-1001234567890` | 开启 Topics/Forum 的 Telegram 超级群 ID。 |
+| `TOPIC_CREATE_POLICY` | `after_verify` | `after_verify` 表示验证通过后创建话题，`first_message` 表示首条消息时创建。 |
+| `TOPIC_SYNC_WEB_REPLIES` | `true` | Web 后台和管理员私聊回复是否同步写入用户专属话题。 |
+
+Telegram 群要求：
+
+- 群必须是超级群，并开启 Topics/Forum。
+- Bot 必须加入该群并具备创建话题、发送消息权限。
+- 话题内回复用户只允许 `ADMIN_CHAT_IDS` 里的 Telegram ID。
+- 如果要让 Bot 收到话题里的普通消息，建议在 BotFather 关闭 Privacy Mode。
+
+话题内操作：
+
+```text
+/admin
+```
+
+按钮包括通过验证、取消验证、拉黑、取消拉黑、获取用户信息、重建话题。Web 后台的用户管理页也提供创建话题、重建话题、取消绑定操作。
+
 <a id="routes"></a>
 
 ## 路由表
@@ -199,12 +239,13 @@ tg-dualbot-cloudflare/
 │  ├─ npm run check：检查 worker.js 和 Pages 入口语法。
 │  ├─ npm run db:apply：新部署初始化 D1。
 │  ├─ npm run db:upgrade:verification：旧库补验证门禁字段。
+│  ├─ npm run db:upgrade:topics：旧库补 Telegram 话题字段。
 │  └─ npm run pages:deploy：Pages Direct Upload。
 ├─ wrangler.toml
 │  ├─ name：Worker 名称。
 │  ├─ main = "worker.js"：Workers 入口。
 │  ├─ [[d1_databases]]：D1 绑定，binding 必须是 DB。
-│  └─ [vars]：PUBLIC_BASE_URL、TURNSTILE_SITE_KEY、ADMIN_CHAT_IDS。
+│  └─ [vars]：PUBLIC_BASE_URL、TURNSTILE_SITE_KEY、ADMIN_CHAT_IDS、CONTROL_MODE、TOPIC_GROUP_ID 等普通变量。
 ├─ worker.js
 │  ├─ export default.fetch()：Workers 入口。
 │  ├─ handleRequest()：统一路由分发。
@@ -241,6 +282,10 @@ tg-dualbot-cloudflare/
 |---|---|---|
 | `PUBLIC_BASE_URL` | `https://tg-dualbot-cloudflare.example.workers.dev` | 机器人生成验证链接、设置 Webhook 时使用的公开地址，正式部署必须填写。 |
 | `TURNSTILE_SITE_KEY` | `0x4AAAAA_example` | 前端 Turnstile Widget 使用。 |
+| `CONTROL_MODE` | `both` | 控制通道：`web`、`topic`、`both`。 |
+| `TOPIC_GROUP_ID` | `-1001234567890` | 话题群 ID。 |
+| `TOPIC_CREATE_POLICY` | `after_verify` | 话题创建策略。 |
+| `TOPIC_SYNC_WEB_REPLIES` | `true` | 是否把 Web 后台和管理员私聊回复同步到用户话题。 |
 | `ADMIN_CHAT_IDS` | `123456789,987654321` | 管理员 Chat ID，可后续在后台设置页保存。 |
 
 ### Cloudflare Secrets
@@ -332,6 +377,10 @@ database_id = "你的 D1 database_id"
 PUBLIC_BASE_URL = "https://你的-worker地址"
 TURNSTILE_SITE_KEY = "你的 Turnstile Site Key"
 ADMIN_CHAT_IDS = "123456789"
+CONTROL_MODE = "both"
+TOPIC_GROUP_ID = "-1001234567890"
+TOPIC_CREATE_POLICY = "after_verify"
+TOPIC_SYNC_WEB_REPLIES = "true"
 ```
 
 2. 写入 Secrets：
@@ -378,6 +427,10 @@ npm run deploy
    - `PUBLIC_BASE_URL`
    - `TURNSTILE_SITE_KEY`
    - `ADMIN_CHAT_IDS`
+   - `CONTROL_MODE`
+   - `TOPIC_GROUP_ID`
+   - `TOPIC_CREATE_POLICY`
+   - `TOPIC_SYNC_WEB_REPLIES`
 6. 在 Worker 设置里添加 Secret：
    - `BOT_TOKEN`
    - `PANEL_PASSWORD`
@@ -400,7 +453,7 @@ npm run deploy
    - Install command：`npm install`
    - Deploy command：`npm run deploy`
 6. 确认项目使用根目录 `wrangler.toml`。
-7. 在 Cloudflare 项目设置中配置 D1 Binding、普通变量和 Secrets。
+7. 在 Cloudflare 项目设置中配置 D1 Binding、普通变量和 Secrets；话题模式需要配置 `CONTROL_MODE`、`TOPIC_GROUP_ID`、`TOPIC_CREATE_POLICY`、`TOPIC_SYNC_WEB_REPLIES`。
 8. 在 D1 控制台执行 `migrations/0001_initial.sql`。
 9. 触发一次部署。
 10. 部署地址确定后，更新 `PUBLIC_BASE_URL` 并重新部署。
@@ -425,6 +478,10 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
    - `PUBLIC_BASE_URL`
    - `TURNSTILE_SITE_KEY`
    - `ADMIN_CHAT_IDS`
+   - `CONTROL_MODE`
+   - `TOPIC_GROUP_ID`
+   - `TOPIC_CREATE_POLICY`
+   - `TOPIC_SYNC_WEB_REPLIES`
 9. 添加 Secrets：
    - `BOT_TOKEN`
    - `PANEL_PASSWORD`
@@ -448,7 +505,7 @@ npm run pages:deploy
 部署后仍要在 Cloudflare Pages 项目设置里配置：
 
 - D1 Binding：`DB`。
-- 普通变量：`PUBLIC_BASE_URL`、`TURNSTILE_SITE_KEY`、`ADMIN_CHAT_IDS`。
+- 普通变量：`PUBLIC_BASE_URL`、`TURNSTILE_SITE_KEY`、`ADMIN_CHAT_IDS`、`CONTROL_MODE`、`TOPIC_GROUP_ID`、`TOPIC_CREATE_POLICY`、`TOPIC_SYNC_WEB_REPLIES`。
 - Secrets：`BOT_TOKEN`、`PANEL_PASSWORD`、`PANEL_SECRET`、`TELEGRAM_SECRET_TOKEN`、`TURNSTILE_SECRET_KEY`。
 
 <a id="telegram-webhook-setup"></a>
@@ -563,6 +620,12 @@ npm run db:apply
 npm run db:upgrade:verification
 ```
 
+如果旧库已经有验证门禁字段，但还没有 Telegram 话题字段，可以执行：
+
+```powershell
+npm run db:upgrade:topics
+```
+
 如果旧库已经运行过新版 Worker，运行时代码可能已经自动补齐字段；这时升级 SQL 遇到重复字段可以停止，不影响新版运行。
 
 <a id="faq"></a>
@@ -617,5 +680,6 @@ npm run db:upgrade:verification
 - `PANEL_SECRET` 建议使用随机长字符串。
 - D1 Binding 名称必须是 `DB`，不要改成其他名称。
 - `TELEGRAM_SECRET_TOKEN` 建议使用随机字符串，并在设置 Webhook 时同步传入。
+- 使用话题模式时，`TOPIC_GROUP_ID` 必须是开启 Topics/Forum 的超级群 ID，且 Bot 需要创建话题和发送消息权限。
 - Turnstile Widget 的 Hostname 要包含 Workers、Pages 或自定义域名。
 - 管理员 Chat ID 示例可用 `123456789`，正式部署要换成真实管理员 ID。

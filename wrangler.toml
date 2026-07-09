@@ -20,3 +20,14 @@ TURNSTILE_SITE_KEY = ""
 # or set as a secret with: wrangler secret put ADMIN_CHAT_IDS
 ADMIN_CHAT_IDS = ""
 
+# Message control mode: web, topic, or both.
+CONTROL_MODE = "web"
+
+# Telegram supergroup ID with Topics/Forum enabled, for CONTROL_MODE=topic/both.
+TOPIC_GROUP_ID = ""
+
+# Topic creation policy: after_verify or first_message.
+TOPIC_CREATE_POLICY = "after_verify"
+
+# Sync Web panel and private admin replies into the user's Telegram topic.
+TOPIC_SYNC_WEB_REPLIES = "true"

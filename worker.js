@@ -2,6 +2,8 @@ const COOKIE_NAME = "tg_dualbot_session";
 const DEFAULT_PANEL_USER = "admin";
 const VERIFY_SESSION_HOURS = 24;
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+const DEFAULT_CONTROL_MODE = "web";
+const DEFAULT_TOPIC_CREATE_POLICY = "after_verify";
 
 let verificationSchemaReady = false;
 
@@ -92,6 +94,15 @@ export async function handleRequest(request, env, ctx) {
 
     match = path.match(/^\/users\/(-?\d+)\/unverify$/);
     if (match && method === "POST") return userVerifyCancel(request, env, Number(match[1]));
+
+    match = path.match(/^\/users\/(-?\d+)\/topic\/create$/);
+    if (match && method === "POST") return userTopicCreate(request, env, Number(match[1]), false);
+
+    match = path.match(/^\/users\/(-?\d+)\/topic\/rebuild$/);
+    if (match && method === "POST") return userTopicCreate(request, env, Number(match[1]), true);
+
+    match = path.match(/^\/users\/(-?\d+)\/topic\/unbind$/);
+    if (match && method === "POST") return userTopicUnbind(request, env, Number(match[1]));
 
     return html(layout("未找到", `<div class="card"><p>页面不存在。</p></div>`), 404);
 }
@@ -295,7 +306,7 @@ async function retryInbox(request, env, id) {
     const row = await getInboxMessage(env, id);
     if (!row) return redirect("/inbox", request);
     try {
-        await relayStoredInboxToAdmins(env, row);
+        await relayInboxByMode(env, row);
     } catch (error) {
         await markInboxError(env, id, String(error));
     }
@@ -322,10 +333,17 @@ async function usersPage(request, env) {
             `UDP 状态: ${h(u.last_udp_status || "-")}`,
             u.last_device_os ? `设备: ${h(u.last_device_os)}` : "设备: -",
         ].join("<br>");
+        const topic = [
+            u.topic_thread_id ? `话题 ID: ${h(u.topic_thread_id)}` : "话题 ID: -",
+            `状态: ${h(u.topic_status || "-")}`,
+            u.topic_title ? `标题: ${h(u.topic_title)}` : "标题: -",
+            u.topic_last_error ? `错误: ${h(u.topic_last_error)}` : "",
+        ].filter(Boolean).join("<br>");
         const unverify = u.verified ? `<form method="post" action="/users/${u.user_id}/unverify" style="margin-top:8px"><button type="submit">取消验证</button></form>` : "";
-        return `<tr><td><b>${h(u.full_name || u.user_id)}</b><br><small>${u.user_id} @${h(u.username || "")}<br>语言: ${h(u.language_code || "-")}</small></td><td>${status}<br><small>${h(u.verification_status || "")}<br>${h(u.updated_at)}</small></td><td>${http}<br><small>${h(u.last_verified_at || "")}</small></td><td>${udp}</td><td>${h(u.note || "")}</td><td><form method="post" action="/users/${u.user_id}/note"><input name="note" value="${h(u.note || "")}"><button type="submit">保存备注</button></form><form method="post" action="/users/${u.user_id}/${actionPath}" style="margin-top:8px"><button class="${actionClass}" type="submit">${actionText}</button></form>${unverify}</td></tr>`;
+        const topicActions = `<form method="post" action="/users/${u.user_id}/topic/create" style="margin-top:8px"><button type="submit">创建话题</button></form><form method="post" action="/users/${u.user_id}/topic/rebuild" style="margin-top:8px"><button type="submit">重建话题</button></form><form method="post" action="/users/${u.user_id}/topic/unbind" style="margin-top:8px"><button type="submit">取消绑定</button></form>`;
+        return `<tr><td><b>${h(u.full_name || u.user_id)}</b><br><small>${u.user_id} @${h(u.username || "")}<br>语言: ${h(u.language_code || "-")}</small></td><td>${status}<br><small>${h(u.verification_status || "")}<br>${h(u.updated_at)}</small></td><td>${http}<br><small>${h(u.last_verified_at || "")}</small></td><td>${udp}</td><td>${topic}</td><td>${h(u.note || "")}</td><td><form method="post" action="/users/${u.user_id}/note"><input name="note" value="${h(u.note || "")}"><button type="submit">保存备注</button></form><form method="post" action="/users/${u.user_id}/${actionPath}" style="margin-top:8px"><button class="${actionClass}" type="submit">${actionText}</button></form>${unverify}${topicActions}</td></tr>`;
     }).join("");
-    return html(layout("用户管理", `<div class="card"><h2>用户管理</h2><p class="muted">展示已私聊过 Bot 的用户、验证状态、IPv4/IPv6、UDP WebRTC、封禁状态和备注。</p><table><tr><th>用户</th><th>状态</th><th>公网 HTTP 信息</th><th>UDP / WebRTC</th><th>备注</th><th>操作</th></tr>${bodyRows}</table></div>`));
+    return html(layout("用户管理", `<div class="card"><h2>用户管理</h2><p class="muted">展示已私聊过 Bot 的用户、验证状态、IPv4/IPv6、UDP WebRTC、话题绑定、封禁状态和备注。</p><table><tr><th>用户</th><th>状态</th><th>公网 HTTP 信息</th><th>UDP / WebRTC</th><th>话题</th><th>备注</th><th>操作</th></tr>${bodyRows}</table></div>`));
 }
 
 async function userNoteSave(request, env, userId) {
@@ -343,6 +361,22 @@ async function userBlockSet(request, env, userId, blocked) {
 
 async function userVerifyCancel(request, env, userId) {
     await setUserVerified(env, userId, false, "cancelled");
+    return redirect("/users", request);
+}
+
+async function userTopicCreate(request, env, userId, forceNew) {
+    await ensureVerificationSchema(env);
+    try {
+        await ensureUserTopic(env, userId, { forceNew, reason: forceNew ? "web:rebuild" : "web:create" });
+    } catch (error) {
+        await logEvent(env, "error", "failed to create topic from web", { userId, error: String(error?.message || error) });
+    }
+    return redirect("/users", request);
+}
+
+async function userTopicUnbind(request, env, userId) {
+    await ensureVerificationSchema(env);
+    await clearUserTopic(env, userId);
     return redirect("/users", request);
 }
 
@@ -394,10 +428,17 @@ async function verificationsPage(request, env) {
 async function settingsPage(request, env) {
     const adminIds = await adminChatIds(env);
     const welcome = await getSetting(env, "welcome_message", "已连接机器人后台。你的消息会转交给管理员。");
+    const mode = await controlMode(env);
+    const groupId = await topicGroupId(env);
+    const createPolicy = await topicCreatePolicy(env);
+    const syncWebReplies = await topicSyncWebReplies(env);
     const base = publicBaseUrl(env, request);
+    const option = (value, label, selected) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`;
     const body = `<div class="card"><h2>后台设置</h2><form method="post">
 <label>管理员 Telegram Chat ID（最多 3 个，逗号分隔）</label><input name="admin_chat_ids" value="${h(adminIds.join(","))}">
 <label>用户 /start 欢迎语</label><textarea name="welcome_message">${h(welcome)}</textarea>
+<div class="grid"><div><label>控制模式</label><select name="control_mode">${option("web", "仅 Web 后台", mode)}${option("topic", "仅 Telegram 话题", mode)}${option("both", "Web 后台 + Telegram 话题", mode)}</select></div><div><label>Telegram 话题群 ID</label><input name="topic_group_id" value="${h(groupId || "")}" placeholder="-1001234567890"></div></div>
+<div class="grid"><div><label>话题创建策略</label><select name="topic_create_policy">${option("after_verify", "验证通过后创建", createPolicy)}${option("first_message", "用户首条消息时创建", createPolicy)}</select></div><div><label><input type="checkbox" name="topic_sync_web_replies" ${syncWebReplies ? "checked" : ""} style="width:auto"> Web/私聊回复同步到话题</label></div></div>
 <div class="grid"><div><label>公开地址</label><input value="${h(base)}" readonly></div><div><label>验证入口</label><input value="${h(`${base}/verify/{token}`)}" readonly></div></div>
 <div class="actions"><button class="primary" type="submit">保存设置</button></div></form></div>
 <div class="card"><h2>Cloudflare Secrets 状态</h2>
@@ -408,6 +449,8 @@ ${secretRow("PANEL_SECRET", env.PANEL_SECRET, "Cookie session secret")}
 ${secretRow("TELEGRAM_SECRET_TOKEN", env.TELEGRAM_SECRET_TOKEN, "Telegram webhook secret token")}
 ${secretRow("TURNSTILE_SECRET_KEY", env.TURNSTILE_SECRET_KEY, "Cloudflare Turnstile secret")}
 ${secretRow("TURNSTILE_SITE_KEY", env.TURNSTILE_SITE_KEY, "Cloudflare Turnstile site key，可放 vars")}
+${secretRow("CONTROL_MODE", mode, "web / topic / both")}
+${secretRow("TOPIC_GROUP_ID", groupId, "开启 Topics 的 Telegram 超级群 ID")}
 </table></div>`;
     return html(layout("设置", body));
 }
@@ -418,8 +461,16 @@ function secretRow(name, value, note) {
 
 async function settingsSave(request, env) {
     const form = await request.formData();
+    const mode = String(form.get("control_mode") || DEFAULT_CONTROL_MODE).trim().toLowerCase();
+    const safeMode = ["web", "topic", "both"].includes(mode) ? mode : DEFAULT_CONTROL_MODE;
+    const policy = String(form.get("topic_create_policy") || DEFAULT_TOPIC_CREATE_POLICY).trim().toLowerCase();
+    const safePolicy = ["after_verify", "first_message"].includes(policy) ? policy : DEFAULT_TOPIC_CREATE_POLICY;
     await setSetting(env, "admin_chat_ids", String(form.get("admin_chat_ids") || ""));
     await setSetting(env, "welcome_message", String(form.get("welcome_message") || "").trim());
+    await setSetting(env, "control_mode", safeMode);
+    await setSetting(env, "topic_group_id", String(form.get("topic_group_id") || "").trim());
+    await setSetting(env, "topic_create_policy", safePolicy);
+    await setSetting(env, "topic_sync_web_replies", form.get("topic_sync_web_replies") ? "true" : "false");
     return redirect("/settings", request);
 }
 
@@ -609,7 +660,7 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     await env.DB.prepare(`UPDATE users SET verified=1, verification_status='verified', verification_token=?, language_code=COALESCE(NULLIF(language_code,''), ?), last_verified_ip=?, last_verified_at=?, last_cf_country=?, last_http_ip=?, last_http_ip_version=?, last_http_ipv4=?, last_http_ipv6=?, last_webrtc_ipv4=?, last_webrtc_ipv6=?, last_udp_status=?, last_asn=?, last_as_organization=?, last_device_os=?, last_user_agent=?, updated_at=? WHERE user_id=?`)
         .bind(token, session.language_code || "", ip || "", ts, cfInfo.country, ip || "", ipVersion(ip), network.http_ipv4, network.http_ipv6, network.webrtc_ipv4, network.webrtc_ipv6, network.udp_status, cfInfo.asn, cfInfo.asOrganization, deviceOs, userAgent.slice(0, 500), ts, userId)
         .run();
-    await notifyVerificationSuccess(env, userId, token, {
+    const verificationInfo = {
         username: session.username || "",
         fullName: session.full_name || String(userId),
         languageCode: session.language_code || "",
@@ -626,7 +677,9 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         country: cfInfo.country,
         colo: cfInfo.colo,
         deviceOs,
-    });
+    };
+    await completeTopicVerification(env, userId, verificationInfo);
+    await notifyVerificationSuccess(env, userId, token, verificationInfo);
     await tgSendMessage(env, userId, "验证已通过，现在可以回到 Telegram 继续聊天。").catch(() => {});
     return html(verifySuccessPage(ip, cfInfo, ts));
 }
@@ -677,8 +730,12 @@ async function handleTelegramUpdate(env, update) {
     if (!message || !message.chat) return;
     const chatId = Number(message.chat.id);
     const textValue = message.text || "";
-    const admin = await isAdminChat(env, chatId);
     const command = parseCommand(textValue);
+    if (await isTopicGroupMessage(env, message)) {
+        await handleTopicGroupMessage(env, message, command);
+        return;
+    }
+    const admin = await isAdminChat(env, chatId);
     if (command) {
         await handleCommand(env, message, command, admin);
         return;
@@ -695,6 +752,401 @@ async function handleTelegramUpdate(env, update) {
     }
     if (message.chat.type !== "private") return;
     await relayUserMessage(env, message);
+}
+
+
+async function controlMode(env) {
+    const fromDb = await getSetting(env, "control_mode", "");
+    const raw = String(fromDb || env.CONTROL_MODE || DEFAULT_CONTROL_MODE).trim().toLowerCase();
+    return ["web", "topic", "both"].includes(raw) ? raw : DEFAULT_CONTROL_MODE;
+}
+
+async function topicGroupId(env) {
+    const fromDb = await getSetting(env, "topic_group_id", "");
+    const raw = String(fromDb || env.TOPIC_GROUP_ID || "").trim();
+    const value = Number(raw);
+    return Number.isFinite(value) && value !== 0 ? value : null;
+}
+
+async function topicCreatePolicy(env) {
+    const fromDb = await getSetting(env, "topic_create_policy", "");
+    const raw = String(fromDb || env.TOPIC_CREATE_POLICY || DEFAULT_TOPIC_CREATE_POLICY).trim().toLowerCase();
+    return ["after_verify", "first_message"].includes(raw) ? raw : DEFAULT_TOPIC_CREATE_POLICY;
+}
+
+async function topicSyncWebReplies(env) {
+    const raw = await getSetting(env, "topic_sync_web_replies", env.TOPIC_SYNC_WEB_REPLIES ?? "true");
+    return String(raw || "true").toLowerCase() !== "false";
+}
+
+async function webRelayEnabled(env) {
+    return (await controlMode(env)) !== "topic";
+}
+
+async function topicEnabled(env) {
+    const mode = await controlMode(env);
+    return (mode === "topic" || mode === "both") && Boolean(await topicGroupId(env));
+}
+
+async function isTopicGroupMessage(env, message) {
+    const groupId = await topicGroupId(env);
+    if (!groupId) return false;
+    const mode = await controlMode(env);
+    return (mode === "topic" || mode === "both") && Number(message.chat?.id) === groupId;
+}
+
+function isForwardableMessage(message) {
+    if (!message) return false;
+    if (message.text?.startsWith("/")) return false;
+    if (message.new_chat_members || message.left_chat_member || message.group_chat_created || message.forum_topic_created || message.forum_topic_edited || message.forum_topic_closed || message.forum_topic_reopened) return false;
+    return true;
+}
+
+async function handleTopicGroupMessage(env, message, command) {
+    if (command?.name === "admin") {
+        await handleTopicAdminCommand(env, message);
+        return;
+    }
+    if (command) return;
+    if (!message.message_thread_id || message.from?.is_bot || !isForwardableMessage(message)) return;
+    if (!(await isAdminChat(env, message.from?.id))) return;
+    const groupId = await topicGroupId(env);
+    const user = await getUserByTopicThreadId(env, groupId, Number(message.message_thread_id));
+    if (!user || user.blocked) return;
+    try {
+        const sent = await tgCall(env, "copyMessage", {
+            chat_id: Number(user.user_id),
+            from_chat_id: groupId,
+            message_id: Number(message.message_id),
+        });
+        await createOutboxMessage(env, Number(user.user_id), messageText(message) || "(话题媒体消息)", "topic", sent.result.message_id, {
+            topic_chat_id: groupId,
+            topic_thread_id: Number(message.message_thread_id),
+            topic_message_id: Number(message.message_id),
+            admin_chat_id: Number(message.from.id),
+            admin_message_id: Number(message.message_id),
+        });
+    } catch (error) {
+        await logEvent(env, "error", "failed to relay topic message", { threadId: message.message_thread_id, error: String(error?.message || error) });
+        await tgCall(env, "sendMessage", {
+            chat_id: groupId,
+            message_thread_id: Number(message.message_thread_id),
+            text: `回复用户失败：${String(error?.message || error).slice(0, 400)}`,
+        }).catch(() => {});
+    }
+}
+
+async function handleTopicAdminCommand(env, message) {
+    const groupId = await topicGroupId(env);
+    if (!groupId || Number(message.chat?.id) !== groupId || !message.message_thread_id) return;
+    if (!(await isAdminChat(env, message.from?.id))) {
+        await tgCall(env, "sendMessage", {
+            chat_id: groupId,
+            message_thread_id: Number(message.message_thread_id),
+            text: "无权限。",
+        }).catch(() => {});
+        return;
+    }
+    const user = await getUserByTopicThreadId(env, groupId, Number(message.message_thread_id));
+    if (!user) {
+        await tgCall(env, "sendMessage", {
+            chat_id: groupId,
+            message_thread_id: Number(message.message_thread_id),
+            text: "当前话题没有绑定用户。",
+        });
+        return;
+    }
+    await tgCall(env, "sendMessage", {
+        chat_id: groupId,
+        message_thread_id: Number(message.message_thread_id),
+        text: topicAdminText(user),
+        reply_markup: topicAdminKeyboard(user),
+    });
+}
+
+function topicAdminText(user) {
+    return [
+        "用户管理",
+        `用户ID：${user.user_id}`,
+        `昵称：${user.full_name || "-"}`,
+        `用户名：${user.username ? `@${user.username}` : "无"}`,
+        `状态：${user.blocked ? "已封禁" : user.verified ? "已验证" : "未验证"}`,
+        `话题：${user.topic_thread_id || "无"}`,
+        `备注：${user.note || "无"}`,
+    ].join("\n");
+}
+
+function topicAdminKeyboard(user) {
+    const verifyButton = user.verified
+        ? { text: "取消验证", callback_data: `topicadmin:cancel:${user.user_id}` }
+        : { text: "通过验证", callback_data: `topicadmin:approve:${user.user_id}` };
+    const blockButton = user.blocked
+        ? { text: "取消拉黑", callback_data: `topicadmin:unban:${user.user_id}` }
+        : { text: "拉黑", callback_data: `topicadmin:ban:${user.user_id}` };
+    return {
+        inline_keyboard: [
+            [verifyButton],
+            [blockButton],
+            [{ text: "获取用户信息", callback_data: `topicadmin:who:${user.user_id}` }],
+            [{ text: "重建话题", callback_data: `topicadmin:rebuild:${user.user_id}` }],
+        ],
+    };
+}
+
+async function handleTopicAdminCallback(env, query) {
+    const data = String(query.data || "");
+    const [, action, rawUserId] = data.split(":");
+    const userId = Number(rawUserId);
+    const adminId = Number(query.from?.id || 0);
+    if (!(await isAdminChat(env, adminId))) {
+        await answerCallbackQuery(env, query.id, "无权限");
+        return;
+    }
+    if (!Number.isFinite(userId)) {
+        await answerCallbackQuery(env, query.id, "参数错误");
+        return;
+    }
+    const groupId = await topicGroupId(env);
+    const user = await getUser(env, userId);
+    if (!user) {
+        await answerCallbackQuery(env, query.id, "找不到用户");
+        return;
+    }
+    if (action === "approve") {
+        await setUserVerified(env, userId, true, "verified");
+        await tgSendMessage(env, userId, "管理员已为你通过验证。你现在可以继续聊天。").catch(() => {});
+        await answerCallbackQuery(env, query.id, "已通过验证");
+    } else if (action === "cancel") {
+        await setUserVerified(env, userId, false, "cancelled");
+        await tgSendMessage(env, userId, "管理员已取消你的验证状态，请重新完成验证后继续聊天。").catch(() => {});
+        await answerCallbackQuery(env, query.id, "已取消验证");
+    } else if (action === "ban") {
+        await setBlock(env, userId, true);
+        await tgSendMessage(env, userId, "管理员已将你加入黑名单，后续消息不会被转发。").catch(() => {});
+        await answerCallbackQuery(env, query.id, "已拉黑");
+    } else if (action === "unban") {
+        await setBlock(env, userId, false);
+        await tgSendMessage(env, userId, "管理员已取消你的拉黑状态。").catch(() => {});
+        await answerCallbackQuery(env, query.id, "已取消拉黑");
+    } else if (action === "who") {
+        const threadId = Number(query.message?.message_thread_id || user.topic_thread_id || 0);
+        await answerCallbackQuery(env, query.id, "已发送用户信息");
+        if (groupId && threadId) {
+            await tgCall(env, "sendMessage", { chat_id: groupId, message_thread_id: threadId, text: formatUserInfo(await getUser(env, userId)) });
+        }
+    } else if (action === "rebuild") {
+        await ensureUserTopic(env, userId, { forceNew: true, reason: "topicadmin:rebuild" });
+        await answerCallbackQuery(env, query.id, "已重建话题");
+    } else {
+        await answerCallbackQuery(env, query.id, "未知操作");
+        return;
+    }
+    if (groupId && query.message?.message_thread_id && action !== "rebuild") {
+        const latest = await getUser(env, userId);
+        await tgCall(env, "sendMessage", {
+            chat_id: groupId,
+            message_thread_id: Number(query.message.message_thread_id),
+            text: topicAdminText(latest),
+            reply_markup: topicAdminKeyboard(latest),
+        }).catch(() => {});
+    }
+}
+
+async function relayInboxByMode(env, row, originalMessage = null) {
+    const errors = [];
+    let delivered = false;
+    const mode = await controlMode(env);
+    const topicReady = await topicEnabled(env);
+    if (mode === "topic" && !topicReady) errors.push("topic: 未配置 TOPIC_GROUP_ID 或话题模式未启用");
+    if (await webRelayEnabled(env)) {
+        try {
+            await relayStoredInboxToAdmins(env, row, originalMessage);
+            delivered = true;
+        } catch (error) {
+            errors.push(`web: ${String(error?.message || error)}`);
+        }
+    }
+    if (topicReady) {
+        try {
+            await relayInboxToTopic(env, row);
+            delivered = true;
+        } catch (error) {
+            errors.push(`topic: ${String(error?.message || error)}`);
+        }
+    }
+    if (!delivered && errors.length) throw new Error(errors.join(" | "));
+    if (errors.length) await logEvent(env, "warn", "partial relay failure", { inboxId: row.id, errors });
+}
+
+async function relayInboxToTopic(env, row) {
+    const userId = Number(row.user_id);
+    let topic = await ensureUserTopic(env, userId, { reason: "relay" });
+    if (!topic) return false;
+    try {
+        const copy = await copyUserMessageToTopic(env, row, topic);
+        await markInboxTopicForwarded(env, row.id, topic, copy.message_id);
+        return true;
+    } catch (error) {
+        if (!isMessageThreadNotFoundError(error)) throw error;
+        topic = await ensureUserTopic(env, userId, { forceNew: true, reason: "thread-not-found" });
+        const copy = await copyUserMessageToTopic(env, row, topic);
+        await markInboxTopicForwarded(env, row.id, topic, copy.message_id);
+        return true;
+    }
+}
+
+async function copyUserMessageToTopic(env, row, topic) {
+    if (row.user_message_id) {
+        const result = await tgCall(env, "copyMessage", {
+            chat_id: topic.chatId,
+            from_chat_id: Number(row.user_id),
+            message_id: Number(row.user_message_id),
+            message_thread_id: topic.threadId,
+        });
+        return result.result;
+    }
+    const result = await tgCall(env, "sendMessage", {
+        chat_id: topic.chatId,
+        message_thread_id: topic.threadId,
+        text: row.text || "(非文本/媒体消息)",
+    });
+    return result.result;
+}
+
+async function syncOutboxToTopic(env, userId, textValue, source, outboxId) {
+    if (!(await topicEnabled(env)) || !(await topicSyncWebReplies(env))) return;
+    let topic = await ensureUserTopic(env, userId, { reason: "outbox-sync" });
+    if (!topic) return;
+    const label = source === "web:inbox" ? "Web 后台回复" : "管理员回复";
+    const payload = `[${label}]\n${textValue || "(空消息)"}`;
+    try {
+        const sent = await tgCall(env, "sendMessage", {
+            chat_id: topic.chatId,
+            message_thread_id: topic.threadId,
+            text: payload.slice(0, 3900),
+        });
+        await updateInboxTopicMeta(env, outboxId, topic, sent.result.message_id, null, null);
+    } catch (error) {
+        if (!isMessageThreadNotFoundError(error)) throw error;
+        topic = await ensureUserTopic(env, userId, { forceNew: true, reason: "outbox-thread-not-found" });
+        const sent = await tgCall(env, "sendMessage", {
+            chat_id: topic.chatId,
+            message_thread_id: topic.threadId,
+            text: payload.slice(0, 3900),
+        });
+        await updateInboxTopicMeta(env, outboxId, topic, sent.result.message_id, null, null);
+    }
+}
+
+async function ensureUserTopic(env, userId, options = {}) {
+    if (!(await topicEnabled(env))) return null;
+    const groupId = await topicGroupId(env);
+    const user = await getUser(env, userId);
+    if (!user) throw new Error(`User ${userId} not found`);
+    if (user.topic_thread_id && !options.forceNew) {
+        return { chatId: Number(user.topic_chat_id || groupId), threadId: Number(user.topic_thread_id), title: user.topic_title || "" };
+    }
+    const title = topicTitleForUser(user);
+    try {
+        const topic = await tgCall(env, "createForumTopic", {
+            chat_id: groupId,
+            name: title,
+        });
+        const threadId = Number(topic.result.message_thread_id);
+        await setUserTopic(env, userId, groupId, threadId, title, "active", "");
+        await tgCall(env, "sendMessage", {
+            chat_id: groupId,
+            message_thread_id: threadId,
+            text: topicIntroText({ ...user, topic_thread_id: threadId }),
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+        }).catch((error) => logEvent(env, "warn", "failed to send topic intro", { userId, error: String(error?.message || error) }));
+        return { chatId: groupId, threadId, title };
+    } catch (error) {
+        await setUserTopicError(env, userId, String(error?.message || error));
+        throw error;
+    }
+}
+
+function topicTitleForUser(user) {
+    const name = String(user.full_name || user.username || user.user_id || "User").replace(/[\r\n]+/g, " ").trim();
+    const suffix = user.username ? `@${user.username}` : String(user.user_id);
+    return `${name} ${suffix}`.slice(0, 120);
+}
+
+function topicIntroText(user) {
+    return [
+        "用户话题已创建",
+        `用户 ID：<code>${h(user.user_id)}</code>`,
+        `昵称：${h(user.full_name || "-")}`,
+        `用户名：${user.username ? `@${h(user.username)}` : "无"}`,
+        `语言：${h(user.language_code || "-")}`,
+        `状态：${user.blocked ? "已封禁" : user.verified ? "已验证" : "未验证"}`,
+    ].join("\n");
+}
+
+function topicVerificationText(info) {
+    return [
+        "本次验证信息",
+        `HTTP IP：${info.httpIp || "-"}`,
+        `公网 IPv4：${info.httpIpv4 || "-"}`,
+        `公网 IPv6：${info.httpIpv6 || "-"}`,
+        `WebRTC IPv4：${info.webrtcIpv4 || "-"}`,
+        `WebRTC IPv6：${info.webrtcIpv6 || "-"}`,
+        `UDP 状态：${info.udpStatus || "-"}`,
+        `ASN：${info.asn || "-"}`,
+        `运营商：${info.asOrganization || "-"}`,
+        `国家/地区：${info.country || "-"}`,
+        `设备系统：${info.deviceOs || "-"}`,
+    ].join("\n");
+}
+
+async function completeTopicVerification(env, userId, info) {
+    if (!(await topicEnabled(env))) return;
+    if ((await topicCreatePolicy(env)) !== "after_verify") return;
+    try {
+        const topic = await ensureUserTopic(env, userId, { reason: "verify" });
+        if (!topic) return;
+        await tgCall(env, "sendMessage", {
+            chat_id: topic.chatId,
+            message_thread_id: topic.threadId,
+            text: topicVerificationText(info),
+            disable_web_page_preview: true,
+        });
+    } catch (error) {
+        await logEvent(env, "error", "failed to complete topic verification", { userId, error: String(error?.message || error) });
+    }
+}
+
+async function setUserTopic(env, userId, chatId, threadId, title, status, lastError = "") {
+    const ts = nowIso();
+    await env.DB.prepare(`UPDATE users SET topic_chat_id=?, topic_thread_id=?, topic_title=?, topic_status=?, topic_created_at=?, topic_updated_at=?, topic_last_error=?, updated_at=? WHERE user_id=?`)
+        .bind(chatId, threadId, title || "", status || "active", ts, ts, String(lastError || "").slice(0, 1000), ts, userId)
+        .run();
+}
+
+async function setUserTopicError(env, userId, error) {
+    const ts = nowIso();
+    await env.DB.prepare("UPDATE users SET topic_status='error', topic_last_error=?, topic_updated_at=?, updated_at=? WHERE user_id=?")
+        .bind(String(error || "").slice(0, 1000), ts, ts, userId)
+        .run();
+}
+
+async function clearUserTopic(env, userId) {
+    const ts = nowIso();
+    await env.DB.prepare("UPDATE users SET topic_chat_id=NULL, topic_thread_id=NULL, topic_title='', topic_status='unbound', topic_updated_at=?, topic_last_error='', updated_at=? WHERE user_id=?")
+        .bind(ts, ts, userId)
+        .run();
+}
+
+async function getUserByTopicThreadId(env, chatId, threadId) {
+    return env.DB.prepare("SELECT * FROM users WHERE topic_chat_id=? AND topic_thread_id=?")
+        .bind(Number(chatId), Number(threadId))
+        .first();
+}
+
+function isMessageThreadNotFoundError(error) {
+    return String(error?.message || error).toLowerCase().includes("message thread not found");
 }
 
 function parseCommand(textValue) {
@@ -789,7 +1241,7 @@ function parseUserIdAndText(args) {
 }
 
 function formatUserInfo(row) {
-    return `用户信息\nuser_id: ${row.user_id}\nusername: @${row.username || ""}\nfull_name: ${row.full_name || ""}\nblocked: ${Boolean(row.blocked)}\nverified: ${Boolean(row.verified)}\nstatus: ${row.verification_status || "-"}\nnote: ${row.note || ""}\nHTTP IPv4: ${row.last_http_ipv4 || "-"}\nHTTP IPv6: ${row.last_http_ipv6 || "-"}\nUDP IPv4: ${row.last_webrtc_ipv4 || "-"}\nUDP IPv6: ${row.last_webrtc_ipv6 || "-"}\nASN: ${row.last_asn || "-"}\nupdated_at: ${row.updated_at}`;
+    return `用户信息\nuser_id: ${row.user_id}\nusername: @${row.username || ""}\nfull_name: ${row.full_name || ""}\nblocked: ${Boolean(row.blocked)}\nverified: ${Boolean(row.verified)}\nstatus: ${row.verification_status || "-"}\nnote: ${row.note || ""}\nHTTP IPv4: ${row.last_http_ipv4 || "-"}\nHTTP IPv6: ${row.last_http_ipv6 || "-"}\nUDP IPv4: ${row.last_webrtc_ipv4 || "-"}\nUDP IPv6: ${row.last_webrtc_ipv6 || "-"}\nASN: ${row.last_asn || "-"}\ntopic_thread_id: ${row.topic_thread_id || "-"}\ntopic_status: ${row.topic_status || "-"}\nupdated_at: ${row.updated_at}`;
 }
 
 async function relayUserMessage(env, message) {
@@ -820,7 +1272,7 @@ async function relayUserMessage(env, message) {
     }
     const row = await getInboxMessage(env, inboxId);
     try {
-        await relayStoredInboxToAdmins(env, row, message);
+        await relayInboxByMode(env, row, message);
         await tgSendMessage(env, message.chat.id, "已收到。");
     } catch (error) {
         await markInboxError(env, inboxId, String(error));
@@ -887,13 +1339,18 @@ async function adminReplyByMessage(env, message) {
 }
 
 async function sendTextToUser(env, userId, textValue, source) {
+    await ensureVerificationSchema(env);
     if (await isBlocked(env, userId)) throw new Error(`用户 ${userId} 已被封禁`);
     const sent = await tgCall(env, "sendMessage", { chat_id: userId, text: textValue });
-    await createOutboxMessage(env, userId, textValue, source, sent.result.message_id);
+    const outboxId = await createOutboxMessage(env, userId, textValue, source, sent.result.message_id);
+    if (source !== "topic") {
+        await syncOutboxToTopic(env, userId, textValue, source, outboxId).catch((error) => logEvent(env, "warn", "failed to sync outbox to topic", { userId, source, error: String(error?.message || error) }));
+    }
     return sent.result;
 }
 
 async function notifyAdmins(env, textValue, extraPayload = {}) {
+    if (!(await webRelayEnabled(env))) return;
     const ids = await adminChatIds(env);
     for (const id of ids) {
         try {
@@ -995,13 +1452,21 @@ VALUES(?,?,?,?,?,?,?,?,?,?)`)
     return result.meta.last_row_id;
 }
 
-async function createOutboxMessage(env, userId, textValue, source, messageId) {
+async function createOutboxMessage(env, userId, textValue, source, messageId, meta = {}) {
+    await ensureVerificationSchema(env);
     const user = await getUser(env, userId);
     const result = await env.DB.prepare(`INSERT INTO inbox_messages(user_id, username, full_name, user_message_id, direction, source, message_type, text, forwarded, created_at, forwarded_at)
 VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
-        .bind(userId, user?.username || "", user?.full_name || String(userId), messageId || null, "out", source, "text", textValue, 1, nowIso(), nowIso())
+        .bind(userId, user?.username || "", user?.full_name || String(userId), messageId || null, "out", source, meta.message_type || "text", textValue, 1, nowIso(), nowIso())
         .run();
-    return result.meta.last_row_id;
+    const id = result.meta.last_row_id;
+    if (meta.topic_chat_id || meta.topic_thread_id || meta.topic_message_id || meta.admin_chat_id || meta.admin_message_id) {
+        await updateInboxTopicMeta(env, id, {
+            chatId: meta.topic_chat_id || null,
+            threadId: meta.topic_thread_id || null,
+        }, meta.topic_message_id || null, meta.admin_chat_id || null, meta.admin_message_id || null);
+    }
+    return id;
 }
 
 async function getInboxMessage(env, id) {
@@ -1021,6 +1486,21 @@ async function markInboxError(env, id, error) {
 async function saveMessageMap(env, adminChatId, adminMessageId, userId, userMessageId) {
     await env.DB.prepare("INSERT OR REPLACE INTO message_map(admin_chat_id, admin_message_id, user_id, user_message_id, created_at) VALUES(?,?,?,?,?)")
         .bind(Number(adminChatId), Number(adminMessageId), Number(userId), userMessageId ? Number(userMessageId) : null, nowIso())
+        .run();
+}
+
+async function updateInboxTopicMeta(env, id, topic, topicMessageId = null, adminChatId = null, adminMessageId = null) {
+    if (!id) return;
+    await ensureVerificationSchema(env);
+    await env.DB.prepare("UPDATE inbox_messages SET topic_chat_id=?, topic_thread_id=?, topic_message_id=?, admin_chat_id=?, admin_message_id=? WHERE id=?")
+        .bind(topic?.chatId || null, topic?.threadId || null, topicMessageId || null, adminChatId || null, adminMessageId || null, id)
+        .run();
+}
+
+async function markInboxTopicForwarded(env, id, topic, topicMessageId) {
+    await ensureVerificationSchema(env);
+    await env.DB.prepare("UPDATE inbox_messages SET forwarded=1, topic_chat_id=?, topic_thread_id=?, topic_message_id=?, forwarded_at=?, error='' WHERE id=?")
+        .bind(topic?.chatId || null, topic?.threadId || null, topicMessageId || null, nowIso(), id)
         .run();
 }
 
@@ -1143,6 +1623,10 @@ function randomToken() {
 
 async function handleCallbackQuery(env, query) {
     const data = String(query.data || "");
+    if (data.startsWith("topicadmin:")) {
+        await handleTopicAdminCallback(env, query);
+        return;
+    }
     const adminId = Number(query.from?.id || query.message?.chat?.id || 0);
     if (!(await isAdminChat(env, adminId))) {
         await answerCallbackQuery(env, query.id, "无权限");
@@ -1315,6 +1799,20 @@ async function ensureVerificationSchema(env) {
         "last_as_organization TEXT DEFAULT ''",
         "last_device_os TEXT DEFAULT ''",
         "last_user_agent TEXT DEFAULT ''",
+        "topic_chat_id INTEGER",
+        "topic_thread_id INTEGER",
+        "topic_title TEXT DEFAULT ''",
+        "topic_status TEXT DEFAULT ''",
+        "topic_created_at TEXT DEFAULT ''",
+        "topic_updated_at TEXT DEFAULT ''",
+        "topic_last_error TEXT DEFAULT ''",
+    ];
+    const inboxColumns = [
+        "topic_chat_id INTEGER",
+        "topic_thread_id INTEGER",
+        "topic_message_id INTEGER",
+        "admin_chat_id INTEGER",
+        "admin_message_id INTEGER",
     ];
     const verificationColumns = [
         "http_ip TEXT DEFAULT ''",
@@ -1333,7 +1831,10 @@ async function ensureVerificationSchema(env) {
         "raw_client_data TEXT DEFAULT ''",
     ];
     for (const column of userColumns) await addColumnIfMissing(env, "users", column);
+    for (const column of inboxColumns) await addColumnIfMissing(env, "inbox_messages", column);
     for (const column of verificationColumns) await addColumnIfMissing(env, "ip_verifications", column);
+    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_users_topic ON users(topic_chat_id, topic_thread_id)").run();
+    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_inbox_topic_created ON inbox_messages(topic_chat_id, topic_thread_id, created_at)").run();
     await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_verification_sessions_user_created ON verification_sessions(user_id, created_at)").run();
     await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_verification_sessions_status ON verification_sessions(status)").run();
     verificationSchemaReady = true;
