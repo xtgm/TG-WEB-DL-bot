@@ -1617,12 +1617,10 @@ async function sendVerificationPrompt(env, chatId, from, textValue) {
     }
     await tgCall(env, "sendMessage", {
         chat_id: chatId,
-        text: `${textValue}\n\n请优先使用“Telegram 内验证”；如无法打开，再使用“浏览器验证”。验证通过前，你发送的消息不会被转发。`,
+        text: `${h(textValue)}\n\n如无法打开 Telegram 内验证，请使用 <a href="${h(link)}">浏览器备用验证</a>。`,
+        parse_mode: "HTML",
         reply_markup: {
-            inline_keyboard: [
-                [{ text: "Telegram 内验证", web_app: { url: link } }],
-                [{ text: "浏览器验证", url: link }],
-            ],
+            inline_keyboard: [[{ text: "打开验证界面", web_app: { url: link } }]],
         },
         disable_web_page_preview: true,
     });
