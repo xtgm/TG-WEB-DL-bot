@@ -125,7 +125,12 @@ function json(body, status = 200) {
 }
 
 function redirect(path, request, status = 303) {
-    return Response.redirect(new URL(path, request.url).toString(), status);
+    return new Response(null, {
+        status,
+        headers: {
+            Location: new URL(path, request.url).toString(),
+        },
+    });
 }
 
 function h(value) {
