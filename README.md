@@ -163,6 +163,8 @@ npm run db:apply
 | `rate_events` | 用户消息限频记录。 |
 | `ip_verifications` | Cloudflare Turnstile、HTTP IP、IPv4/IPv6、UDP WebRTC、ASN、设备记录。 |
 | `verification_sessions` | Telegram 用户一次性验证 token 和验证会话。 |
+| `webrtc_identity_labels` | 管理员手动标记的 WebRTC 精确哈希和标签；同一哈希全局唯一。 |
+| `webrtc_identity_confirmations` | 管理员人工确认后的用户与 WebRTC 标签关联；每个用户最多一行。 |
 
 ### 旧库升级
 
@@ -172,6 +174,7 @@ npm run db:apply
 npm run db:upgrade:verification
 npm run db:upgrade:topics
 npm run db:upgrade:fingerprint
+npm run db:upgrade:webrtc-identity
 ```
 
 如果旧库已经运行过新版 Worker，运行时代码可能已经自动补齐字段；这时升级 SQL 遇到重复字段可以停止，不影响新版运行。
@@ -284,6 +287,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 广告拦截 | `/rules` 支持维护私聊关键词，命中后可自动封禁并通知管理员。 |
 | Cloudflare 验证记录 | `/verifications` 展示 Turnstile 通过记录、HTTP IP、WebRTC UDP 结果、国家、机房、ASN、User-Agent。 |
 | 设备指纹精确匹配 | 验证页生成 Canvas、WebGL、屏幕和硬件特征哈希；服务端 32 字符指纹完全相同时读取已匹配用户的备注标签并显示相似度 `100%`。 |
+| WebRTC 人工身份标签 | 管理员使用现有备注手动标记 WebRTC；后续 WebRTC 精确命中只显示“待人工确认”，点击“确认同一人”后才建立持久标签关联。 |
 | Telegram 话题控制 | `CONTROL_MODE=topic/both` 时，验证通过后可自动创建用户专属群话题，管理员在话题里回复会回到用户。 |
 | 多管理员 | `ADMIN_CHAT_IDS` 最多取 3 个管理员 ID，可通过后台设置或 Cloudflare 环境变量配置；话题回复也只允许这些 ID。 |
 | 后台登录 | `/login` 使用用户名、密码和 Cookie Session；密码、Bot Token 等敏感值通过 Cloudflare Secrets 保存。 |
@@ -376,6 +380,25 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 - D1 只在 `users` 中保存每个用户最新的一条 32 字符指纹，不保存指纹历史；Canvas、WebGL、硬件和组件哈希不会写入 `ip_verifications` 或 `verification_sessions`。指纹查询使用部分索引，不扫描全表。
 - 用户重新验证只覆盖当前指纹；删除用户时该指纹随用户行一起删除。
 
+### WebRTC 标签与人工确认
+
+WebRTC 标签是独立于设备指纹的人工流程：
+
+1. 先通过 `/note <user_id> <标签>` 或 Web 后台给已知用户设置备注，例如 `小孩`。
+2. 管理员在验证通知或用户话题中点击“标记 WebRTC”。系统只保存当前 WebRTC 地址计算出的 32 字符 SHA-256 哈希，不在标签表重复保存原始 IP。
+3. 后续账号验证时，如果本次 WebRTC 哈希与标签完全一致，通知显示“WebRTC 标签命中（待人工确认）”。
+4. 管理员点击“确认同一人”后，才写入该用户的人工确认关联；系统不会自动拉黑或自动确认身份。
+
+资源限制：
+
+- 验证流程最多增加一次按唯一哈希索引的精确查询，不扫描全部用户或标签。
+- 自动匹配不会新增标签或确认记录；只有管理员点击标记或确认时才写入 D1。
+- 相同 WebRTC 哈希重复标记只更新原记录；每个来源用户最多保留 5 个直接标记。
+- 每个已确认用户在 `webrtc_identity_confirmations` 中最多一行，重新确认时覆盖。
+- 删除标签会同步删除对应确认关系；完整删除用户会同步清理其标签和确认记录。
+
+WebRTC 精确一致通常表示相同公网 NAT、代理或 VPN 出口，不等于自动证明同一人，因此最终确认必须由管理员完成。WebRTC candidate 来自浏览器提交的客户端数据，Turnstile 不会验证该字段真实性；恶意用户可能伪造，所以人工确认时还应结合 Telegram 账号、历史消息等其他证据。
+
 <a id="topic-mode"></a>
 
 ## Telegram 话题双通道
@@ -412,7 +435,7 @@ Telegram 群要求：
 /admin
 ```
 
-按钮包括通过验证、取消验证、拉黑、取消拉黑、获取用户信息、重建话题。Web 后台的用户管理页也提供创建话题、重建话题、解除话题绑定和删除用户操作。
+按钮包括通过验证、取消验证、拉黑、取消拉黑、获取用户信息、重建话题、标记 WebRTC 和查看 WebRTC 标签。WebRTC 精确命中后的验证通知还会显示“确认同一人”按钮；Web 后台的用户管理页继续提供创建话题、重建话题、解除话题绑定和删除用户操作。
 
 <a id="routes"></a>
 
@@ -462,6 +485,8 @@ Telegram 群要求：
 | `users` | Telegram 用户资料、备注、封禁状态、验证状态、最近 HTTP/UDP/IP/ASN/设备信息和话题绑定信息。 |
 | `verification_sessions` | 一次性验证 token、过期时间、验证状态和本次采集到的网络信息。 |
 | `ip_verifications` | 每次 Turnstile 通过后的验证记录。 |
+| `webrtc_identity_labels` | 管理员手动标记的 WebRTC 哈希、标签、来源用户和创建人。 |
+| `webrtc_identity_confirmations` | 每个用户当前由管理员确认的 WebRTC 标签关联。 |
 | `inbox_messages` | 入站消息、出站回复、消息类型、Web/话题转发状态、错误信息和话题消息元数据。 |
 | `message_map` | 管理员 Telegram 消息 ID 到用户消息的映射，用于回复定位。 |
 | `spam_keywords` | 广告关键词。 |
@@ -485,6 +510,7 @@ tg-dualbot-cloudflare/
 │  ├─ npm run db:upgrade:verification：旧库补验证门禁字段。
 │  ├─ npm run db:upgrade:topics：旧库补 Telegram 话题字段。
 │  ├─ npm run db:upgrade:fingerprint：旧库补设备指纹字段和索引。
+│  ├─ npm run db:upgrade:webrtc-identity：旧库新增 WebRTC 标签与人工确认表。
 │  └─ npm run pages:deploy：Pages Direct Upload。
 ├─ wrangler.toml
 │  ├─ name：Worker 名称。
@@ -515,8 +541,10 @@ tg-dualbot-cloudflare/
 │  │  └─ 旧数据库升级到验证门禁版本。
 │  ├─ 0003_topic_mode.sql
 │  │  └─ 旧数据库升级到 Telegram 话题双通道版本。
-│  └─ 0004_device_fingerprint.sql
-│     └─ 旧数据库升级到设备指纹精确匹配版本。
+│  ├─ 0004_device_fingerprint.sql
+│  │  └─ 旧数据库升级到设备指纹精确匹配版本。
+│  └─ 0005_webrtc_identity.sql
+│     └─ 旧数据库新增 WebRTC 标签与人工确认表。
 └─ README.md
    └─ 功能、部署、配置、验证和排错说明。
 ```
@@ -810,6 +838,14 @@ npm run db:upgrade:topics
 ```powershell
 npm run db:upgrade:fingerprint
 ```
+
+如果旧库还没有 WebRTC 标签与人工确认表，可以执行：
+
+```powershell
+npm run db:upgrade:webrtc-identity
+```
+
+该迁移不执行 `ALTER` 或删除操作，只使用外键开关和 `CREATE TABLE/INDEX IF NOT EXISTS`，可以安全重复执行。新版 Worker 也会在首次请求时自动补齐这两张表。
 
 如果旧库已经运行过新版 Worker，运行时代码可能已经自动补齐字段；这时升级 SQL 遇到重复字段可以停止，不影响新版运行。
 

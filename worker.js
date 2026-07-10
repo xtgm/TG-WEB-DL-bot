@@ -5,6 +5,9 @@ const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/sit
 const DEFAULT_CONTROL_MODE = "web";
 const DEFAULT_TOPIC_CREATE_POLICY = "after_verify";
 const DEVICE_FINGERPRINT_VERSION = "tg-dualbot-fp-v1";
+const WEBRTC_IDENTITY_VERSION = "tg-dualbot-webrtc-v1";
+const MAX_WEBRTC_LABELS_PER_USER = 5;
+const USER_WITH_IDENTITY_SELECT = "SELECT u.*, c.label_id AS confirmed_identity_label_id, c.confirmed_at AS identity_confirmed_at, l.label_name AS identity_label_name, l.source_user_id AS identity_label_source_user_id FROM users u LEFT JOIN webrtc_identity_confirmations c ON c.user_id=u.user_id LEFT JOIN webrtc_identity_labels l ON l.id=c.label_id";
 
 let verificationSchemaReady = false;
 
@@ -195,6 +198,220 @@ async function buildDeviceFingerprint(clientData = {}) {
         webglHash,
     ]);
     return (await sha256Hex(payload)).slice(0, 32);
+}
+
+function normalizeIpv6Address(value) {
+    const input = String(value || "").trim().toLowerCase();
+    if (!input || input.indexOf("::") !== input.lastIndexOf("::")) return "";
+    const parseParts = (text) => {
+        if (!text) return [];
+        const parts = text.split(":");
+        const result = [];
+        for (const part of parts) {
+            if (!part) return null;
+            if (part.includes(".")) {
+                const octets = part.split(".").map(Number);
+                if (octets.length !== 4 || !octets.every((item) => Number.isInteger(item) && item >= 0 && item <= 255)) return null;
+                result.push(((octets[0] << 8) | octets[1]).toString(16));
+                result.push(((octets[2] << 8) | octets[3]).toString(16));
+            } else {
+                if (!/^[0-9a-f]{1,4}$/.test(part)) return null;
+                result.push(part);
+            }
+        }
+        return result;
+    };
+    const compressed = input.includes("::");
+    const [leftText, rightText = ""] = compressed ? input.split("::") : [input, ""];
+    const left = parseParts(leftText);
+    const right = parseParts(rightText);
+    if (!left || !right) return "";
+    const missing = 8 - left.length - right.length;
+    if ((compressed && missing < 1) || (!compressed && missing !== 0)) return "";
+    const groups = [...left, ...Array(compressed ? missing : 0).fill("0"), ...right];
+    if (groups.length !== 8) return "";
+    return groups.map((part) => Number.parseInt(part, 16).toString(16).padStart(4, "0")).join(":");
+}
+
+function normalizedWebRtcIdentityAddress(value = {}) {
+    const rawIpv4 = cleanIp(value.webrtc_ipv4 ?? value.last_webrtc_ipv4, "IPv4");
+    if (rawIpv4) {
+        const octets = rawIpv4.split(".").map(Number);
+        if (octets.length === 4 && octets.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) {
+            return { ip: octets.join("."), ipVersion: "IPv4" };
+        }
+    }
+    const rawIpv6 = cleanIp(value.webrtc_ipv6 ?? value.last_webrtc_ipv6, "IPv6");
+    const ipv6 = normalizeIpv6Address(rawIpv6);
+    if (ipv6) return { ip: ipv6, ipVersion: "IPv6" };
+    return { ip: "", ipVersion: "" };
+}
+
+async function buildWebRtcIdentity(value = {}) {
+    const address = normalizedWebRtcIdentityAddress(value);
+    if (!address.ip) return { ...address, hash: "" };
+    const hash = await sha256Hex(JSON.stringify([WEBRTC_IDENTITY_VERSION, address.ipVersion, address.ip]));
+    return { ...address, hash: hash.slice(0, 32) };
+}
+
+async function findWebRtcIdentityLabel(env, userId, network) {
+    const identity = await buildWebRtcIdentity(network);
+    if (!identity.hash) return { ...identity, label: null };
+    const label = await env.DB.prepare(
+        "SELECT l.id, l.webrtc_hash, l.label_name, l.source_user_id, l.created_by_user_id, l.ip_version, l.created_at, l.updated_at, " +
+        "CASE WHEN c.user_id IS NULL THEN 0 ELSE 1 END AS confirmed " +
+        "FROM webrtc_identity_labels l " +
+        "LEFT JOIN webrtc_identity_confirmations c ON c.user_id=? AND c.label_id=l.id " +
+        "WHERE l.webrtc_hash=? LIMIT 1",
+    ).bind(Number(userId), identity.hash).first();
+    return { ...identity, label: label || null };
+}
+
+async function getWebRtcIdentityLabelById(env, labelId) {
+    return env.DB.prepare("SELECT * FROM webrtc_identity_labels WHERE id=?").bind(Number(labelId)).first();
+}
+
+async function upsertWebRtcIdentityConfirmation(env, user, label, adminId) {
+    const expectedIpv4 = String(user?.last_webrtc_ipv4 || "");
+    const expectedIpv6 = String(user?.last_webrtc_ipv6 || "");
+    const result = await env.DB.prepare(
+        "INSERT INTO webrtc_identity_confirmations(user_id, label_id, confirmed_by_user_id, confirmed_at) " +
+        "SELECT u.user_id, l.id, ?, ? FROM users u JOIN webrtc_identity_labels l ON l.id=? " +
+        "WHERE u.user_id=? AND u.last_webrtc_ipv4=? AND lower(u.last_webrtc_ipv6)=lower(?) " +
+        "ON CONFLICT(user_id) DO UPDATE SET label_id=excluded.label_id, confirmed_by_user_id=excluded.confirmed_by_user_id, confirmed_at=excluded.confirmed_at",
+    ).bind(Number(adminId), nowIso(), Number(label?.id), Number(user?.user_id), expectedIpv4, expectedIpv6).run();
+    return Number(result.meta?.changes || 0) > 0;
+}
+
+async function markWebRtcIdentityLabel(env, user, adminId, expectedHash = "") {
+    const labelName = String(user?.note || "").trim().slice(0, 80);
+    if (!labelName) return { error: "请先使用 /note 或后台备注设置标签，再标记 WebRTC。" };
+    const identity = await buildWebRtcIdentity({
+        last_webrtc_ipv4: user?.last_webrtc_ipv4,
+        last_webrtc_ipv6: user?.last_webrtc_ipv6,
+    });
+    if (!identity.hash) return { error: "该用户没有可用的 WebRTC 地址，无法标记。" };
+    if (expectedHash && (!/^[0-9a-f]{32}$/.test(expectedHash) || identity.hash !== expectedHash)) {
+        return { error: "用户 WebRTC 已变化，请使用最新验证通知重新标记。" };
+    }
+    const existing = await env.DB.prepare("SELECT * FROM webrtc_identity_labels WHERE webrtc_hash=?")
+        .bind(identity.hash)
+        .first();
+    if (existing && Number(existing.source_user_id) !== Number(user.user_id)) {
+        return { error: "该 WebRTC 已标记为“" + String(existing.label_name || "").slice(0, 80) + "”，如需更换请先删除旧标签。" };
+    }
+    let labelId = Number(existing?.id || 0);
+    let insertedByThisCall = false;
+    if (!existing) {
+        const slotRows = await env.DB.prepare("SELECT slot FROM webrtc_identity_labels WHERE source_user_id=?")
+            .bind(Number(user.user_id))
+            .all();
+        const usedSlots = new Set((slotRows.results || []).map((row) => Number(row.slot)));
+        let slot = 0;
+        for (let candidate = 1; candidate <= MAX_WEBRTC_LABELS_PER_USER; candidate += 1) {
+            if (!usedSlots.has(candidate)) {
+                slot = candidate;
+                break;
+            }
+        }
+        if (!slot) return { error: "该用户最多保存 5 个 WebRTC 标签，请先删除旧标签。" };
+        const ts = nowIso();
+        const insertResult = await env.DB.prepare(
+            "INSERT OR IGNORE INTO webrtc_identity_labels(webrtc_hash, label_name, source_user_id, created_by_user_id, ip_version, slot, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+        ).bind(identity.hash, labelName, Number(user.user_id), Number(adminId), identity.ipVersion, slot, ts, ts).run();
+        insertedByThisCall = Number(insertResult.meta?.changes || 0) > 0;
+        const inserted = await env.DB.prepare("SELECT * FROM webrtc_identity_labels WHERE webrtc_hash=?").bind(identity.hash).first();
+        if (!inserted) return { error: "标签位置刚被其他管理员占用，请重试。" };
+        if (Number(inserted.source_user_id) !== Number(user.user_id)) {
+            return { error: "该 WebRTC 已标记为“" + String(inserted.label_name || "").slice(0, 80) + "”，如需更换请先删除旧标签。" };
+        }
+        labelId = Number(inserted.id || 0);
+    }
+    if (!labelId) return { error: "WebRTC 标签保存失败，请稍后重试。" };
+    const savedLabel = await getWebRtcIdentityLabelById(env, labelId);
+    if (!savedLabel) return { error: "WebRTC 标签已被其他管理员删除，请重试。" };
+    if (!(await upsertWebRtcIdentityConfirmation(env, user, savedLabel, adminId))) {
+        if (insertedByThisCall) {
+            await env.DB.prepare(
+                "DELETE FROM webrtc_identity_labels WHERE id=? AND NOT EXISTS (SELECT 1 FROM webrtc_identity_confirmations WHERE label_id=?)",
+            ).bind(labelId, labelId).run();
+        }
+        return { error: "用户 WebRTC 刚刚发生变化，请使用最新验证通知重新标记。" };
+    }
+    await env.DB.prepare("UPDATE webrtc_identity_labels SET label_name=?, ip_version=?, updated_at=? WHERE id=? AND source_user_id=?")
+        .bind(labelName, identity.ipVersion, nowIso(), labelId, Number(user.user_id))
+        .run();
+    return { labelId, labelName, identity };
+}
+
+async function confirmWebRtcIdentityLabel(env, userId, labelId, adminId) {
+    const [user, label] = await Promise.all([
+        getUser(env, Number(userId)),
+        getWebRtcIdentityLabelById(env, Number(labelId)),
+    ]);
+    if (!user) return { error: "找不到用户。" };
+    if (!label) return { error: "标签已经不存在。" };
+    const current = await buildWebRtcIdentity({
+        last_webrtc_ipv4: user.last_webrtc_ipv4,
+        last_webrtc_ipv6: user.last_webrtc_ipv6,
+    });
+    if (!current.hash || current.hash !== String(label.webrtc_hash || "")) {
+        return { error: "用户当前 WebRTC 已变化，不能使用旧通知确认。" };
+    }
+    if (!(await upsertWebRtcIdentityConfirmation(env, user, label, adminId))) {
+        return { error: "用户 WebRTC 刚刚发生变化，请重新验证后再确认。" };
+    }
+    return { user, label, identity: current };
+}
+
+async function deleteWebRtcIdentityLabel(env, labelId) {
+    const label = await getWebRtcIdentityLabelById(env, Number(labelId));
+    if (!label) return null;
+    await env.DB.batch([
+        env.DB.prepare("DELETE FROM webrtc_identity_confirmations WHERE label_id=?").bind(Number(labelId)),
+        env.DB.prepare("DELETE FROM webrtc_identity_labels WHERE id=?").bind(Number(labelId)),
+    ]);
+    return label;
+}
+
+async function sendCallbackContextMessage(env, query, textValue, replyMarkup = null) {
+    const chatId = Number(query.message?.chat?.id || query.from?.id || 0);
+    if (!chatId) return;
+    const payload = { chat_id: chatId, text: String(textValue || "") };
+    const threadId = Number(query.message?.message_thread_id || 0);
+    if (threadId) payload.message_thread_id = threadId;
+    if (replyMarkup) payload.reply_markup = replyMarkup;
+    await tgCall(env, "sendMessage", payload);
+}
+
+async function sendWebRtcIdentityLabels(env, query, userId) {
+    const [user, labels] = await Promise.all([
+        getUserWithIdentity(env, Number(userId)),
+        env.DB.prepare("SELECT id, label_name, ip_version, updated_at FROM webrtc_identity_labels WHERE source_user_id=? ORDER BY updated_at DESC LIMIT 10")
+            .bind(Number(userId))
+            .all(),
+    ]);
+    if (!user) {
+        await sendCallbackContextMessage(env, query, "找不到用户。");
+        return;
+    }
+    const rows = labels.results || [];
+    const lines = [
+        "WebRTC 标签",
+        "用户 ID：" + user.user_id,
+        "当前人工确认标签：" + (user.identity_label_name || "无"),
+        "直接标记数量：" + rows.length,
+    ];
+    for (const row of rows) {
+        lines.push("", "#" + row.id + " " + row.label_name, "地址类型：" + row.ip_version, "更新时间：" + row.updated_at);
+    }
+    const replyMarkup = rows.length ? {
+        inline_keyboard: rows.map((row) => [{
+            text: "删除 #" + row.id + " " + String(row.label_name || "").slice(0, 20),
+            callback_data: "rtcdelete:" + row.id,
+        }]),
+    } : null;
+    await sendCallbackContextMessage(env, query, lines.join("\n"), replyMarkup);
 }
 
 function clientDataForVerificationStorage(clientData = {}) {
@@ -397,7 +614,7 @@ async function retryInbox(request, env, id) {
 
 async function usersPage(request, env) {
     await ensureVerificationSchema(env);
-    const rows = await env.DB.prepare("SELECT * FROM users ORDER BY updated_at DESC LIMIT 300").all();
+    const rows = await env.DB.prepare(USER_WITH_IDENTITY_SELECT + " ORDER BY u.updated_at DESC LIMIT 300").all();
     const bodyRows = (rows.results || []).map((u) => {
         const status = u.blocked ? `<span class="badge red">封禁</span>` : u.verified ? `<span class="badge green">已验证</span>` : `<span class="badge red">未验证</span>`;
         const actionPath = u.blocked ? "unblock" : "block";
@@ -415,6 +632,7 @@ async function usersPage(request, env) {
             `UDP 状态: ${h(u.last_udp_status || "-")}`,
             u.last_device_os ? `设备: ${h(u.last_device_os)}` : "设备: -",
             u.last_device_fingerprint ? `指纹: ${h(String(u.last_device_fingerprint).slice(0, 32))}` : "指纹: -",
+            u.identity_label_name ? "人工确认标签: " + h(u.identity_label_name) : "人工确认标签: -",
         ].join("<br>");
         const topic = [
             u.topic_thread_id ? `话题 ID: ${h(u.topic_thread_id)}` : "话题 ID: -",
@@ -467,6 +685,9 @@ async function userTopicUnbind(request, env, userId) {
 async function userDelete(request, env, userId) {
     await ensureVerificationSchema(env);
     await env.DB.batch([
+        env.DB.prepare("DELETE FROM webrtc_identity_confirmations WHERE label_id IN (SELECT id FROM webrtc_identity_labels WHERE source_user_id=?)").bind(userId),
+        env.DB.prepare("DELETE FROM webrtc_identity_labels WHERE source_user_id=?").bind(userId),
+        env.DB.prepare("DELETE FROM webrtc_identity_confirmations WHERE user_id=?").bind(userId),
         env.DB.prepare("DELETE FROM message_map WHERE user_id=?").bind(userId),
         env.DB.prepare("DELETE FROM rate_events WHERE user_id=?").bind(userId),
         env.DB.prepare("DELETE FROM verification_sessions WHERE user_id=?").bind(userId),
@@ -907,6 +1128,7 @@ async function verifySubmit(request, env, token = "") {
     const userId = Number(session.user_id);
     const deviceFingerprint = await buildDeviceFingerprint(clientData);
     const fingerprintMatch = await findDeviceFingerprintMatch(env, userId, deviceFingerprint);
+    const webrtcIdentityMatch = await findWebRtcIdentityLabel(env, userId, network);
     await env.DB.prepare("UPDATE verification_sessions SET status='verified', verified_at=? WHERE token=?")
         .bind(ts, token)
         .run();
@@ -939,6 +1161,12 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         fingerprintMatchedUsername: String(fingerprintMatch?.username || ""),
         fingerprintLabel: String(fingerprintMatch?.note || "").trim().slice(0, 200),
         fingerprintSimilarity: fingerprintMatch ? 100 : 0,
+        webrtcIdentityHash: String(webrtcIdentityMatch.hash || ""),
+        webrtcIdentityIpVersion: String(webrtcIdentityMatch.ipVersion || ""),
+        webrtcIdentityLabelId: Number(webrtcIdentityMatch.label?.id || 0),
+        webrtcIdentityLabelName: String(webrtcIdentityMatch.label?.label_name || "").slice(0, 80),
+        webrtcIdentitySourceUserId: Number(webrtcIdentityMatch.label?.source_user_id || 0),
+        webrtcIdentityConfirmed: Boolean(webrtcIdentityMatch.label?.confirmed),
     };
     await completeTopicVerification(env, userId, verificationInfo);
     await notifyVerificationSuccess(env, userId, token, verificationInfo);
@@ -1109,7 +1337,7 @@ async function handleTopicAdminCommand(env, message) {
         }).catch(() => {});
         return;
     }
-    const user = await getUserByTopicThreadId(env, groupId, Number(message.message_thread_id));
+    const user = await getUserWithIdentityByTopicThreadId(env, groupId, Number(message.message_thread_id));
     if (!user) {
         await tgCall(env, "sendMessage", {
             chat_id: groupId,
@@ -1135,6 +1363,7 @@ function topicAdminText(user) {
         `状态：${user.blocked ? "已封禁" : user.verified ? "已验证" : "未验证"}`,
         `话题：${user.topic_thread_id || "无"}`,
         `备注：${user.note || "无"}`,
+        "人工确认标签：" + (user.identity_label_name || "无"),
     ].join("\n");
 }
 
@@ -1151,6 +1380,10 @@ function topicAdminKeyboard(user) {
             [blockButton],
             [{ text: "获取用户信息", callback_data: `topicadmin:who:${user.user_id}` }],
             [{ text: "重建话题", callback_data: `topicadmin:rebuild:${user.user_id}` }],
+            [
+                { text: "标记 WebRTC", callback_data: "rtcmark:" + user.user_id },
+                { text: "WebRTC 标签", callback_data: "rtclabels:" + user.user_id },
+            ],
         ],
     };
 }
@@ -1169,7 +1402,7 @@ async function handleTopicAdminCallback(env, query) {
         return;
     }
     const groupId = await topicGroupId(env);
-    const user = await getUser(env, userId);
+    const user = await getUserWithIdentity(env, userId);
     if (!user) {
         await answerCallbackQuery(env, query.id, "找不到用户");
         return;
@@ -1194,7 +1427,7 @@ async function handleTopicAdminCallback(env, query) {
         const threadId = Number(query.message?.message_thread_id || user.topic_thread_id || 0);
         await answerCallbackQuery(env, query.id, "已发送用户信息");
         if (groupId && threadId) {
-            await tgCall(env, "sendMessage", { chat_id: groupId, message_thread_id: threadId, text: formatUserInfo(await getUser(env, userId)) });
+            await tgCall(env, "sendMessage", { chat_id: groupId, message_thread_id: threadId, text: formatUserInfo(await getUserWithIdentity(env, userId)) });
         }
     } else if (action === "rebuild") {
         await ensureUserTopic(env, userId, { forceNew: true, reason: "topicadmin:rebuild" });
@@ -1204,7 +1437,7 @@ async function handleTopicAdminCallback(env, query) {
         return;
     }
     if (groupId && query.message?.message_thread_id && action !== "rebuild") {
-        const latest = await getUser(env, userId);
+        const latest = await getUserWithIdentity(env, userId);
         await tgCall(env, "sendMessage", {
             chat_id: groupId,
             message_thread_id: Number(query.message.message_thread_id),
@@ -1323,6 +1556,11 @@ async function ensureUserTopic(env, userId, options = {}) {
             parse_mode: "HTML",
             disable_web_page_preview: true,
         }).catch((error) => logEvent(env, "warn", "failed to send topic intro", { userId, error: String(error?.message || error) }));
+        if (options.reason !== "verify") {
+            await sendCurrentWebRtcIdentityToTopic(env, user, { chatId: groupId, threadId }).catch((error) => (
+                logEvent(env, "warn", "failed to send current WebRTC identity label", { userId, error: String(error?.message || error) })
+            ));
+        }
         return { chatId: groupId, threadId, title };
     } catch (error) {
         await setUserTopicError(env, userId, String(error?.message || error));
@@ -1347,6 +1585,35 @@ function topicIntroText(user) {
     ].join("\n");
 }
 
+async function sendCurrentWebRtcIdentityToTopic(env, user, topic) {
+    const latestUser = await getUser(env, Number(user.user_id));
+    if (!latestUser) return;
+    const match = await findWebRtcIdentityLabel(env, Number(latestUser.user_id), {
+        webrtc_ipv4: latestUser.last_webrtc_ipv4,
+        webrtc_ipv6: latestUser.last_webrtc_ipv6,
+    });
+    if (!match.label) return;
+    const payload = {
+        chat_id: topic.chatId,
+        message_thread_id: topic.threadId,
+        text: [
+            match.label.confirmed ? "WebRTC 标签（管理员已确认）" : "WebRTC 标签命中（待人工确认）",
+            "标签：" + (match.label.label_name || "未设置"),
+            "来源用户 ID：" + (match.label.source_user_id || "-"),
+            "匹配依据：WebRTC " + (match.ipVersion || "-") + " 完全相同",
+        ].join("\n"),
+    };
+    if (!match.label.confirmed) {
+        payload.reply_markup = {
+            inline_keyboard: [[{
+                text: "确认同一人",
+                callback_data: "rtcconfirm:" + latestUser.user_id + ":" + match.label.id,
+            }]],
+        };
+    }
+    await tgCall(env, "sendMessage", payload);
+}
+
 function topicVerificationText(info) {
     const lines = [
         "本次验证信息",
@@ -1365,6 +1632,15 @@ function topicVerificationText(info) {
     if (info.fingerprintMatchedUserId) {
         lines.push("", "相似标签命中", `标签：${info.fingerprintLabel || "未设置"}`, "相似度：100%", `匹配用户 ID：${info.fingerprintMatchedUserId}`, `匹配用户名：${info.fingerprintMatchedUsername ? `@${info.fingerprintMatchedUsername}` : "无"}`);
     }
+    if (info.webrtcIdentityLabelId) {
+        lines.push(
+            "",
+            info.webrtcIdentityConfirmed ? "WebRTC 标签（管理员已确认）" : "WebRTC 标签命中（待人工确认）",
+            "标签：" + (info.webrtcIdentityLabelName || "未设置"),
+            "来源用户 ID：" + (info.webrtcIdentitySourceUserId || "-"),
+            "匹配依据：WebRTC " + (info.webrtcIdentityIpVersion || "-") + " 完全相同",
+        );
+    }
     return lines.join("\n");
 }
 
@@ -1374,12 +1650,21 @@ async function completeTopicVerification(env, userId, info) {
     try {
         const topic = await ensureUserTopic(env, userId, { reason: "verify" });
         if (!topic) return;
-        await tgCall(env, "sendMessage", {
+        const payload = {
             chat_id: topic.chatId,
             message_thread_id: topic.threadId,
             text: topicVerificationText(info),
             disable_web_page_preview: true,
-        });
+        };
+        if (info.webrtcIdentityLabelId && !info.webrtcIdentityConfirmed) {
+            payload.reply_markup = {
+                inline_keyboard: [[{
+                    text: "确认同一人",
+                    callback_data: "rtcconfirm:" + userId + ":" + info.webrtcIdentityLabelId,
+                }]],
+            };
+        }
+        await tgCall(env, "sendMessage", payload);
     } catch (error) {
         await logEvent(env, "error", "failed to complete topic verification", { userId, error: String(error?.message || error) });
     }
@@ -1408,6 +1693,12 @@ async function clearUserTopic(env, userId) {
 
 async function getUserByTopicThreadId(env, chatId, threadId) {
     return env.DB.prepare("SELECT * FROM users WHERE topic_chat_id=? AND topic_thread_id=?")
+        .bind(Number(chatId), Number(threadId))
+        .first();
+}
+
+async function getUserWithIdentityByTopicThreadId(env, chatId, threadId) {
+    return env.DB.prepare(USER_WITH_IDENTITY_SELECT + " WHERE u.topic_chat_id=? AND u.topic_thread_id=?")
         .bind(Number(chatId), Number(threadId))
         .first();
 }
@@ -1467,7 +1758,7 @@ async function handleCommand(env, message, command, isAdmin) {
             await tgSendMessage(env, chatId, `已更新用户 ${uid} 备注`);
         } else if (command.name === "who") {
             const uid = parseUserId(command.args);
-            const row = await getUser(env, uid);
+            const row = await getUserWithIdentity(env, uid);
             await tgSendMessage(env, chatId, row ? formatUserInfo(row) : `找不到用户 ${uid}`);
         } else if (command.name === "spamwords") {
             const words = await getSpamKeywords(env);
@@ -1521,7 +1812,7 @@ function parseUserIdAndText(args) {
 }
 
 function formatUserInfo(row) {
-    return `用户信息\nuser_id: ${row.user_id}\nusername: @${row.username || ""}\nfull_name: ${row.full_name || ""}\nblocked: ${Boolean(row.blocked)}\nverified: ${Boolean(row.verified)}\nstatus: ${row.verification_status || "-"}\nnote: ${row.note || ""}\nHTTP IPv4: ${row.last_http_ipv4 || "-"}\nHTTP IPv6: ${row.last_http_ipv6 || "-"}\nUDP IPv4: ${row.last_webrtc_ipv4 || "-"}\nUDP IPv6: ${row.last_webrtc_ipv6 || "-"}\nASN: ${row.last_asn || "-"}\ndevice_fingerprint: ${row.last_device_fingerprint ? String(row.last_device_fingerprint).slice(0, 32) : "-"}\ntopic_thread_id: ${row.topic_thread_id || "-"}\ntopic_status: ${row.topic_status || "-"}\nupdated_at: ${row.updated_at}`;
+    return `用户信息\nuser_id: ${row.user_id}\nusername: @${row.username || ""}\nfull_name: ${row.full_name || ""}\nblocked: ${Boolean(row.blocked)}\nverified: ${Boolean(row.verified)}\nstatus: ${row.verification_status || "-"}\nnote: ${row.note || ""}\nwebrtc_identity_label: ${row.identity_label_name || "-"}\nHTTP IPv4: ${row.last_http_ipv4 || "-"}\nHTTP IPv6: ${row.last_http_ipv6 || "-"}\nUDP IPv4: ${row.last_webrtc_ipv4 || "-"}\nUDP IPv6: ${row.last_webrtc_ipv6 || "-"}\nASN: ${row.last_asn || "-"}\ndevice_fingerprint: ${row.last_device_fingerprint ? String(row.last_device_fingerprint).slice(0, 32) : "-"}\ntopic_thread_id: ${row.topic_thread_id || "-"}\ntopic_status: ${row.topic_status || "-"}\nupdated_at: ${row.updated_at}`;
 }
 
 async function relayUserMessage(env, message) {
@@ -1564,13 +1855,14 @@ async function relayUserMessage(env, message) {
 async function relayStoredInboxToAdmins(env, row, originalMessage = null) {
     const ids = await adminChatIds(env);
     if (!ids.length) throw new Error("未配置管理员 ADMIN_CHAT_IDS");
-    const user = await getUser(env, Number(row.user_id));
+    const user = await getUserWithIdentity(env, Number(row.user_id));
     const note = user?.note || "";
+    const identityLabel = user?.identity_label_name || "";
     let firstHeaderId = null;
     let firstCopyId = null;
     let sentAny = false;
     for (const adminId of ids) {
-        const header = `[用户消息 #${row.id}]\nuser_id: <code>${row.user_id}</code>\nname: ${h(row.full_name || "")}\nusername: @${h(row.username || "")}\nnote: ${h(note)}\ntime: ${h(nowIso())}`;
+        const header = `[用户消息 #${row.id}]\nuser_id: <code>${row.user_id}</code>\nname: ${h(row.full_name || "")}\nusername: @${h(row.username || "")}\nnote: ${h(note)}\n人工确认标签: ${h(identityLabel || "-")}\ntime: ${h(nowIso())}`;
         const sent = await tgCall(env, "sendMessage", {
             chat_id: adminId,
             text: header,
@@ -1684,6 +1976,10 @@ ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, full_name=exclude
 
 async function getUser(env, userId) {
     return env.DB.prepare("SELECT * FROM users WHERE user_id=?").bind(userId).first();
+}
+
+async function getUserWithIdentity(env, userId) {
+    return env.DB.prepare(USER_WITH_IDENTITY_SELECT + " WHERE u.user_id=?").bind(userId).first();
 }
 
 async function isBlocked(env, userId) {
@@ -1915,7 +2211,64 @@ async function handleCallbackQuery(env, query) {
         await answerCallbackQuery(env, query.id, "无权限");
         return;
     }
-    const [action, rawUserId] = data.split(":");
+    const [action, rawUserId, rawLabelId] = data.split(":");
+    if (action === "rtcmark") {
+        const userId = Number(rawUserId);
+        const user = Number.isFinite(userId) ? await getUser(env, userId) : null;
+        if (!user) {
+            await answerCallbackQuery(env, query.id, "找不到用户");
+            return;
+        }
+        const result = await markWebRtcIdentityLabel(env, user, adminId, String(rawLabelId || ""));
+        if (result.error) {
+            await answerCallbackQuery(env, query.id, result.error.slice(0, 180));
+            return;
+        }
+        await answerCallbackQuery(env, query.id, "WebRTC 标签已保存");
+        await sendCallbackContextMessage(
+            env,
+            query,
+            "已标记 WebRTC\n用户 ID：" + userId + "\n标签：" + result.labelName + "\n地址类型：" + result.identity.ipVersion + "\n该用户已记为管理员确认。",
+        );
+        return;
+    }
+    if (action === "rtclabels") {
+        const userId = Number(rawUserId);
+        if (!Number.isFinite(userId)) {
+            await answerCallbackQuery(env, query.id, "参数错误");
+            return;
+        }
+        await answerCallbackQuery(env, query.id, "已发送 WebRTC 标签");
+        await sendWebRtcIdentityLabels(env, query, userId);
+        return;
+    }
+    if (action === "rtcdelete") {
+        const labelId = Number(rawUserId);
+        if (!Number.isFinite(labelId)) {
+            await answerCallbackQuery(env, query.id, "参数错误");
+            return;
+        }
+        const deleted = await deleteWebRtcIdentityLabel(env, labelId);
+        await answerCallbackQuery(env, query.id, deleted ? "标签已删除" : "标签不存在");
+        if (deleted) await sendCallbackContextMessage(env, query, "已删除 WebRTC 标签 #" + labelId + "：" + deleted.label_name);
+        return;
+    }
+    if (action === "rtcconfirm") {
+        const userId = Number(rawUserId);
+        const labelId = Number(rawLabelId);
+        if (!Number.isFinite(userId) || !Number.isFinite(labelId)) {
+            await answerCallbackQuery(env, query.id, "参数错误");
+            return;
+        }
+        const result = await confirmWebRtcIdentityLabel(env, userId, labelId, adminId);
+        if (result.error) {
+            await answerCallbackQuery(env, query.id, result.error.slice(0, 180));
+            return;
+        }
+        await answerCallbackQuery(env, query.id, "已人工确认同一人");
+        await sendCallbackContextMessage(env, query, "已人工确认\n用户 ID：" + userId + "\n标签：" + result.label.label_name + "\n依据：当前 WebRTC 完全相同。");
+        return;
+    }
     const userId = Number(rawUserId);
     if (!Number.isFinite(userId)) {
         await answerCallbackQuery(env, query.id, "参数错误");
@@ -1935,7 +2288,7 @@ async function handleCallbackQuery(env, query) {
         return;
     }
     if (action === "who") {
-        const row = await getUser(env, userId);
+        const row = await getUserWithIdentity(env, userId);
         await answerCallbackQuery(env, query.id, "已发送用户信息");
         await tgSendMessage(env, adminId, row ? formatUserInfo(row) : `找不到用户 ${userId}`);
         return;
@@ -1952,14 +2305,27 @@ async function notifyVerificationSuccess(env, userId, token, info) {
     const username = info.username ? `@${h(info.username)}` : "无";
     const fingerprintText = info.deviceFingerprint ? h(info.deviceFingerprint.slice(0, 32)) : "-";
     const matchText = info.fingerprintMatchedUserId ? `\n\n相似标签命中\n标签：${h(info.fingerprintLabel || "未设置")}\n相似度：100%\n匹配用户 ID：<code>${info.fingerprintMatchedUserId}</code>\n匹配用户名：${info.fingerprintMatchedUsername ? `@${h(info.fingerprintMatchedUsername)}` : "无"}` : "";
-    const textValue = `新用户验证通过\n用户 ID：<code>${userId}</code>\n昵称：${h(info.fullName || "-")}\n用户名：${username}\n语言：${h(info.languageCode || "-")}\n\n本次验证信息\n设备系统：${h(info.deviceOs || "-")}\n设备指纹：<code>${fingerprintText}</code>\nHTTP IP：<code>${h(info.httpIp || "-")}</code>\nHTTP IP 类型：${h(info.httpIpVersion || "-")}\n公网 IPv4：<code>${h(info.httpIpv4 || "-")}</code>\n公网 IPv6：<code>${h(info.httpIpv6 || "-")}</code>\n公网 ASN：${h(info.asn || "-")}\n运营商：${h(info.asOrganization || "-")}\n国家/地区：${h(info.country || "-")}\nCloudflare 机房：${h(info.colo || "-")}\n\nUDP / WebRTC 信息\nWebRTC IPv4：<code>${h(info.webrtcIpv4 || "-")}</code>\nWebRTC IPv6：<code>${h(info.webrtcIpv6 || "-")}</code>\nUDP 状态：${h(info.udpStatus || "-")}\nCandidate 类型：${h(info.candidateType || "-")}${matchText}`;
+    const identityText = info.webrtcIdentityLabelId
+        ? `\n\n${info.webrtcIdentityConfirmed ? "WebRTC 标签（管理员已确认）" : "WebRTC 标签命中（待人工确认）"}\n标签：${h(info.webrtcIdentityLabelName || "未设置")}\n来源用户 ID：<code>${info.webrtcIdentitySourceUserId || "-"}</code>\n匹配依据：WebRTC ${h(info.webrtcIdentityIpVersion || "-")} 完全相同`
+        : "";
+    const textValue = `新用户验证通过\n用户 ID：<code>${userId}</code>\n昵称：${h(info.fullName || "-")}\n用户名：${username}\n语言：${h(info.languageCode || "-")}\n\n本次验证信息\n设备系统：${h(info.deviceOs || "-")}\n设备指纹：<code>${fingerprintText}</code>\nHTTP IP：<code>${h(info.httpIp || "-")}</code>\nHTTP IP 类型：${h(info.httpIpVersion || "-")}\n公网 IPv4：<code>${h(info.httpIpv4 || "-")}</code>\n公网 IPv6：<code>${h(info.httpIpv6 || "-")}</code>\n公网 ASN：${h(info.asn || "-")}\n运营商：${h(info.asOrganization || "-")}\n国家/地区：${h(info.country || "-")}\nCloudflare 机房：${h(info.colo || "-")}\n\nUDP / WebRTC 信息\nWebRTC IPv4：<code>${h(info.webrtcIpv4 || "-")}</code>\nWebRTC IPv6：<code>${h(info.webrtcIpv6 || "-")}</code>\nUDP 状态：${h(info.udpStatus || "-")}\nCandidate 类型：${h(info.candidateType || "-")}${matchText}${identityText}`;
+    const keyboard = [];
+    if (info.webrtcIdentityLabelId && !info.webrtcIdentityConfirmed) {
+        keyboard.push([{ text: "确认同一人", callback_data: "rtcconfirm:" + userId + ":" + info.webrtcIdentityLabelId }]);
+    }
+    const rtcActions = [{ text: "WebRTC 标签", callback_data: "rtclabels:" + userId }];
+    if (info.webrtcIdentityHash) {
+        rtcActions.unshift({ text: "标记 WebRTC", callback_data: "rtcmark:" + userId + ":" + info.webrtcIdentityHash });
+    }
+    keyboard.push(rtcActions);
+    keyboard.push(
+        [{ text: "取消验证", callback_data: `unverify:${userId}` }],
+        [{ text: "拉黑", callback_data: `block:${userId}` }],
+        [{ text: "获取用户名", callback_data: `who:${userId}` }],
+    );
     await notifyAdmins(env, textValue, {
         reply_markup: {
-            inline_keyboard: [
-                [{ text: "取消验证", callback_data: `unverify:${userId}` }],
-                [{ text: "拉黑", callback_data: `block:${userId}` }],
-                [{ text: "获取用户名", callback_data: `who:${userId}` }],
-            ],
+            inline_keyboard: keyboard,
         },
     });
 }
@@ -2073,6 +2439,30 @@ async function ensureVerificationSchema(env) {
             verified_at TEXT
         )`).run();
     }
+    if (!schemaObjects.has("table:webrtc_identity_labels")) {
+        await env.DB.prepare(
+            "CREATE TABLE IF NOT EXISTS webrtc_identity_labels (" +
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+            "webrtc_hash TEXT NOT NULL UNIQUE CHECK(length(webrtc_hash)=32), " +
+            "label_name TEXT NOT NULL CHECK(length(label_name) BETWEEN 1 AND 80), " +
+            "source_user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE, " +
+            "created_by_user_id INTEGER NOT NULL, " +
+            "ip_version TEXT NOT NULL CHECK(ip_version IN ('IPv4','IPv6')), " +
+            "slot INTEGER NOT NULL CHECK(slot BETWEEN 1 AND 5), " +
+            "created_at TEXT NOT NULL, " +
+            "updated_at TEXT NOT NULL, " +
+            "UNIQUE(source_user_id, slot))",
+        ).run();
+    }
+    if (!schemaObjects.has("table:webrtc_identity_confirmations")) {
+        await env.DB.prepare(
+            "CREATE TABLE IF NOT EXISTS webrtc_identity_confirmations (" +
+            "user_id INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE, " +
+            "label_id INTEGER NOT NULL REFERENCES webrtc_identity_labels(id) ON DELETE CASCADE, " +
+            "confirmed_by_user_id INTEGER NOT NULL, " +
+            "confirmed_at TEXT NOT NULL)",
+        ).run();
+    }
     const userColumns = [
         "language_code TEXT DEFAULT ''",
         "verified INTEGER DEFAULT 0",
@@ -2127,6 +2517,8 @@ async function ensureVerificationSchema(env) {
     const indexes = [
         { name: "idx_users_topic", sql: "CREATE INDEX IF NOT EXISTS idx_users_topic ON users(topic_chat_id, topic_thread_id)" },
         { name: "idx_users_device_fingerprint", sql: "CREATE INDEX IF NOT EXISTS idx_users_device_fingerprint ON users(last_device_fingerprint) WHERE last_device_fingerprint<>''" },
+        { name: "idx_webrtc_identity_labels_source", sql: "CREATE INDEX IF NOT EXISTS idx_webrtc_identity_labels_source ON webrtc_identity_labels(source_user_id, updated_at DESC)" },
+        { name: "idx_webrtc_identity_confirmations_label", sql: "CREATE INDEX IF NOT EXISTS idx_webrtc_identity_confirmations_label ON webrtc_identity_confirmations(label_id)" },
         { name: "idx_inbox_topic_created", sql: "CREATE INDEX IF NOT EXISTS idx_inbox_topic_created ON inbox_messages(topic_chat_id, topic_thread_id, created_at)" },
         { name: "idx_verification_sessions_user_created", sql: "CREATE INDEX IF NOT EXISTS idx_verification_sessions_user_created ON verification_sessions(user_id, created_at)" },
         { name: "idx_verification_sessions_status", sql: "CREATE INDEX IF NOT EXISTS idx_verification_sessions_status ON verification_sessions(status)" },
