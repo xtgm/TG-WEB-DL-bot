@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS users (
     last_as_organization TEXT DEFAULT '',
     last_device_os TEXT DEFAULT '',
     last_user_agent TEXT DEFAULT '',
+    last_device_fingerprint TEXT NOT NULL DEFAULT '' CHECK(last_device_fingerprint='' OR length(last_device_fingerprint)=32),
     topic_chat_id INTEGER,
     topic_thread_id INTEGER,
     topic_title TEXT DEFAULT '',
@@ -150,6 +151,7 @@ CREATE INDEX IF NOT EXISTS idx_rate_events_user_ts ON rate_events(user_id, ts);
 CREATE INDEX IF NOT EXISTS idx_inbox_user_created ON inbox_messages(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_inbox_created ON inbox_messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_users_topic ON users(topic_chat_id, topic_thread_id);
+CREATE INDEX IF NOT EXISTS idx_users_device_fingerprint ON users(last_device_fingerprint) WHERE last_device_fingerprint<>'';
 CREATE INDEX IF NOT EXISTS idx_inbox_topic_created ON inbox_messages(topic_chat_id, topic_thread_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_ip_verifications_user_created ON ip_verifications(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_ip_verifications_created ON ip_verifications(created_at);

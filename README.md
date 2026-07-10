@@ -171,6 +171,7 @@ npm run db:apply
 ```powershell
 npm run db:upgrade:verification
 npm run db:upgrade:topics
+npm run db:upgrade:fingerprint
 ```
 
 如果旧库已经运行过新版 Worker，运行时代码可能已经自动补齐字段；这时升级 SQL 遇到重复字段可以停止，不影响新版运行。
@@ -282,6 +283,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 用户管理 | `/users` 展示用户资料、验证状态、备注、封禁状态、HTTP IPv4/IPv6、UDP WebRTC IPv4/IPv6、ASN、设备系统。 |
 | 广告拦截 | `/rules` 支持维护私聊关键词，命中后可自动封禁并通知管理员。 |
 | Cloudflare 验证记录 | `/verifications` 展示 Turnstile 通过记录、HTTP IP、WebRTC UDP 结果、国家、机房、ASN、User-Agent。 |
+| 设备指纹精确匹配 | 验证页生成 Canvas、WebGL、屏幕和硬件特征哈希；服务端 32 字符指纹完全相同时读取已匹配用户的备注标签并显示相似度 `100%`。 |
 | Telegram 话题控制 | `CONTROL_MODE=topic/both` 时，验证通过后可自动创建用户专属群话题，管理员在话题里回复会回到用户。 |
 | 多管理员 | `ADMIN_CHAT_IDS` 最多取 3 个管理员 ID，可通过后台设置或 Cloudflare 环境变量配置；话题回复也只允许这些 ID。 |
 | 后台登录 | `/login` 使用用户名、密码和 Cookie Session；密码、Bot Token 等敏感值通过 Cloudflare Secrets 保存。 |
@@ -296,7 +298,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 登录 | `/login` | 输入后台用户名和密码，成功后写入 `tg_dualbot_session` Cookie。 |
 | 总览 | `/` | 显示用户数、封禁用户、已验证用户、消息记录、CF 验证通过数、公开地址和验证入口格式。 |
 | 收件箱 | `/inbox` | 显示用户入站消息、管理员出站回复、消息方向、来源、状态和错误；支持回复与重试。 |
-| 用户管理 | `/users` | 查看用户资料、备注、封禁、验证状态、HTTP IP、UDP WebRTC、ASN、设备系统和话题绑定；支持备注、封禁、解封、取消验证、创建话题、重建话题、取消绑定。 |
+| 用户管理 | `/users` | 查看用户资料、备注标签、封禁、验证状态、HTTP IP、UDP WebRTC、ASN、设备系统、设备指纹和话题绑定；支持备注、封禁、解封、取消验证、创建话题、重建话题、解除话题绑定和完整删除用户数据。 |
 | 广告拦截 | `/rules` | 一行一个关键词；可开关命中后自动封禁。 |
 | CF 验证记录 | `/verifications` | 展示每次 Turnstile 通过后的 IP、UDP/WebRTC、ASN、设备系统、User-Agent 和时间。 |
 | 设置 | `/settings` | 保存管理员 Chat ID、欢迎语；查看公开地址、验证入口和 Secrets 配置状态。 |
@@ -364,6 +366,16 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 - WebRTC UDP 记录受浏览器、代理、系统隐私设置、企业网络和运营商网络影响，可能显示 `empty`、`unsupported` 或 `failed`。
 - 本项目会记录字段和状态，不把空值伪造成真实 IP。
 
+### 设备指纹与标签匹配
+
+验证页会在用户设备中计算 Canvas、WebGL、屏幕尺寸、像素比、颜色深度、CPU 核数、粗粒度内存和触控点数等特征。Canvas 图片和 WebGL 原始参数不会写入 D1；Worker 计算 SHA-256 后只保留前 32 个十六进制字符作为固定长度指纹。
+
+- 只有数据库中的 32 字符指纹完全一致时，才显示 `相似度：100%`。
+- 标签直接读取已匹配用户的“备注”。例如先把已知账号备注设置为 `小孩`，其他账号精确命中后，管理员通知会显示“标签：小孩”。
+- 指纹和标签只显示在登录后台、管理员私聊通知和管理员话题中，不显示在用户验证页面。
+- D1 只在 `users` 中保存每个用户最新的一条 32 字符指纹，不保存指纹历史；Canvas、WebGL、硬件和组件哈希不会写入 `ip_verifications` 或 `verification_sessions`。指纹查询使用部分索引，不扫描全表。
+- 用户重新验证只覆盖当前指纹；删除用户时该指纹随用户行一起删除。
+
 <a id="topic-mode"></a>
 
 ## Telegram 话题双通道
@@ -400,7 +412,7 @@ Telegram 群要求：
 /admin
 ```
 
-按钮包括通过验证、取消验证、拉黑、取消拉黑、获取用户信息、重建话题。Web 后台的用户管理页也提供创建话题、重建话题、取消绑定操作。
+按钮包括通过验证、取消验证、拉黑、取消拉黑、获取用户信息、重建话题。Web 后台的用户管理页也提供创建话题、重建话题、解除话题绑定和删除用户操作。
 
 <a id="routes"></a>
 
@@ -434,7 +446,8 @@ Telegram 群要求：
 | `/users/{user_id}/unverify` | POST | 取消用户验证状态。 |
 | `/users/{user_id}/topic/create` | POST | 为用户创建 Telegram 专属话题。 |
 | `/users/{user_id}/topic/rebuild` | POST | 强制重建用户专属话题。 |
-| `/users/{user_id}/topic/unbind` | POST | 取消用户和话题的绑定。 |
+| `/users/{user_id}/topic/unbind` | POST | 解除用户和话题的绑定，不删除用户记录或 Telegram 话题。 |
+| `/users/{user_id}/delete` | POST | 删除用户及其消息、验证、验证会话、限频和回复映射数据；不删除 Telegram 话题。 |
 | `/rules` | GET/POST | 查看和保存广告关键词。 |
 | `/verifications` | GET | CF 验证记录。 |
 | `/settings` | GET/POST | 后台设置。 |
@@ -471,6 +484,7 @@ tg-dualbot-cloudflare/
 │  ├─ npm run db:apply：新部署初始化 D1。
 │  ├─ npm run db:upgrade:verification：旧库补验证门禁字段。
 │  ├─ npm run db:upgrade:topics：旧库补 Telegram 话题字段。
+│  ├─ npm run db:upgrade:fingerprint：旧库补设备指纹字段和索引。
 │  └─ npm run pages:deploy：Pages Direct Upload。
 ├─ wrangler.toml
 │  ├─ name：Worker 名称。
@@ -499,8 +513,10 @@ tg-dualbot-cloudflare/
 │  │  └─ 新部署完整 D1 表结构。
 │  ├─ 0002_verification_gate.sql
 │  │  └─ 旧数据库升级到验证门禁版本。
-│  └─ 0003_topic_mode.sql
-│     └─ 旧数据库升级到 Telegram 话题双通道版本。
+│  ├─ 0003_topic_mode.sql
+│  │  └─ 旧数据库升级到 Telegram 话题双通道版本。
+│  └─ 0004_device_fingerprint.sql
+│     └─ 旧数据库升级到设备指纹精确匹配版本。
 └─ README.md
    └─ 功能、部署、配置、验证和排错说明。
 ```
@@ -760,7 +776,7 @@ https://你的地址/login
 ### 7. D1 数据检查
 
 ```powershell
-npx wrangler d1 execute tg-dualbot-db --remote --command "SELECT user_id,verified,last_http_ipv4,last_http_ipv6,last_webrtc_ipv4,last_webrtc_ipv6,last_asn FROM users ORDER BY updated_at DESC LIMIT 10"
+npx wrangler d1 execute tg-dualbot-db --remote --command "SELECT user_id,verified,last_http_ipv4,last_http_ipv6,last_webrtc_ipv4,last_webrtc_ipv6,last_asn,last_device_fingerprint FROM users ORDER BY updated_at DESC LIMIT 10"
 ```
 
 ```powershell
@@ -787,6 +803,12 @@ npm run db:upgrade:verification
 
 ```powershell
 npm run db:upgrade:topics
+```
+
+如果旧库还没有设备指纹字段和索引，可以执行：
+
+```powershell
+npm run db:upgrade:fingerprint
 ```
 
 如果旧库已经运行过新版 Worker，运行时代码可能已经自动补齐字段；这时升级 SQL 遇到重复字段可以停止，不影响新版运行。

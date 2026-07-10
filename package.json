@@ -10,6 +10,7 @@
     "db:apply": "wrangler d1 execute tg-dualbot-db --file=./migrations/0001_initial.sql --remote",
     "db:upgrade:verification": "wrangler d1 execute tg-dualbot-db --file=./migrations/0002_verification_gate.sql --remote",
     "db:upgrade:topics": "wrangler d1 execute tg-dualbot-db --file=./migrations/0003_topic_mode.sql --remote",
+    "db:upgrade:fingerprint": "wrangler d1 execute tg-dualbot-db --file=./migrations/0004_device_fingerprint.sql --remote",
     "pages:deploy": "wrangler pages deploy public --project-name tg-dualbot-cloudflare"
   },
   "devDependencies": {

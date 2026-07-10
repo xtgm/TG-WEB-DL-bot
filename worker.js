@@ -4,6 +4,7 @@ const VERIFY_SESSION_HOURS = 24;
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const DEFAULT_CONTROL_MODE = "web";
 const DEFAULT_TOPIC_CREATE_POLICY = "after_verify";
+const DEVICE_FINGERPRINT_VERSION = "tg-dualbot-fp-v1";
 
 let verificationSchemaReady = false;
 
@@ -104,6 +105,9 @@ export async function handleRequest(request, env, ctx) {
     match = path.match(/^\/users\/(-?\d+)\/topic\/unbind$/);
     if (match && method === "POST") return userTopicUnbind(request, env, Number(match[1]));
 
+    match = path.match(/^\/users\/(-?\d+)\/delete$/);
+    if (match && method === "POST") return userDelete(request, env, Number(match[1]));
+
     return html(layout("未找到", `<div class="card"><p>页面不存在。</p></div>`), 404);
 }
 
@@ -150,6 +154,79 @@ async function sha256Hex(input) {
     const data = new TextEncoder().encode(input);
     const hash = await crypto.subtle.digest("SHA-256", data);
     return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function boundedFingerprintNumber(value, max, precision = 0) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return 0;
+    const bounded = Math.max(0, Math.min(max, number));
+    const factor = 10 ** precision;
+    return Math.round(bounded * factor) / factor;
+}
+
+function normalizedClientHash(value) {
+    const hash = String(value || "").trim().toLowerCase();
+    return /^[0-9a-f]{32}$/.test(hash) ? hash : "";
+}
+
+async function buildDeviceFingerprint(clientData = {}) {
+    const fingerprint = clientData?.fingerprint && typeof clientData.fingerprint === "object" ? clientData.fingerprint : {};
+    const hardware = fingerprint.hardware && typeof fingerprint.hardware === "object" ? fingerprint.hardware : {};
+    const screenInfo = clientData?.screen && typeof clientData.screen === "object" ? clientData.screen : {};
+    const canvasHash = normalizedClientHash(fingerprint.canvas?.hash);
+    const webglHash = normalizedClientHash(fingerprint.webgl?.hash);
+    if (!canvasHash && !webglHash) return "";
+    const width = boundedFingerprintNumber(screenInfo.width, 32768);
+    const height = boundedFingerprintNumber(screenInfo.height, 32768);
+    const payload = JSON.stringify([
+        DEVICE_FINGERPRINT_VERSION,
+        String(clientData.platform || "").trim().toLowerCase().slice(0, 80),
+        String(clientData.language || "").trim().toLowerCase().slice(0, 32),
+        Array.isArray(clientData.languages) ? clientData.languages.map((value) => String(value).toLowerCase().slice(0, 32)).slice(0, 5).join(",") : "",
+        String(clientData.timezone || "").trim().slice(0, 64),
+        Math.min(width, height),
+        Math.max(width, height),
+        boundedFingerprintNumber(screenInfo.pixel_ratio, 16, 3),
+        boundedFingerprintNumber(screenInfo.color_depth, 64),
+        boundedFingerprintNumber(hardware.cores, 64),
+        boundedFingerprintNumber(hardware.memory_gb, 64, 1),
+        boundedFingerprintNumber(hardware.touch_points, 32),
+        canvasHash,
+        webglHash,
+    ]);
+    return (await sha256Hex(payload)).slice(0, 32);
+}
+
+function clientDataForVerificationStorage(clientData = {}) {
+    const screenInfo = clientData?.screen && typeof clientData.screen === "object" ? clientData.screen : {};
+    return {
+        language: String(clientData.language || "").slice(0, 32),
+        platform: String(clientData.platform || "").slice(0, 80),
+        user_agent: String(clientData.user_agent || "").slice(0, 500),
+        timezone: String(clientData.timezone || "").slice(0, 64),
+        screen: {
+            width: Number(screenInfo.width) || 0,
+            height: Number(screenInfo.height) || 0,
+            pixel_ratio: Number(screenInfo.pixel_ratio) || 1,
+        },
+        probe: clientData?.probe && typeof clientData.probe === "object" ? clientData.probe : null,
+        webrtc: clientData?.webrtc && typeof clientData.webrtc === "object" ? clientData.webrtc : null,
+        error: String(clientData.error || "").slice(0, 300),
+        parse_error: String(clientData.parse_error || "").slice(0, 300),
+    };
+}
+
+async function findDeviceFingerprintMatch(env, userId, deviceFingerprint) {
+    if (!deviceFingerprint) return null;
+    return env.DB.prepare(`SELECT user_id, username, full_name, note
+FROM users
+WHERE last_device_fingerprint=?
+  AND last_device_fingerprint<>''
+  AND user_id<>?
+ORDER BY CASE WHEN TRIM(COALESCE(note,''))<>'' THEN 0 ELSE 1 END, updated_at DESC
+LIMIT 1`)
+        .bind(deviceFingerprint, userId)
+        .first();
 }
 
 function constantTimeEqual(a, b) {
@@ -337,6 +414,7 @@ async function usersPage(request, env) {
             u.last_webrtc_ipv6 ? `UDP IPv6: ${h(u.last_webrtc_ipv6)}` : "UDP IPv6: -",
             `UDP 状态: ${h(u.last_udp_status || "-")}`,
             u.last_device_os ? `设备: ${h(u.last_device_os)}` : "设备: -",
+            u.last_device_fingerprint ? `指纹: ${h(String(u.last_device_fingerprint).slice(0, 32))}` : "指纹: -",
         ].join("<br>");
         const topic = [
             u.topic_thread_id ? `话题 ID: ${h(u.topic_thread_id)}` : "话题 ID: -",
@@ -345,10 +423,11 @@ async function usersPage(request, env) {
             u.topic_last_error ? `错误: ${h(u.topic_last_error)}` : "",
         ].filter(Boolean).join("<br>");
         const unverify = u.verified ? `<form method="post" action="/users/${u.user_id}/unverify" style="margin-top:8px"><button type="submit">取消验证</button></form>` : "";
-        const topicActions = `<form method="post" action="/users/${u.user_id}/topic/create" style="margin-top:8px"><button type="submit">创建话题</button></form><form method="post" action="/users/${u.user_id}/topic/rebuild" style="margin-top:8px"><button type="submit">重建话题</button></form><form method="post" action="/users/${u.user_id}/topic/unbind" style="margin-top:8px"><button type="submit">取消绑定</button></form>`;
-        return `<tr><td><b>${h(u.full_name || u.user_id)}</b><br><small>${u.user_id} @${h(u.username || "")}<br>语言: ${h(u.language_code || "-")}</small></td><td>${status}<br><small>${h(u.verification_status || "")}<br>${h(u.updated_at)}</small></td><td>${http}<br><small>${h(u.last_verified_at || "")}</small></td><td>${udp}</td><td>${topic}</td><td>${h(u.note || "")}</td><td><form method="post" action="/users/${u.user_id}/note"><input name="note" value="${h(u.note || "")}"><button type="submit">保存备注</button></form><form method="post" action="/users/${u.user_id}/${actionPath}" style="margin-top:8px"><button class="${actionClass}" type="submit">${actionText}</button></form>${unverify}${topicActions}</td></tr>`;
+        const topicActions = `<form method="post" action="/users/${u.user_id}/topic/create" style="margin-top:8px"><button type="submit">创建话题</button></form><form method="post" action="/users/${u.user_id}/topic/rebuild" style="margin-top:8px"><button type="submit">重建话题</button></form><form method="post" action="/users/${u.user_id}/topic/unbind" style="margin-top:8px"><button type="submit">解除话题绑定</button></form>`;
+        const deleteAction = `<form method="post" action="/users/${u.user_id}/delete" style="margin-top:8px" onsubmit="return confirm('确定要永久删除该用户及其全部消息和验证记录吗？此操作无法恢复。')"><button class="danger" type="submit">删除用户</button></form>`;
+        return `<tr><td><b>${h(u.full_name || u.user_id)}</b><br><small>${u.user_id} @${h(u.username || "")}<br>语言: ${h(u.language_code || "-")}</small></td><td>${status}<br><small>${h(u.verification_status || "")}<br>${h(u.updated_at)}</small></td><td>${http}<br><small>${h(u.last_verified_at || "")}</small></td><td>${udp}</td><td>${topic}</td><td>${h(u.note || "")}</td><td><form method="post" action="/users/${u.user_id}/note"><input name="note" value="${h(u.note || "")}"><button type="submit">保存标签 / 备注</button></form><form method="post" action="/users/${u.user_id}/${actionPath}" style="margin-top:8px"><button class="${actionClass}" type="submit">${actionText}</button></form>${unverify}${topicActions}${deleteAction}</td></tr>`;
     }).join("");
-    return html(layout("用户管理", `<div class="card"><h2>用户管理</h2><p class="muted">展示已私聊过 Bot 的用户、验证状态、IPv4/IPv6、UDP WebRTC、话题绑定、封禁状态和备注。</p><table><tr><th>用户</th><th>状态</th><th>公网 HTTP 信息</th><th>UDP / WebRTC</th><th>话题</th><th>备注</th><th>操作</th></tr>${bodyRows}</table></div>`));
+    return html(layout("用户管理", `<div class="card"><h2>用户管理</h2><p class="muted">展示已私聊过 Bot 的用户、验证状态、IPv4/IPv6、UDP WebRTC、设备指纹、话题绑定、封禁状态和标签 / 备注；备注同时作为精确指纹命中的标签。</p><table><tr><th>用户</th><th>状态</th><th>公网 HTTP 信息</th><th>UDP / WebRTC / 指纹</th><th>话题</th><th>标签 / 备注</th><th>操作</th></tr>${bodyRows}</table></div>`));
 }
 
 async function userNoteSave(request, env, userId) {
@@ -382,6 +461,19 @@ async function userTopicCreate(request, env, userId, forceNew) {
 async function userTopicUnbind(request, env, userId) {
     await ensureVerificationSchema(env);
     await clearUserTopic(env, userId);
+    return redirect("/users", request);
+}
+
+async function userDelete(request, env, userId) {
+    await ensureVerificationSchema(env);
+    await env.DB.batch([
+        env.DB.prepare("DELETE FROM message_map WHERE user_id=?").bind(userId),
+        env.DB.prepare("DELETE FROM rate_events WHERE user_id=?").bind(userId),
+        env.DB.prepare("DELETE FROM verification_sessions WHERE user_id=?").bind(userId),
+        env.DB.prepare("DELETE FROM ip_verifications WHERE user_id=?").bind(userId),
+        env.DB.prepare("DELETE FROM inbox_messages WHERE user_id=?").bind(userId),
+        env.DB.prepare("DELETE FROM users WHERE user_id=?").bind(userId),
+    ]);
     return redirect("/users", request);
 }
 
@@ -524,28 +616,188 @@ form.addEventListener("submit", async (event) => {
     button.textContent = "正在验证...";
     try {
         const data = await collectClientData();
-        document.getElementById("client_data").value = JSON.stringify(data).slice(0, 6000);
+        document.getElementById("client_data").value = serializeClientData(data);
     } catch (error) {
-        document.getElementById("client_data").value = JSON.stringify({ error: String(error && error.message || error) }).slice(0, 6000);
+        document.getElementById("client_data").value = JSON.stringify({ error: String(error && error.message || error).slice(0, 500) });
     }
     button.textContent = "正在提交验证...";
     form.submit();
 });
+function compactClientText(value, max) {
+    return String(value || "").slice(0, max);
+}
+function serializeClientData(data) {
+    const screenInfo = data && data.screen && typeof data.screen === "object" ? data.screen : {};
+    const fingerprint = data && data.fingerprint && typeof data.fingerprint === "object" ? data.fingerprint : {};
+    const hardware = fingerprint.hardware && typeof fingerprint.hardware === "object" ? fingerprint.hardware : {};
+    const canvas = fingerprint.canvas && typeof fingerprint.canvas === "object" ? fingerprint.canvas : {};
+    const webgl = fingerprint.webgl && typeof fingerprint.webgl === "object" ? fingerprint.webgl : {};
+    const probe = data && data.probe && typeof data.probe === "object" ? data.probe : {};
+    const webrtc = data && data.webrtc && typeof data.webrtc === "object" ? data.webrtc : {};
+    const safe = {
+        language: compactClientText(data && data.language, 32),
+        languages: Array.isArray(data && data.languages) ? data.languages.map((value) => compactClientText(value, 32)).slice(0, 5) : [],
+        platform: compactClientText(data && data.platform, 80),
+        user_agent: compactClientText(data && data.user_agent, 500),
+        timezone: compactClientText(data && data.timezone, 64),
+        screen: {
+            width: Number(screenInfo.width) || 0,
+            height: Number(screenInfo.height) || 0,
+            pixel_ratio: Number(screenInfo.pixel_ratio) || 1,
+            color_depth: Number(screenInfo.color_depth) || 0,
+        },
+        fingerprint: {
+            version: 1,
+            hardware: {
+                cores: Number(hardware.cores) || 0,
+                memory_gb: Number(hardware.memory_gb) || 0,
+                touch_points: Number(hardware.touch_points) || 0,
+            },
+            canvas: { status: compactClientText(canvas.status, 20), hash: compactClientText(canvas.hash, 32) },
+            webgl: { status: compactClientText(webgl.status, 20), hash: compactClientText(webgl.hash, 32) },
+        },
+        probe: {
+            http_ip: compactClientText(probe.http_ip, 128),
+            http_ip_version: compactClientText(probe.http_ip_version, 16),
+            http_ipv4: compactClientText(probe.http_ipv4, 64),
+            http_ipv6: compactClientText(probe.http_ipv6, 128),
+            country: compactClientText(probe.country, 16),
+            colo: compactClientText(probe.colo, 32),
+            asn: compactClientText(probe.asn, 32),
+            as_organization: compactClientText(probe.as_organization, 200),
+            error: compactClientText(probe.error, 300),
+        },
+        webrtc: {
+            udp_status: compactClientText(webrtc.udp_status, 40),
+            webrtc_ipv4: compactClientText(webrtc.webrtc_ipv4, 64),
+            webrtc_ipv6: compactClientText(webrtc.webrtc_ipv6, 128),
+            webrtc_protocol: compactClientText(webrtc.webrtc_protocol, 20),
+            webrtc_candidate_type: compactClientText(webrtc.webrtc_candidate_type, 80),
+            error: compactClientText(webrtc.error, 300),
+            candidates: Array.isArray(webrtc.candidates) ? webrtc.candidates.slice(0, 10).map((item) => ({
+                ip: compactClientText(item && item.ip, 128),
+                version: compactClientText(item && item.version, 16),
+                protocol: compactClientText(item && item.protocol, 20),
+                type: compactClientText(item && item.type, 20),
+            })) : [],
+        },
+    };
+    let jsonValue = JSON.stringify(safe);
+    if (jsonValue.length <= 6000) return jsonValue;
+    safe.webrtc.candidates = safe.webrtc.candidates.slice(0, 3);
+    safe.webrtc.error = safe.webrtc.error.slice(0, 100);
+    safe.probe.error = safe.probe.error.slice(0, 100);
+    safe.user_agent = safe.user_agent.slice(0, 200);
+    jsonValue = JSON.stringify(safe);
+    if (jsonValue.length <= 6000) return jsonValue;
+    safe.webrtc.candidates = [];
+    return JSON.stringify(safe);
+}
+function withClientTimeout(promise, timeoutMs, fallback) {
+    return Promise.race([
+        Promise.resolve(promise),
+        new Promise((resolve) => setTimeout(() => resolve(fallback), timeoutMs)),
+    ]);
+}
 async function collectClientData() {
     const data = {
         language: navigator.language || "",
+        languages: Array.isArray(navigator.languages) ? navigator.languages.slice(0, 5) : [],
         platform: navigator.platform || "",
         user_agent: navigator.userAgent || "",
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
-        screen: { width: screen.width || 0, height: screen.height || 0, pixel_ratio: window.devicePixelRatio || 1 },
+        screen: {
+            width: screen.width || 0,
+            height: screen.height || 0,
+            pixel_ratio: window.devicePixelRatio || 1,
+            color_depth: screen.colorDepth || 0,
+        },
+        fingerprint: {
+            version: 1,
+            hardware: {
+                cores: navigator.hardwareConcurrency || 0,
+                memory_gb: navigator.deviceMemory || 0,
+                touch_points: navigator.maxTouchPoints || 0,
+            },
+            canvas: null,
+            webgl: null,
+        },
         probe: null,
         webrtc: null,
     };
-    const tasks = [httpProbe(), collectWebRtcCandidates()];
+    const tasks = [
+        withClientTimeout(httpProbe(), 4000, { error: "timeout" }),
+        withClientTimeout(collectWebRtcCandidates(), 4500, { udp_status: "failed", error: "timeout", candidates: [] }),
+        withClientTimeout(collectCanvasSignal(), 1500, { status: "failed", hash: "" }),
+        withClientTimeout(collectWebGlSignal(), 1500, { status: "failed", hash: "" }),
+    ];
     const results = await Promise.allSettled(tasks);
-    data.probe = results[0].status === "fulfilled" ? results[0].value : { error: String(results[0].reason || "failed") };
-    data.webrtc = results[1].status === "fulfilled" ? results[1].value : { udp_status: "failed", error: String(results[1].reason || "failed") };
+    data.probe = results[0].status === "fulfilled" ? results[0].value : { error: String(results[0].reason || "failed").slice(0, 300) };
+    data.webrtc = results[1].status === "fulfilled" ? results[1].value : { udp_status: "failed", error: String(results[1].reason || "failed").slice(0, 300) };
+    data.fingerprint.canvas = results[2].status === "fulfilled" ? results[2].value : { status: "failed", hash: "" };
+    data.fingerprint.webgl = results[3].status === "fulfilled" ? results[3].value : { status: "failed", hash: "" };
     return data;
+}
+async function browserShortSha256(value) {
+    if (!window.crypto || !window.crypto.subtle || !window.TextEncoder) return "";
+    const bytes = new TextEncoder().encode(String(value || ""));
+    const digest = await window.crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(digest)).map((value) => value.toString(16).padStart(2, "0")).join("").slice(0, 32);
+}
+async function collectCanvasSignal() {
+    try {
+        const canvas = document.createElement("canvas");
+        canvas.width = 280;
+        canvas.height = 80;
+        const context = canvas.getContext("2d");
+        if (!context) return { status: "unsupported", hash: "" };
+        context.textBaseline = "top";
+        context.fillStyle = "#f97316";
+        context.fillRect(4, 4, 96, 24);
+        context.fillStyle = "#1d4ed8";
+        context.font = "16px Arial, sans-serif";
+        context.fillText("TG DualBot 指纹 v1", 8, 34);
+        context.globalCompositeOperation = "multiply";
+        context.fillStyle = "rgba(22,163,74,.65)";
+        context.beginPath();
+        context.arc(225, 35, 26, 0, Math.PI * 2);
+        context.fill();
+        const hash = await browserShortSha256(canvas.toDataURL("image/png"));
+        return { status: hash ? "ok" : "unsupported", hash };
+    } catch (error) {
+        return { status: "failed", hash: "" };
+    }
+}
+function normalizedGlValue(value) {
+    if (ArrayBuffer.isView(value)) return Array.from(value);
+    return value == null ? "" : value;
+}
+async function collectWebGlSignal() {
+    try {
+        const canvas = document.createElement("canvas");
+        const gl = canvas.getContext("webgl2") || canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+        if (!gl) return { status: "unsupported", hash: "" };
+        const debugInfo = gl.getExtension("WEBGL_debug_renderer_info");
+        const values = [
+            normalizedGlValue(gl.getParameter(gl.VENDOR)),
+            normalizedGlValue(gl.getParameter(gl.RENDERER)),
+            normalizedGlValue(gl.getParameter(gl.VERSION)),
+            normalizedGlValue(gl.getParameter(gl.SHADING_LANGUAGE_VERSION)),
+            normalizedGlValue(gl.getParameter(gl.MAX_TEXTURE_SIZE)),
+            normalizedGlValue(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE)),
+            normalizedGlValue(gl.getParameter(gl.MAX_VERTEX_ATTRIBS)),
+            normalizedGlValue(gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS)),
+            normalizedGlValue(gl.getParameter(gl.ALIASED_LINE_WIDTH_RANGE)),
+            debugInfo ? normalizedGlValue(gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL)) : "",
+            debugInfo ? normalizedGlValue(gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)) : "",
+        ];
+        const hash = await browserShortSha256(JSON.stringify(values));
+        const loseContext = gl.getExtension("WEBGL_lose_context");
+        if (loseContext) loseContext.loseContext();
+        return { status: hash ? "ok" : "unsupported", hash };
+    } catch (error) {
+        return { status: "failed", hash: "" };
+    }
 }
 async function httpProbe() {
     const response = await fetch("/verify/ip-probe?token=" + encodeURIComponent(VERIFY_TOKEN) + "&t=" + Date.now(), { cache: "no-store" });
@@ -590,20 +842,20 @@ function collectWebRtcCandidates() {
     });
 }
 function parseCandidate(candidate) {
-    const parts = String(candidate || "").split(/\s+/);
+    const parts = String(candidate || "").split(/\\s+/);
     const typIndex = parts.indexOf("typ");
     const ip = parts[4] || "";
     const protocol = String(parts[2] || "").toLowerCase();
     const type = typIndex >= 0 ? parts[typIndex + 1] || "" : "";
     if (!ip || ip.endsWith(".local")) return null;
-    return { ip, version: ip.includes(":") ? "IPv6" : "IPv4", protocol, type, raw: candidate.slice(0, 500) };
+    return { ip, version: ip.includes(":") ? "IPv6" : "IPv4", protocol, type };
 }
 function firstPublicIp(items, version) {
     const item = items.find((x) => x.version === version && x.type !== "host" && !isPrivateIp(x.ip));
     return item ? item.ip : "";
 }
 function isPrivateIp(ip) {
-    return /^(10\.|127\.|172\.(1[6-9]|2\d|3[0-1])\.|192\.168\.|169\.254\.)/.test(ip) || /^f[cd][0-9a-f]{2}:/i.test(ip) || /^fe80:/i.test(ip) || ip === "::1";
+    return /^(10\\.|127\\.|172\\.(1[6-9]|2\\d|3[0-1])\\.|192\\.168\\.|169\\.254\\.)/.test(ip) || /^f[cd][0-9a-f]{2}:/i.test(ip) || /^fe80:/i.test(ip) || ip === "::1";
 }
 </script></body></html>`;
 }
@@ -651,17 +903,19 @@ async function verifySubmit(request, env, token = "") {
     const userAgent = request.headers.get("User-Agent") || "";
     const network = extractClientNetwork(clientData, ip);
     const deviceOs = detectDeviceOs(userAgent, clientData);
-    const rawClientData = JSON.stringify(clientData || {}).slice(0, 6000);
+    const rawClientData = JSON.stringify(clientDataForVerificationStorage(clientData)).slice(0, 6000);
     const userId = Number(session.user_id);
-    await env.DB.prepare(`UPDATE verification_sessions SET status='verified', verified_at=?, http_ip=?, http_ip_version=?, http_ipv4=?, http_ipv6=?, webrtc_ipv4=?, webrtc_ipv6=?, webrtc_protocol=?, webrtc_candidate_type=?, udp_status=?, asn=?, as_organization=?, country=?, colo=?, device_os=?, user_agent=?, raw_client_data=? WHERE token=?`)
-        .bind(ts, ip || "", ipVersion(ip), network.http_ipv4, network.http_ipv6, network.webrtc_ipv4, network.webrtc_ipv6, network.webrtc_protocol, network.webrtc_candidate_type, network.udp_status, cfInfo.asn, cfInfo.asOrganization, cfInfo.country, cfInfo.colo, deviceOs, userAgent.slice(0, 500), rawClientData, token)
+    const deviceFingerprint = await buildDeviceFingerprint(clientData);
+    const fingerprintMatch = await findDeviceFingerprintMatch(env, userId, deviceFingerprint);
+    await env.DB.prepare("UPDATE verification_sessions SET status='verified', verified_at=? WHERE token=?")
+        .bind(ts, token)
         .run();
     await env.DB.prepare(`INSERT INTO ip_verifications(user_id, ip, country, colo, user_agent, passed, turnstile_action, http_ip, http_ip_version, http_ipv4, http_ipv6, webrtc_ipv4, webrtc_ipv6, webrtc_protocol, webrtc_candidate_type, udp_status, asn, as_organization, device_os, token, raw_client_data, created_at)
 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .bind(userId, ip || "", cfInfo.country, cfInfo.colo, userAgent.slice(0, 500), 1, String(result.action || ""), ip || "", ipVersion(ip), network.http_ipv4, network.http_ipv6, network.webrtc_ipv4, network.webrtc_ipv6, network.webrtc_protocol, network.webrtc_candidate_type, network.udp_status, cfInfo.asn, cfInfo.asOrganization, deviceOs, token, rawClientData, ts)
         .run();
-    await env.DB.prepare(`UPDATE users SET verified=1, verification_status='verified', verification_token=?, language_code=COALESCE(NULLIF(language_code,''), ?), last_verified_ip=?, last_verified_at=?, last_cf_country=?, last_http_ip=?, last_http_ip_version=?, last_http_ipv4=?, last_http_ipv6=?, last_webrtc_ipv4=?, last_webrtc_ipv6=?, last_udp_status=?, last_asn=?, last_as_organization=?, last_device_os=?, last_user_agent=?, updated_at=? WHERE user_id=?`)
-        .bind(token, session.language_code || "", ip || "", ts, cfInfo.country, ip || "", ipVersion(ip), network.http_ipv4, network.http_ipv6, network.webrtc_ipv4, network.webrtc_ipv6, network.udp_status, cfInfo.asn, cfInfo.asOrganization, deviceOs, userAgent.slice(0, 500), ts, userId)
+    await env.DB.prepare(`UPDATE users SET verified=1, verification_status='verified', verification_token=?, language_code=COALESCE(NULLIF(language_code,''), ?), last_verified_ip=?, last_verified_at=?, last_cf_country=?, last_http_ip=?, last_http_ip_version=?, last_http_ipv4=?, last_http_ipv6=?, last_webrtc_ipv4=?, last_webrtc_ipv6=?, last_udp_status=?, last_asn=?, last_as_organization=?, last_device_os=?, last_user_agent=?, last_device_fingerprint=COALESCE(NULLIF(?,''), last_device_fingerprint), updated_at=? WHERE user_id=?`)
+        .bind(token, session.language_code || "", ip || "", ts, cfInfo.country, ip || "", ipVersion(ip), network.http_ipv4, network.http_ipv6, network.webrtc_ipv4, network.webrtc_ipv6, network.udp_status, cfInfo.asn, cfInfo.asOrganization, deviceOs, userAgent.slice(0, 500), deviceFingerprint, ts, userId)
         .run();
     const verificationInfo = {
         username: session.username || "",
@@ -680,6 +934,11 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         country: cfInfo.country,
         colo: cfInfo.colo,
         deviceOs,
+        deviceFingerprint,
+        fingerprintMatchedUserId: Number(fingerprintMatch?.user_id || 0),
+        fingerprintMatchedUsername: String(fingerprintMatch?.username || ""),
+        fingerprintLabel: String(fingerprintMatch?.note || "").trim().slice(0, 200),
+        fingerprintSimilarity: fingerprintMatch ? 100 : 0,
     };
     await completeTopicVerification(env, userId, verificationInfo);
     await notifyVerificationSuccess(env, userId, token, verificationInfo);
@@ -1089,7 +1348,7 @@ function topicIntroText(user) {
 }
 
 function topicVerificationText(info) {
-    return [
+    const lines = [
         "本次验证信息",
         `HTTP IP：${info.httpIp || "-"}`,
         `公网 IPv4：${info.httpIpv4 || "-"}`,
@@ -1101,7 +1360,12 @@ function topicVerificationText(info) {
         `运营商：${info.asOrganization || "-"}`,
         `国家/地区：${info.country || "-"}`,
         `设备系统：${info.deviceOs || "-"}`,
-    ].join("\n");
+        `设备指纹：${info.deviceFingerprint ? info.deviceFingerprint.slice(0, 32) : "-"}`,
+    ];
+    if (info.fingerprintMatchedUserId) {
+        lines.push("", "相似标签命中", `标签：${info.fingerprintLabel || "未设置"}`, "相似度：100%", `匹配用户 ID：${info.fingerprintMatchedUserId}`, `匹配用户名：${info.fingerprintMatchedUsername ? `@${info.fingerprintMatchedUsername}` : "无"}`);
+    }
+    return lines.join("\n");
 }
 
 async function completeTopicVerification(env, userId, info) {
@@ -1257,7 +1521,7 @@ function parseUserIdAndText(args) {
 }
 
 function formatUserInfo(row) {
-    return `用户信息\nuser_id: ${row.user_id}\nusername: @${row.username || ""}\nfull_name: ${row.full_name || ""}\nblocked: ${Boolean(row.blocked)}\nverified: ${Boolean(row.verified)}\nstatus: ${row.verification_status || "-"}\nnote: ${row.note || ""}\nHTTP IPv4: ${row.last_http_ipv4 || "-"}\nHTTP IPv6: ${row.last_http_ipv6 || "-"}\nUDP IPv4: ${row.last_webrtc_ipv4 || "-"}\nUDP IPv6: ${row.last_webrtc_ipv6 || "-"}\nASN: ${row.last_asn || "-"}\ntopic_thread_id: ${row.topic_thread_id || "-"}\ntopic_status: ${row.topic_status || "-"}\nupdated_at: ${row.updated_at}`;
+    return `用户信息\nuser_id: ${row.user_id}\nusername: @${row.username || ""}\nfull_name: ${row.full_name || ""}\nblocked: ${Boolean(row.blocked)}\nverified: ${Boolean(row.verified)}\nstatus: ${row.verification_status || "-"}\nnote: ${row.note || ""}\nHTTP IPv4: ${row.last_http_ipv4 || "-"}\nHTTP IPv6: ${row.last_http_ipv6 || "-"}\nUDP IPv4: ${row.last_webrtc_ipv4 || "-"}\nUDP IPv6: ${row.last_webrtc_ipv6 || "-"}\nASN: ${row.last_asn || "-"}\ndevice_fingerprint: ${row.last_device_fingerprint ? String(row.last_device_fingerprint).slice(0, 32) : "-"}\ntopic_thread_id: ${row.topic_thread_id || "-"}\ntopic_status: ${row.topic_status || "-"}\nupdated_at: ${row.updated_at}`;
 }
 
 async function relayUserMessage(env, message) {
@@ -1686,7 +1950,9 @@ async function answerCallbackQuery(env, callbackQueryId, textValue) {
 
 async function notifyVerificationSuccess(env, userId, token, info) {
     const username = info.username ? `@${h(info.username)}` : "无";
-    const textValue = `新用户验证通过\n用户 ID：<code>${userId}</code>\n昵称：${h(info.fullName || "-")}\n用户名：${username}\n语言：${h(info.languageCode || "-")}\n\n本次验证信息\n设备系统：${h(info.deviceOs || "-")}\nHTTP IP：<code>${h(info.httpIp || "-")}</code>\nHTTP IP 类型：${h(info.httpIpVersion || "-")}\n公网 IPv4：<code>${h(info.httpIpv4 || "-")}</code>\n公网 IPv6：<code>${h(info.httpIpv6 || "-")}</code>\n公网 ASN：${h(info.asn || "-")}\n运营商：${h(info.asOrganization || "-")}\n国家/地区：${h(info.country || "-")}\nCloudflare 机房：${h(info.colo || "-")}\n\nUDP / WebRTC 信息\nWebRTC IPv4：<code>${h(info.webrtcIpv4 || "-")}</code>\nWebRTC IPv6：<code>${h(info.webrtcIpv6 || "-")}</code>\nUDP 状态：${h(info.udpStatus || "-")}\nCandidate 类型：${h(info.candidateType || "-")}`;
+    const fingerprintText = info.deviceFingerprint ? h(info.deviceFingerprint.slice(0, 32)) : "-";
+    const matchText = info.fingerprintMatchedUserId ? `\n\n相似标签命中\n标签：${h(info.fingerprintLabel || "未设置")}\n相似度：100%\n匹配用户 ID：<code>${info.fingerprintMatchedUserId}</code>\n匹配用户名：${info.fingerprintMatchedUsername ? `@${h(info.fingerprintMatchedUsername)}` : "无"}` : "";
+    const textValue = `新用户验证通过\n用户 ID：<code>${userId}</code>\n昵称：${h(info.fullName || "-")}\n用户名：${username}\n语言：${h(info.languageCode || "-")}\n\n本次验证信息\n设备系统：${h(info.deviceOs || "-")}\n设备指纹：<code>${fingerprintText}</code>\nHTTP IP：<code>${h(info.httpIp || "-")}</code>\nHTTP IP 类型：${h(info.httpIpVersion || "-")}\n公网 IPv4：<code>${h(info.httpIpv4 || "-")}</code>\n公网 IPv6：<code>${h(info.httpIpv6 || "-")}</code>\n公网 ASN：${h(info.asn || "-")}\n运营商：${h(info.asOrganization || "-")}\n国家/地区：${h(info.country || "-")}\nCloudflare 机房：${h(info.colo || "-")}\n\nUDP / WebRTC 信息\nWebRTC IPv4：<code>${h(info.webrtcIpv4 || "-")}</code>\nWebRTC IPv6：<code>${h(info.webrtcIpv6 || "-")}</code>\nUDP 状态：${h(info.udpStatus || "-")}\nCandidate 类型：${h(info.candidateType || "-")}${matchText}`;
     await notifyAdmins(env, textValue, {
         reply_markup: {
             inline_keyboard: [
@@ -1699,8 +1965,9 @@ async function notifyVerificationSuccess(env, userId, token, info) {
 }
 
 function parseClientData(value) {
-    const raw = String(value || "").slice(0, 6000);
+    const raw = String(value || "");
     if (!raw) return {};
+    if (raw.length > 6000) return { parse_error: "client_data_too_large" };
     try {
         const parsed = JSON.parse(raw);
         return parsed && typeof parsed === "object" ? parsed : {};
@@ -1774,34 +2041,38 @@ function detectDeviceOs(userAgent, clientData = {}) {
 
 async function ensureVerificationSchema(env) {
     if (verificationSchemaReady) return;
-    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS verification_sessions (
-        token TEXT PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        chat_id INTEGER,
-        username TEXT DEFAULT '',
-        full_name TEXT DEFAULT '',
-        language_code TEXT DEFAULT '',
-        status TEXT DEFAULT 'pending',
-        http_ip TEXT DEFAULT '',
-        http_ip_version TEXT DEFAULT '',
-        http_ipv4 TEXT DEFAULT '',
-        http_ipv6 TEXT DEFAULT '',
-        webrtc_ipv4 TEXT DEFAULT '',
-        webrtc_ipv6 TEXT DEFAULT '',
-        webrtc_protocol TEXT DEFAULT '',
-        webrtc_candidate_type TEXT DEFAULT '',
-        udp_status TEXT DEFAULT '',
-        asn TEXT DEFAULT '',
-        as_organization TEXT DEFAULT '',
-        country TEXT DEFAULT '',
-        colo TEXT DEFAULT '',
-        device_os TEXT DEFAULT '',
-        user_agent TEXT DEFAULT '',
-        raw_client_data TEXT DEFAULT '',
-        created_at TEXT NOT NULL,
-        expires_at TEXT NOT NULL,
-        verified_at TEXT
-    )`).run();
+    const schemaRows = await env.DB.prepare("SELECT name, type FROM sqlite_master WHERE type IN ('table','index')").all();
+    const schemaObjects = new Set((schemaRows.results || []).map((row) => `${row.type}:${row.name}`));
+    if (!schemaObjects.has("table:verification_sessions")) {
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS verification_sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            chat_id INTEGER,
+            username TEXT DEFAULT '',
+            full_name TEXT DEFAULT '',
+            language_code TEXT DEFAULT '',
+            status TEXT DEFAULT 'pending',
+            http_ip TEXT DEFAULT '',
+            http_ip_version TEXT DEFAULT '',
+            http_ipv4 TEXT DEFAULT '',
+            http_ipv6 TEXT DEFAULT '',
+            webrtc_ipv4 TEXT DEFAULT '',
+            webrtc_ipv6 TEXT DEFAULT '',
+            webrtc_protocol TEXT DEFAULT '',
+            webrtc_candidate_type TEXT DEFAULT '',
+            udp_status TEXT DEFAULT '',
+            asn TEXT DEFAULT '',
+            as_organization TEXT DEFAULT '',
+            country TEXT DEFAULT '',
+            colo TEXT DEFAULT '',
+            device_os TEXT DEFAULT '',
+            user_agent TEXT DEFAULT '',
+            raw_client_data TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            verified_at TEXT
+        )`).run();
+    }
     const userColumns = [
         "language_code TEXT DEFAULT ''",
         "verified INTEGER DEFAULT 0",
@@ -1818,6 +2089,7 @@ async function ensureVerificationSchema(env) {
         "last_as_organization TEXT DEFAULT ''",
         "last_device_os TEXT DEFAULT ''",
         "last_user_agent TEXT DEFAULT ''",
+        "last_device_fingerprint TEXT NOT NULL DEFAULT '' CHECK(last_device_fingerprint='' OR length(last_device_fingerprint)=32)",
         "topic_chat_id INTEGER",
         "topic_thread_id INTEGER",
         "topic_title TEXT DEFAULT ''",
@@ -1849,14 +2121,29 @@ async function ensureVerificationSchema(env) {
         "token TEXT DEFAULT ''",
         "raw_client_data TEXT DEFAULT ''",
     ];
-    for (const column of userColumns) await addColumnIfMissing(env, "users", column);
-    for (const column of inboxColumns) await addColumnIfMissing(env, "inbox_messages", column);
-    for (const column of verificationColumns) await addColumnIfMissing(env, "ip_verifications", column);
-    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_users_topic ON users(topic_chat_id, topic_thread_id)").run();
-    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_inbox_topic_created ON inbox_messages(topic_chat_id, topic_thread_id, created_at)").run();
-    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_verification_sessions_user_created ON verification_sessions(user_id, created_at)").run();
-    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_verification_sessions_status ON verification_sessions(status)").run();
+    await ensureColumns(env, "users", userColumns);
+    await ensureColumns(env, "inbox_messages", inboxColumns);
+    await ensureColumns(env, "ip_verifications", verificationColumns);
+    const indexes = [
+        { name: "idx_users_topic", sql: "CREATE INDEX IF NOT EXISTS idx_users_topic ON users(topic_chat_id, topic_thread_id)" },
+        { name: "idx_users_device_fingerprint", sql: "CREATE INDEX IF NOT EXISTS idx_users_device_fingerprint ON users(last_device_fingerprint) WHERE last_device_fingerprint<>''" },
+        { name: "idx_inbox_topic_created", sql: "CREATE INDEX IF NOT EXISTS idx_inbox_topic_created ON inbox_messages(topic_chat_id, topic_thread_id, created_at)" },
+        { name: "idx_verification_sessions_user_created", sql: "CREATE INDEX IF NOT EXISTS idx_verification_sessions_user_created ON verification_sessions(user_id, created_at)" },
+        { name: "idx_verification_sessions_status", sql: "CREATE INDEX IF NOT EXISTS idx_verification_sessions_status ON verification_sessions(status)" },
+    ];
+    for (const index of indexes) {
+        if (!schemaObjects.has(`index:${index.name}`)) await env.DB.prepare(index.sql).run();
+    }
     verificationSchemaReady = true;
+}
+
+async function ensureColumns(env, table, columns) {
+    const rows = await env.DB.prepare(`PRAGMA table_info(${table})`).all();
+    const existing = new Set((rows.results || []).map((row) => String(row.name)));
+    for (const columnSql of columns) {
+        const columnName = String(columnSql).trim().split(/\s+/, 1)[0];
+        if (!existing.has(columnName)) await addColumnIfMissing(env, table, columnSql);
+    }
 }
 
 async function addColumnIfMissing(env, table, columnSql) {
