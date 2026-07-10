@@ -342,8 +342,8 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 用户私聊 Bot
   -> Bot 发现用户未验证
   -> 生成 verification_sessions token
-  -> Telegram 返回“打开验证页面”按钮
-  -> 浏览器打开 /verify/{token}
+  -> Telegram 优先返回“Telegram 内验证”Mini App 按钮
+  -> 同时提供“浏览器验证”备用入口，二者打开同一 /verify/{token}
   -> Cloudflare Turnstile 前端挑战
   -> 浏览器采集 HTTP 探测和 WebRTC UDP 候选信息
   -> POST /verify/{token}
@@ -681,6 +681,17 @@ curl.exe "https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo"
 
 `allowed_updates` 必须包含 `callback_query`，否则管理员通知里的 inline 按钮无法回调。
 
+### Telegram Mini App 验证
+
+验证提示默认优先提供 Telegram Mini App，并保留普通浏览器备用入口：
+
+- `Telegram 内验证`：第一按钮，使用 Bot API 的 `web_app` 在 Telegram 内打开验证页。
+- `浏览器验证`：第二按钮，供桌面端、旧版客户端或 Mini App 不可用时使用。
+
+两个入口使用同一个一次性验证 token，验证结果、D1 记录和管理员通知完全一致。`PUBLIC_BASE_URL` 必须是可公开访问的 HTTPS 地址，并且该域名需要加入 Turnstile Widget 的允许主机名。
+
+Mini App 按钮仅适用于 Bot 与用户的私聊；本项目的验证提示只在私聊中发送，因此不会影响群话题和管理员控制功能。
+
 <a id="post-deploy-check"></a>
 
 ## 部署后验证
@@ -708,9 +719,9 @@ https://你的地址/login
 ### 3. 用户验证门禁
 
 1. 用普通 Telegram 用户给 Bot 发送 `/start`。
-2. Bot 返回“打开验证页面”按钮。
-3. 浏览器打开 `/verify/{token}`。
-4. 完成 Turnstile。
+2. Bot 首先显示“Telegram 内验证”Mini App 按钮。
+3. 点击 Mini App 按钮并完成 Turnstile。
+4. 再确认“浏览器验证”备用按钮也能打开同一验证页。
 5. 页面显示验证成功。
 6. 用户回到 Telegram 后可以继续聊天。
 7. 管理员收到验证详情通知。

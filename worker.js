@@ -487,39 +487,41 @@ async function logsPage(request, env) {
 
 async function verifyPage(request, env, token = "", error = "") {
     await ensureVerificationSchema(env);
-    const ip = visitorIp(request);
-    const cfInfo = requestCfInfo(request);
     if (!token) {
-        return verifyMessagePage("继续聊天前需要验证", `<p class="muted">${h(error || "请回到 Telegram，点击机器人发送的验证按钮。")}</p><p class="muted">当前连接 IP：${h(ip || "-")}</p>`);
+        return verifyMessagePage("继续聊天前需要验证", `<p class="muted">${h(error || "请回到 Telegram，点击机器人发送的验证按钮。")}</p>`);
     }
     const session = await getVerificationSession(env, token);
     if (!session) {
-        return verifyMessagePage("验证链接无效", `<p class="muted">请回到 Telegram 重新点击验证按钮。</p><p class="muted">当前连接 IP：${h(ip || "-")}</p>`);
+        return verifyMessagePage("验证链接无效", `<p class="muted">请回到 Telegram 重新点击验证按钮。</p>`);
     }
     if (session.expires_at && Date.parse(session.expires_at) < Date.now()) {
         await markVerificationSession(env, token, "expired");
-        return verifyMessagePage("验证链接已过期", `<p class="muted">请回到 Telegram 重新获取验证链接。</p><p class="muted">当前连接 IP：${h(ip || "-")}</p>`);
+        return verifyMessagePage("验证链接已过期", `<p class="muted">请回到 Telegram 重新获取验证链接。</p>`);
     }
     if (session.status === "verified") {
-        return verifySuccessPage(ip, cfInfo, session.verified_at || nowIso());
+        return verifySuccessPage();
     }
     if (!env.TURNSTILE_SITE_KEY) {
-        return verifyMessagePage("CF 验证未配置", `<p>请先配置 <code>TURNSTILE_SITE_KEY</code> 和 <code>TURNSTILE_SECRET_KEY</code>。</p><p class="muted">当前访问 IP：${h(ip || "-")}</p>`);
+        return verifyMessagePage("CF 验证未配置", `<p>请先配置 <code>TURNSTILE_SITE_KEY</code> 和 <code>TURNSTILE_SECRET_KEY</code>。</p>`);
     }
     const tokenJson = JSON.stringify(token);
-    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>继续聊天前需要验证</title>${verifyStyle()}<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body><main><form id="verifyForm" class="card" method="post" action="/verify/${h(token)}">
+    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>继续聊天前需要验证</title>${verifyStyle()}<script src="https://telegram.org/js/telegram-web-app.js"></script><script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body><main><form id="verifyForm" class="card" method="post" action="/verify/${h(token)}">
 <h1>继续聊天前需要验证</h1><p class="muted">此页面使用 Cloudflare Turnstile 进行人机验证。验证通过后，机器人会为你建立独立话题并转发后续消息。</p>${error ? `<div class="error">${h(error)}</div>` : ""}
 <input type="hidden" id="client_data" name="client_data" value="">
 <div class="cf-turnstile" data-sitekey="${h(env.TURNSTILE_SITE_KEY)}"></div>
-<button id="submitBtn" type="submit">完成验证</button><p id="probeStatus" class="muted">当前连接 IP：${h(ip || "-")}<br>国家/地区：${h(cfInfo.country || "-")} · 机房：${h(cfInfo.colo || "-")}</p><p class="muted small">页面会尝试记录 HTTP IPv4/IPv6 与 UDP WebRTC 信息。浏览器、网络或代理限制时，UDP 信息可能为空。</p></form></main><script>
+<button id="submitBtn" type="submit">完成验证</button></form></main><script>
 const VERIFY_TOKEN = ${tokenJson};
+const telegramWebApp = window.Telegram && window.Telegram.WebApp;
+if (telegramWebApp) {
+    telegramWebApp.ready();
+    telegramWebApp.expand();
+}
 const form = document.getElementById("verifyForm");
 const button = document.getElementById("submitBtn");
-const statusEl = document.getElementById("probeStatus");
 form.addEventListener("submit", async (event) => {
     event.preventDefault();
     button.disabled = true;
-    button.textContent = "正在采集网络信息...";
+    button.textContent = "正在验证...";
     try {
         const data = await collectClientData();
         document.getElementById("client_data").value = JSON.stringify(data).slice(0, 6000);
@@ -543,7 +545,6 @@ async function collectClientData() {
     const results = await Promise.allSettled(tasks);
     data.probe = results[0].status === "fulfilled" ? results[0].value : { error: String(results[0].reason || "failed") };
     data.webrtc = results[1].status === "fulfilled" ? results[1].value : { udp_status: "failed", error: String(results[1].reason || "failed") };
-    if (statusEl && data.webrtc) statusEl.innerHTML += "<br>UDP 状态：" + escapeHtml(data.webrtc.udp_status || "unknown");
     return data;
 }
 async function httpProbe() {
@@ -604,9 +605,6 @@ function firstPublicIp(items, version) {
 function isPrivateIp(ip) {
     return /^(10\.|127\.|172\.(1[6-9]|2\d|3[0-1])\.|192\.168\.|169\.254\.)/.test(ip) || /^f[cd][0-9a-f]{2}:/i.test(ip) || /^fe80:/i.test(ip) || ip === "::1";
 }
-function escapeHtml(value) {
-    return String(value || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
 </script></body></html>`;
 }
 
@@ -614,8 +612,8 @@ function verifyMessagePage(title, body) {
     return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${h(title)}</title>${verifyStyle()}</head><body><main><div class="card"><h1>${h(title)}</h1>${body}</div></main></body></html>`;
 }
 
-function verifySuccessPage(ip, cfInfo, ts) {
-    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>验证成功</title>${verifyStyle()}</head><body><main><div class="card"><h1>验证成功</h1><p>验证已通过，请回到 Telegram 继续聊天。</p><p class="muted">HTTP IP：${h(ip || "-")}<br>国家/地区：${h(cfInfo.country || "-")}<br>Cloudflare 机房：${h(cfInfo.colo || "-")}<br>时间：${h(ts)}</p></div></main></body></html>`;
+function verifySuccessPage() {
+    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>验证成功</title>${verifyStyle()}</head><body><main><div class="card"><h1>验证成功</h1><p>验证已通过，请回到 Telegram 继续聊天。</p></div></main></body></html>`;
 }
 
 function verifyStyle() {
@@ -686,7 +684,7 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     await completeTopicVerification(env, userId, verificationInfo);
     await notifyVerificationSuccess(env, userId, token, verificationInfo);
     await tgSendMessage(env, userId, "验证已通过，现在可以回到 Telegram 继续聊天。").catch(() => {});
-    return html(verifySuccessPage(ip, cfInfo, ts));
+    return html(verifySuccessPage());
 }
 
 function verifyIpProbe(request) {
@@ -1226,7 +1224,20 @@ async function handleCommand(env, message, command, isAdmin) {
             const link = await createVerificationLink(env, row || { user_id: uid, id: uid, full_name: String(uid) }, uid);
             await tgSendMessage(env, chatId, link || "未配置 PUBLIC_BASE_URL。");
         } else {
-            await tgSendMessage(env, chatId, "可用命令：/reply /block /unblock /note /who /spamwords /spamadd /spamdel /verifylink");
+            await tgSendMessage(env, chatId, `管理员命令帮助
+
+/admin — 显示本帮助
+/reply <用户ID> <内容> — 向指定用户发送消息
+/block <用户ID> — 封禁用户，阻止其继续发送消息
+/unblock <用户ID> — 解除用户封禁
+/note <用户ID> <备注> — 添加或更新后台用户备注
+/who <用户ID> — 查看用户资料、验证和封禁状态
+/spamwords — 查看全部广告拦截关键词
+/spamadd <关键词> — 添加一个广告拦截关键词
+/spamdel <关键词> — 删除一个广告拦截关键词
+/verifylink <用户ID> — 为指定用户生成新的验证链接
+/verify — 为当前账号生成新的验证链接
+/start — 查看当前连接和验证状态`);
         }
     } catch (error) {
         await tgSendMessage(env, chatId, `命令执行失败：${String(error.message || error)}`);
@@ -1606,8 +1617,13 @@ async function sendVerificationPrompt(env, chatId, from, textValue) {
     }
     await tgCall(env, "sendMessage", {
         chat_id: chatId,
-        text: `${textValue}\n\n验证通过前，你发送的消息不会被转发。`,
-        reply_markup: { inline_keyboard: [[{ text: "打开验证页面", url: link }]] },
+        text: `${textValue}\n\n请优先使用“Telegram 内验证”；如无法打开，再使用“浏览器验证”。验证通过前，你发送的消息不会被转发。`,
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: "Telegram 内验证", web_app: { url: link } }],
+                [{ text: "浏览器验证", url: link }],
+            ],
+        },
         disable_web_page_preview: true,
     });
 }
