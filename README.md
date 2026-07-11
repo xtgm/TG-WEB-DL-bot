@@ -165,6 +165,7 @@ npm run db:apply
 | `verification_sessions` | Telegram 用户一次性验证 token 和验证会话。 |
 | `webrtc_identity_labels` | 管理员手动标记的 WebRTC 精确哈希和标签；同一哈希全局唯一。 |
 | `webrtc_identity_confirmations` | 管理员人工确认后的用户与 WebRTC 标签关联；每个用户最多一行。 |
+| `device_fingerprint_profiles` | 跨浏览器/设备相似度使用的紧凑哈希档案；每个用户固定最多 3 行。 |
 
 ### 旧库升级
 
@@ -175,6 +176,7 @@ npm run db:upgrade:verification
 npm run db:upgrade:topics
 npm run db:upgrade:fingerprint
 npm run db:upgrade:webrtc-identity
+npm run db:upgrade:fingerprint-similarity
 ```
 
 如果旧库已经运行过新版 Worker，运行时代码可能已经自动补齐字段；这时升级 SQL 遇到重复字段可以停止，不影响新版运行。
@@ -286,7 +288,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 用户管理 | `/users` 展示用户资料、验证状态、备注、封禁状态、HTTP IPv4/IPv6、UDP WebRTC IPv4/IPv6、ASN、设备系统。 |
 | 广告拦截 | `/rules` 支持维护私聊关键词，命中后可自动封禁并通知管理员。 |
 | Cloudflare 验证记录 | `/verifications` 展示 Turnstile 通过记录、HTTP IP、WebRTC UDP 结果、国家、机房、ASN、User-Agent。 |
-| 设备指纹精确匹配 | 验证页生成 Canvas、WebGL、屏幕和硬件特征哈希；服务端 32 字符指纹完全相同时读取已匹配用户的备注标签并显示相似度 `100%`。 |
+| 设备指纹相似度候选 | 验证页生成 Canvas、拆分后的 WebGL、屏幕、硬件、系统、语言和时区哈希；完整指纹可精确匹配，不同浏览器或设备按固定权重计算相似度，最终必须由管理员确认。 |
 | WebRTC 人工身份标签 | 管理员使用现有备注手动标记 WebRTC；后续 WebRTC 精确命中只显示“待人工确认”，点击“确认同一人”后才建立持久标签关联。 |
 | Telegram 话题控制 | `CONTROL_MODE=topic/both` 时，验证通过后可自动创建用户专属群话题，管理员在话题里回复会回到用户。 |
 | 多管理员 | `ADMIN_CHAT_IDS` 最多取 3 个管理员 ID，可通过后台设置或 Cloudflare 环境变量配置；话题回复也只允许这些 ID。 |
@@ -337,6 +339,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 - ASN、运营商、国家/地区、Cloudflare 机房。
 - 设备系统。
 - inline 操作按钮：取消验证、拉黑、获取用户名。
+- 命中时显示 WebRTC 是否完全一致、指纹相似度、命中字段和“确认同一人”按钮；点击前不会建立身份关系。
 
 <a id="cloudflare-verification"></a>
 
@@ -362,23 +365,26 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 当前实现记录两类网络信息：
 
 - HTTP 层：从 `CF-Connecting-IP` 读取访问 IP，从 `request.cf` 读取 `country`、`colo`、`asn`、`asOrganization`。
-- UDP/WebRTC 层：浏览器尝试通过 STUN 收集 UDP 候选地址，提取公网 IPv4、IPv6、协议和 candidate 类型。
+- UDP/WebRTC 层：浏览器尝试通过两个 STUN 收集候选地址；只有公网 UDP `srflx` 会进入身份判断，`host`、私网和 `relay` 会被排除。
 
 限制说明：
 
 - 单次 HTTP 请求通常只会走 IPv4 或 IPv6 其中一种，因此另一项可能为空。
+- HTTP 身份字段只采用 Cloudflare 请求中的 `CF-Connecting-IP`；浏览器提交的 probe 地址不会参与身份判断。
 - WebRTC UDP 记录受浏览器、代理、系统隐私设置、企业网络和运营商网络影响，可能显示 `empty`、`unsupported` 或 `failed`。
 - 本项目会记录字段和状态，不把空值伪造成真实 IP。
 
 ### 设备指纹与标签匹配
 
-验证页会在用户设备中计算 Canvas、WebGL、屏幕尺寸、像素比、颜色深度、CPU 核数、粗粒度内存和触控点数等特征。Canvas 图片和 WebGL 原始参数不会写入 D1；Worker 计算 SHA-256 后只保留前 32 个十六进制字符作为固定长度指纹。
+验证页会计算 Canvas、WebGL 显卡、WebGL 能力、屏幕尺寸、像素比、颜色深度、CPU/内存、触控、系统、时区和语言等特征。Canvas 图片和 WebGL 原始参数不会写入 D1；服务端只保存固定长度 SHA-256 摘要。
 
-- 只有数据库中的 32 字符指纹完全一致时，才显示 `相似度：100%`。
-- 标签直接读取已匹配用户的“备注”。例如先把已知账号备注设置为 `小孩`，其他账号精确命中后，管理员通知会显示“标签：小孩”。
-- 指纹和标签只显示在登录后台、管理员私聊通知和管理员话题中，不显示在用户验证页面。
-- D1 只在 `users` 中保存每个用户最新的一条 32 字符指纹，不保存指纹历史；Canvas、WebGL、硬件和组件哈希不会写入 `ip_verifications` 或 `verification_sessions`。指纹查询使用部分索引，不扫描全表。
-- 用户重新验证只覆盖当前指纹；删除用户时该指纹随用户行一起删除。
+- 完整档案哈希一致时显示 `100%`；否则按照固定满分 100 计算相似度，缺失字段得 0 分，不会按剩余字段重新折算成 100%。即使哈希完全一致，如果缺少“至少两项强特征 + 系统”证据，也只展示参考信息，不显示确认按钮。
+- WebRTC 完全一致与设备指纹百分比分开显示。WebRTC 完全一致优先作为网络出口证据；指纹只提供辅助判断。
+- 跨浏览器候选至少需要两项强特征、设备系统以及 WebGL 显卡或 Canvas 命中，并达到 `75%` 才主动提示；系统不会自动贴标签、封禁或确认身份。
+- 只有匹配用户已经具备人工标签时才显示指纹确认按钮；尚无标签时仍显示候选信息，但需要先设置备注并标记该用户 WebRTC。
+- 管理员点击“确认同一人（指纹候选）”时，Worker 会重新读取双方档案、WebRTC 哈希和标签并重新计算；按钮还包含由 `PANEL_SECRET` 生成的短 HMAC，旧档案、旧标签或伪造 callback 都会被拒绝。
+- 每个用户在 `device_fingerprint_profiles` 中最多保留 3 个档案；第 4 个新档案覆盖最旧槽位。每个档案可在同一行保存最多 2 个 WebRTC IPv4 哈希和 2 个 IPv6 哈希，任一地址交集都视为 WebRTC 完全一致；候选查询只走固定索引，每个分支最多 10 行，并保留旧版复合索引精确查询，不扫描全表。
+- 指纹分项不会重复写入 `ip_verifications` 或 `verification_sessions`；完整删除用户时三条档案一并删除。旧用户无需强制重新验证，但再次验证后才会生成可参与相似度计算的新档案。
 
 ### WebRTC 标签与人工确认
 
@@ -391,7 +397,7 @@ WebRTC 标签是独立于设备指纹的人工流程：
 
 资源限制：
 
-- 验证流程最多增加一次按唯一哈希索引的精确查询，不扫描全部用户或标签。
+- WebRTC 标签继续使用唯一哈希索引；一次验证最多执行 13 个等值索引分支，每支固定 `LIMIT 10`，进入 Worker 合并前最多 130 条候选行，不会扫描整张档案表。
 - 自动匹配不会新增标签或确认记录；只有管理员点击标记或确认时才写入 D1。
 - 相同 WebRTC 哈希重复标记只更新原记录；每个来源用户最多保留 5 个直接标记。
 - 每个已确认用户在 `webrtc_identity_confirmations` 中最多一行，重新确认时覆盖。
@@ -487,6 +493,7 @@ Telegram 群要求：
 | `ip_verifications` | 每次 Turnstile 通过后的验证记录。 |
 | `webrtc_identity_labels` | 管理员手动标记的 WebRTC 哈希、标签、来源用户和创建人。 |
 | `webrtc_identity_confirmations` | 每个用户当前由管理员确认的 WebRTC 标签关联。 |
+| `device_fingerprint_profiles` | 每用户 0～3 个紧凑哈希档案，用于 WebRTC 精确候选和跨浏览器/设备相似度计算。 |
 | `inbox_messages` | 入站消息、出站回复、消息类型、Web/话题转发状态、错误信息和话题消息元数据。 |
 | `message_map` | 管理员 Telegram 消息 ID 到用户消息的映射，用于回复定位。 |
 | `spam_keywords` | 广告关键词。 |
@@ -511,6 +518,10 @@ tg-dualbot-cloudflare/
 │  ├─ npm run db:upgrade:topics：旧库补 Telegram 话题字段。
 │  ├─ npm run db:upgrade:fingerprint：旧库补设备指纹字段和索引。
 │  ├─ npm run db:upgrade:webrtc-identity：旧库新增 WebRTC 标签与人工确认表。
+│  ├─ npm run db:upgrade:fingerprint-similarity：旧库新增三槽指纹相似度档案表与索引。
+│  ├─ npm run test:fingerprint：测试固定权重、缺失字段和公网 IP 校验。
+│  ├─ npm run test:fingerprint-schema：测试迁移及第 4 个档案覆盖最旧槽位。
+│  ├─ npm run test:verification-client：渲染并检查验证页内嵌采集脚本。
 │  └─ npm run pages:deploy：Pages Direct Upload。
 ├─ wrangler.toml
 │  ├─ name：Worker 名称。
@@ -543,8 +554,14 @@ tg-dualbot-cloudflare/
 │  │  └─ 旧数据库升级到 Telegram 话题双通道版本。
 │  ├─ 0004_device_fingerprint.sql
 │  │  └─ 旧数据库升级到设备指纹精确匹配版本。
-│  └─ 0005_webrtc_identity.sql
-│     └─ 旧数据库新增 WebRTC 标签与人工确认表。
+│  ├─ 0005_webrtc_identity.sql
+│  │  └─ 旧数据库新增 WebRTC 标签与人工确认表。
+│  └─ 0006_fingerprint_similarity.sql
+│     └─ 旧数据库新增有界指纹相似度档案表与候选索引。
+├─ tests/
+│  ├─ fingerprint_similarity.test.mjs
+│  ├─ fingerprint_schema.test.mjs
+│  └─ verification_client_script.test.mjs
 └─ README.md
    └─ 功能、部署、配置、验证和排错说明。
 ```
@@ -845,7 +862,13 @@ npm run db:upgrade:fingerprint
 npm run db:upgrade:webrtc-identity
 ```
 
-该迁移不执行 `ALTER` 或删除操作，只使用外键开关和 `CREATE TABLE/INDEX IF NOT EXISTS`，可以安全重复执行。新版 Worker 也会在首次请求时自动补齐这两张表。
+如果旧库还没有跨浏览器/设备相似度档案表，可以执行：
+
+```powershell
+npm run db:upgrade:fingerprint-similarity
+```
+
+`0005` 和 `0006` 不执行删除操作，只使用外键开关和 `CREATE TABLE/INDEX IF NOT EXISTS`，可以安全重复执行。新版 Worker 也会在首次相关请求时自动补齐这些表和索引，因此不会清空已有用户、黑名单、验证状态或 WebRTC 标签。
 
 如果旧库已经运行过新版 Worker，运行时代码可能已经自动补齐字段；这时升级 SQL 遇到重复字段可以停止，不影响新版运行。
 

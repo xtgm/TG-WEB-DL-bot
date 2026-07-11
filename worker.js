@@ -5,8 +5,12 @@ const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/sit
 const DEFAULT_CONTROL_MODE = "web";
 const DEFAULT_TOPIC_CREATE_POLICY = "after_verify";
 const DEVICE_FINGERPRINT_VERSION = "tg-dualbot-fp-v1";
+const DEVICE_FINGERPRINT_PROFILE_VERSION = "tg-dualbot-fp-profile-v2";
 const WEBRTC_IDENTITY_VERSION = "tg-dualbot-webrtc-v1";
 const MAX_WEBRTC_LABELS_PER_USER = 5;
+const MAX_FINGERPRINT_PROFILES_PER_USER = 3;
+const FINGERPRINT_SIMILARITY_THRESHOLD = 75;
+const FINGERPRINT_CANDIDATE_LIMIT = 10;
 const USER_WITH_IDENTITY_SELECT = "SELECT u.*, c.label_id AS confirmed_identity_label_id, c.confirmed_at AS identity_confirmed_at, l.label_name AS identity_label_name, l.source_user_id AS identity_label_source_user_id FROM users u LEFT JOIN webrtc_identity_confirmations c ON c.user_id=u.user_id LEFT JOIN webrtc_identity_labels l ON l.id=c.label_id";
 
 let verificationSchemaReady = false;
@@ -159,6 +163,19 @@ async function sha256Hex(input) {
     return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+async function hmacSha256Hex(secret, input) {
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+        "raw",
+        encoder.encode(String(secret || "")),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"],
+    );
+    const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(String(input || "")));
+    return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function boundedFingerprintNumber(value, max, precision = 0) {
     const number = Number(value);
     if (!Number.isFinite(number)) return 0;
@@ -198,6 +215,218 @@ async function buildDeviceFingerprint(clientData = {}) {
         webglHash,
     ]);
     return (await sha256Hex(payload)).slice(0, 32);
+}
+
+function normalizedFingerprintText(value, max = 80) {
+    return String(value || "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, max);
+}
+
+function fingerprintRangeBucket(value, boundaries) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) return "";
+    for (const boundary of boundaries) {
+        if (number <= boundary) return String(boundary);
+    }
+    return String(boundaries[boundaries.length - 1]) + "+";
+}
+
+async function fingerprintFeatureHash(name, value) {
+    const normalized = String(value || "");
+    if (!normalized) return "";
+    return (await sha256Hex(JSON.stringify([DEVICE_FINGERPRINT_PROFILE_VERSION, name, normalized]))).slice(0, 32);
+}
+
+async function buildFingerprintProfile(clientData = {}, deviceOs = "", webrtcIdentity = {}) {
+    const fingerprint = clientData?.fingerprint && typeof clientData.fingerprint === "object" ? clientData.fingerprint : {};
+    const hardware = fingerprint.hardware && typeof fingerprint.hardware === "object" ? fingerprint.hardware : {};
+    const screenInfo = clientData?.screen && typeof clientData.screen === "object" ? clientData.screen : {};
+    const canvasHash = normalizedClientHash(fingerprint.canvas?.hash);
+    const webglHash = normalizedClientHash(fingerprint.webgl?.hash);
+    const rendererHash = normalizedClientHash(fingerprint.webgl?.renderer_hash) || webglHash;
+    const limitsHash = normalizedClientHash(fingerprint.webgl?.limits_hash);
+    if (!canvasHash && !rendererHash && !limitsHash) return null;
+
+    const width = boundedFingerprintNumber(screenInfo.width, 32768);
+    const height = boundedFingerprintNumber(screenInfo.height, 32768);
+    const shortSide = Math.min(width, height);
+    const longSide = Math.max(width, height);
+    const screenBucketValue = shortSide > 0 && longSide > 0
+        ? `${Math.round(shortSide / 50) * 50}x${Math.round(longSide / 50) * 50}`
+        : "";
+    const pixelRatio = boundedFingerprintNumber(screenInfo.pixel_ratio, 16, 3);
+    const colorDepth = boundedFingerprintNumber(screenInfo.color_depth, 64);
+    const dprDepthValue = colorDepth > 0 ? `${Math.round(pixelRatio * 4) / 4}|${colorDepth}` : "";
+    const coresBucket = fingerprintRangeBucket(hardware.cores, [1, 2, 4, 6, 8, 12, 16, 32, 64]);
+    const memoryBucket = fingerprintRangeBucket(hardware.memory_gb, [1, 2, 4, 8, 16, 32, 64]);
+    const hardwareValue = coresBucket || memoryBucket ? `${coresBucket}|${memoryBucket}` : "";
+    const touchNumber = Number(hardware.touch_points);
+    const touchValue = Number.isFinite(touchNumber) ? (touchNumber > 0 ? "touch" : "no-touch") : "";
+    const osValue = normalizedFingerprintText(deviceOs || clientData.platform || "", 32);
+    const timezoneValue = normalizedFingerprintText(clientData.timezone, 64);
+    const languageValue = normalizedFingerprintText(clientData.language, 32).split("-")[0];
+
+    const [osHash, screenHash, dprDepthHash, hardwareHash, touchHash, timezoneHash, languageHash] = await Promise.all([
+        fingerprintFeatureHash("os", osValue),
+        fingerprintFeatureHash("screen", screenBucketValue),
+        fingerprintFeatureHash("dpr-depth", dprDepthValue),
+        fingerprintFeatureHash("hardware", hardwareValue),
+        fingerprintFeatureHash("touch", touchValue),
+        fingerprintFeatureHash("timezone", timezoneValue),
+        fingerprintFeatureHash("language", languageValue),
+    ]);
+    const profileHash = (await sha256Hex(JSON.stringify([
+        DEVICE_FINGERPRINT_PROFILE_VERSION,
+        canvasHash,
+        rendererHash,
+        limitsHash,
+        osHash,
+        screenHash,
+        dprDepthHash,
+        hardwareHash,
+        touchHash,
+        timezoneHash,
+        languageHash,
+    ]))).slice(0, 32);
+    const stableHash = osHash && rendererHash && (limitsHash || hardwareHash)
+        ? (await sha256Hex(JSON.stringify([DEVICE_FINGERPRINT_PROFILE_VERSION, "stable", osHash, rendererHash, limitsHash, hardwareHash]))).slice(0, 32)
+        : "";
+    let featureMask = 0;
+    if (canvasHash) featureMask |= 1;
+    if (rendererHash) featureMask |= 2;
+    if (limitsHash) featureMask |= 4;
+    if (osHash) featureMask |= 8;
+    if (screenHash) featureMask |= 16;
+    if (dprDepthHash) featureMask |= 32;
+    if (hardwareHash) featureMask |= 64;
+    if (touchHash) featureMask |= 128;
+    if (timezoneHash) featureMask |= 256;
+    if (languageHash) featureMask |= 512;
+    return {
+        profileHash,
+        webrtcIpv4Hash: normalizedClientHash(webrtcIdentity.ipv4Hash),
+        webrtcIpv4Hash2: normalizedClientHash(webrtcIdentity.ipv4Hash2),
+        webrtcIpv6Hash: normalizedClientHash(webrtcIdentity.ipv6Hash),
+        webrtcIpv6Hash2: normalizedClientHash(webrtcIdentity.ipv6Hash2),
+        stableHash,
+        canvasHash,
+        rendererHash,
+        limitsHash,
+        osHash,
+        screenHash,
+        dprDepthHash,
+        hardwareHash,
+        touchHash,
+        timezoneHash,
+        languageHash,
+        featureMask,
+    };
+}
+
+export function scoreFingerprintSimilarity(current, candidate) {
+    const fields = [
+        ["rendererHash", 24, "WebGL 显卡", true],
+        ["limitsHash", 14, "WebGL 能力", true],
+        ["canvasHash", 18, "Canvas", true],
+        ["osHash", 10, "设备系统", false],
+        ["screenHash", 8, "屏幕尺寸", false],
+        ["dprDepthHash", 5, "像素比例/色深", false],
+        ["hardwareHash", 10, "CPU/内存", false],
+        ["touchHash", 3, "触控能力", false],
+        ["timezoneHash", 5, "时区", false],
+        ["languageHash", 3, "语言", false],
+    ];
+    let score = 0;
+    let strongMatches = 0;
+    const matchedFields = [];
+    const matchedKeys = new Set();
+    for (const [key, weight, label, strong] of fields) {
+        if (current?.[key] && candidate?.[key] && current[key] === candidate[key]) {
+            score += weight;
+            matchedFields.push(label);
+            matchedKeys.add(key);
+            if (strong) strongMatches += 1;
+        }
+    }
+    const exactProfile = Boolean(current?.profileHash && candidate?.profileHash && current.profileHash === candidate.profileHash);
+    if (exactProfile) score = 100;
+    const currentIpv4Hashes = [current?.webrtcIpv4Hash, current?.webrtcIpv4Hash2].filter(Boolean);
+    const candidateIpv4Hashes = new Set([candidate?.webrtcIpv4Hash, candidate?.webrtcIpv4Hash2].filter(Boolean));
+    const currentIpv6Hashes = [current?.webrtcIpv6Hash, current?.webrtcIpv6Hash2].filter(Boolean);
+    const candidateIpv6Hashes = new Set([candidate?.webrtcIpv6Hash, candidate?.webrtcIpv6Hash2].filter(Boolean));
+    const webrtcIpv4Exact = currentIpv4Hashes.some((hash) => candidateIpv4Hashes.has(hash));
+    const webrtcIpv6Exact = currentIpv6Hashes.some((hash) => candidateIpv6Hashes.has(hash));
+    const webrtcExact = webrtcIpv4Exact || webrtcIpv6Exact;
+    const highConfidence = (
+        score >= FINGERPRINT_SIMILARITY_THRESHOLD
+        && strongMatches >= 2
+        && matchedKeys.has("osHash")
+        && (matchedKeys.has("rendererHash") || matchedKeys.has("canvasHash"))
+    );
+    return {
+        score: Math.min(100, score),
+        exactProfile,
+        webrtcExact,
+        webrtcIpv4Exact,
+        webrtcIpv6Exact,
+        highConfidence,
+        strongMatches,
+        matchedFields: exactProfile && !matchedFields.length ? ["完整指纹"] : matchedFields,
+    };
+}
+
+function fingerprintMatchIsActionable(evidence) {
+    return Boolean(evidence?.webrtcExact || evidence?.highConfidence);
+}
+
+function fingerprintMatchIsDisplayable(evidence) {
+    return Boolean(evidence?.webrtcExact || evidence?.exactProfile || evidence?.highConfidence);
+}
+
+function fingerprintProfileFromRow(row = {}) {
+    return {
+        profileHash: String(row.profile_hash || ""),
+        webrtcIpv4Hash: String(row.webrtc_ipv4_hash || ""),
+        webrtcIpv4Hash2: String(row.webrtc_ipv4_hash2 || ""),
+        webrtcIpv6Hash: String(row.webrtc_ipv6_hash || ""),
+        webrtcIpv6Hash2: String(row.webrtc_ipv6_hash2 || ""),
+        stableHash: String(row.stable_hash || ""),
+        canvasHash: String(row.canvas_hash || ""),
+        rendererHash: String(row.renderer_hash || ""),
+        limitsHash: String(row.limits_hash || ""),
+        osHash: String(row.os_hash || ""),
+        screenHash: String(row.screen_hash || ""),
+        dprDepthHash: String(row.dpr_depth_hash || ""),
+        hardwareHash: String(row.hardware_hash || ""),
+        touchHash: String(row.touch_hash || ""),
+        timezoneHash: String(row.timezone_hash || ""),
+        languageHash: String(row.language_hash || ""),
+        featureMask: Number(row.feature_mask || 0),
+    };
+}
+
+export async function buildFingerprintConfirmationToken(env, values = {}) {
+    if (!env.PANEL_SECRET || !values.targetProfile?.profileHash || !values.candidateProfile?.profileHash || !values.labelId) return "";
+    const payload = JSON.stringify([
+        "tg-dualbot-fp-confirm-v1",
+        Number(values.userId),
+        Number(values.targetSlot),
+        values.targetProfile.profileHash,
+        values.targetProfile.webrtcIpv4Hash || "",
+        values.targetProfile.webrtcIpv4Hash2 || "",
+        values.targetProfile.webrtcIpv6Hash || "",
+        values.targetProfile.webrtcIpv6Hash2 || "",
+        Number(values.candidateUserId),
+        Number(values.candidateSlot),
+        values.candidateProfile.profileHash,
+        values.candidateProfile.webrtcIpv4Hash || "",
+        values.candidateProfile.webrtcIpv4Hash2 || "",
+        values.candidateProfile.webrtcIpv6Hash || "",
+        values.candidateProfile.webrtcIpv6Hash2 || "",
+        Number(values.labelId),
+        Number(values.targetConfirmedLabelId || 0),
+        String(values.targetConfirmedAt || ""),
+    ]);
+    return (await hmacSha256Hex(env.PANEL_SECRET, payload)).slice(0, 12);
 }
 
 function normalizeIpv6Address(value) {
@@ -247,11 +476,40 @@ function normalizedWebRtcIdentityAddress(value = {}) {
     return { ip: "", ipVersion: "" };
 }
 
+function normalizedWebRtcAddressList(value = {}, version) {
+    const values = version === "IPv4"
+        ? [...(Array.isArray(value.webrtc_ipv4_candidates) ? value.webrtc_ipv4_candidates : []), value.webrtc_ipv4, value.last_webrtc_ipv4]
+        : [...(Array.isArray(value.webrtc_ipv6_candidates) ? value.webrtc_ipv6_candidates : []), value.webrtc_ipv6, value.last_webrtc_ipv6];
+    const addresses = [];
+    const seen = new Set();
+    for (const raw of values) {
+        const ip = cleanIp(raw, version);
+        if (!ip || !isPublicWebRtcIp(ip) || seen.has(ip)) continue;
+        seen.add(ip);
+        addresses.push(ip);
+    }
+    return addresses.sort().slice(0, 2);
+}
+
 async function buildWebRtcIdentity(value = {}) {
     const address = normalizedWebRtcIdentityAddress(value);
-    if (!address.ip) return { ...address, hash: "" };
-    const hash = await sha256Hex(JSON.stringify([WEBRTC_IDENTITY_VERSION, address.ipVersion, address.ip]));
-    return { ...address, hash: hash.slice(0, 32) };
+    const ipv4Addresses = normalizedWebRtcAddressList(value, "IPv4");
+    const ipv6Addresses = normalizedWebRtcAddressList(value, "IPv6");
+    const hashInputs = [
+        ["IPv4", ipv4Addresses[0]],
+        ["IPv4", ipv4Addresses[1]],
+        ["IPv6", ipv6Addresses[0]],
+        ["IPv6", ipv6Addresses[1]],
+    ];
+    const hashes = await Promise.all(hashInputs.map(([version, ip]) => (
+        ip ? sha256Hex(JSON.stringify([WEBRTC_IDENTITY_VERSION, version, ip])) : ""
+    )));
+    const ipv4Hash = hashes[0] ? hashes[0].slice(0, 32) : "";
+    const ipv4Hash2 = hashes[1] ? hashes[1].slice(0, 32) : "";
+    const ipv6Hash = hashes[2] ? hashes[2].slice(0, 32) : "";
+    const ipv6Hash2 = hashes[3] ? hashes[3].slice(0, 32) : "";
+    const hash = address.ipVersion === "IPv4" ? ipv4Hash : address.ipVersion === "IPv6" ? ipv6Hash : "";
+    return { ...address, hash, ipv4Hash, ipv4Hash2, ipv6Hash, ipv6Hash2 };
 }
 
 async function findWebRtcIdentityLabel(env, userId, network) {
@@ -414,8 +672,9 @@ async function sendWebRtcIdentityLabels(env, query, userId) {
     await sendCallbackContextMessage(env, query, lines.join("\n"), replyMarkup);
 }
 
-function clientDataForVerificationStorage(clientData = {}) {
+function clientDataForVerificationStorage(clientData = {}, network = {}) {
     const screenInfo = clientData?.screen && typeof clientData.screen === "object" ? clientData.screen : {};
+    const probe = clientData?.probe && typeof clientData.probe === "object" ? clientData.probe : {};
     return {
         language: String(clientData.language || "").slice(0, 32),
         platform: String(clientData.platform || "").slice(0, 80),
@@ -426,24 +685,304 @@ function clientDataForVerificationStorage(clientData = {}) {
             height: Number(screenInfo.height) || 0,
             pixel_ratio: Number(screenInfo.pixel_ratio) || 1,
         },
-        probe: clientData?.probe && typeof clientData.probe === "object" ? clientData.probe : null,
-        webrtc: clientData?.webrtc && typeof clientData.webrtc === "object" ? clientData.webrtc : null,
+        probe: {
+            http_ip_version: String(probe.http_ip_version || "").slice(0, 16),
+            country: String(probe.country || "").slice(0, 16),
+            colo: String(probe.colo || "").slice(0, 32),
+            asn: String(probe.asn || "").slice(0, 32),
+            as_organization: String(probe.as_organization || "").slice(0, 200),
+            error: String(probe.error || "").slice(0, 100),
+        },
+        webrtc: {
+            udp_status: String(network.udp_status || "").slice(0, 40),
+            webrtc_ipv4: String(network.webrtc_ipv4 || "").slice(0, 64),
+            webrtc_ipv6: String(network.webrtc_ipv6 || "").slice(0, 128),
+            webrtc_protocol: String(network.webrtc_protocol || "").slice(0, 20),
+            webrtc_candidate_type: String(network.webrtc_candidate_type || "").slice(0, 80),
+            candidates: Array.isArray(network.webrtc_candidates) ? network.webrtc_candidates.slice(0, 4) : [],
+        },
         error: String(clientData.error || "").slice(0, 300),
         parse_error: String(clientData.parse_error || "").slice(0, 300),
     };
 }
 
-async function findDeviceFingerprintMatch(env, userId, deviceFingerprint) {
-    if (!deviceFingerprint) return null;
-    return env.DB.prepare(`SELECT user_id, username, full_name, note
-FROM users
-WHERE last_device_fingerprint=?
-  AND last_device_fingerprint<>''
-  AND user_id<>?
-ORDER BY CASE WHEN TRIM(COALESCE(note,''))<>'' THEN 0 ELSE 1 END, updated_at DESC
-LIMIT 1`)
-        .bind(deviceFingerprint, userId)
+async function getIdentityLabelForUser(env, userId) {
+    return env.DB.prepare(
+        "SELECT l.*, CASE WHEN c.user_id IS NULL THEN 'source' ELSE 'confirmed' END AS relation_kind " +
+        "FROM webrtc_identity_labels l " +
+        "LEFT JOIN webrtc_identity_confirmations c ON c.label_id=l.id AND c.user_id=? " +
+        "WHERE c.user_id IS NOT NULL OR l.source_user_id=? " +
+        "ORDER BY CASE WHEN c.user_id IS NULL THEN 1 ELSE 0 END, l.updated_at DESC LIMIT 1",
+    ).bind(Number(userId), Number(userId)).first();
+}
+
+async function getIdentityConfirmationState(env, userId) {
+    const row = await env.DB.prepare("SELECT label_id, confirmed_at FROM webrtc_identity_confirmations WHERE user_id=?")
+        .bind(Number(userId))
         .first();
+    return {
+        labelId: Number(row?.label_id || 0),
+        confirmedAt: String(row?.confirmed_at || ""),
+    };
+}
+
+async function upsertFingerprintProfile(env, userId, profile) {
+    if (!profile?.profileHash) return 0;
+    const slots = Array.from({ length: MAX_FINGERPRINT_PROFILES_PER_USER }, (_, index) => `(${index + 1})`).join(",");
+    const ts = nowIso();
+    await env.DB.prepare(`WITH slots(slot) AS (VALUES${slots}),
+chosen AS (
+    SELECT s.slot
+    FROM slots s
+    LEFT JOIN device_fingerprint_profiles p ON p.user_id=? AND p.slot=s.slot
+    ORDER BY CASE
+        WHEN p.profile_hash=? THEN 0
+        WHEN p.user_id IS NULL THEN 1
+        ELSE 2
+    END, p.last_seen_at ASC, s.slot ASC
+    LIMIT 1
+)
+INSERT INTO device_fingerprint_profiles(
+    user_id, slot, profile_hash, webrtc_ipv4_hash, webrtc_ipv4_hash2, webrtc_ipv6_hash, webrtc_ipv6_hash2, stable_hash, canvas_hash, renderer_hash, limits_hash,
+    os_hash, screen_hash, dpr_depth_hash, hardware_hash, touch_hash, timezone_hash, language_hash,
+    feature_mask, seen_count, first_seen_at, last_seen_at
+)
+SELECT ?, slot, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ? FROM chosen WHERE 1
+ON CONFLICT(user_id, slot) DO UPDATE SET
+    first_seen_at=CASE WHEN device_fingerprint_profiles.profile_hash=excluded.profile_hash THEN device_fingerprint_profiles.first_seen_at ELSE excluded.first_seen_at END,
+    seen_count=CASE WHEN device_fingerprint_profiles.profile_hash=excluded.profile_hash THEN MIN(device_fingerprint_profiles.seen_count+1, 2147483647) ELSE 1 END,
+    profile_hash=excluded.profile_hash,
+    webrtc_ipv4_hash=excluded.webrtc_ipv4_hash,
+    webrtc_ipv4_hash2=excluded.webrtc_ipv4_hash2,
+    webrtc_ipv6_hash=excluded.webrtc_ipv6_hash,
+    webrtc_ipv6_hash2=excluded.webrtc_ipv6_hash2,
+    stable_hash=excluded.stable_hash,
+    canvas_hash=excluded.canvas_hash,
+    renderer_hash=excluded.renderer_hash,
+    limits_hash=excluded.limits_hash,
+    os_hash=excluded.os_hash,
+    screen_hash=excluded.screen_hash,
+    dpr_depth_hash=excluded.dpr_depth_hash,
+    hardware_hash=excluded.hardware_hash,
+    touch_hash=excluded.touch_hash,
+    timezone_hash=excluded.timezone_hash,
+    language_hash=excluded.language_hash,
+    feature_mask=excluded.feature_mask,
+    last_seen_at=excluded.last_seen_at`)
+        .bind(
+            Number(userId), profile.profileHash,
+            Number(userId), profile.profileHash, profile.webrtcIpv4Hash, profile.webrtcIpv4Hash2, profile.webrtcIpv6Hash, profile.webrtcIpv6Hash2, profile.stableHash, profile.canvasHash,
+            profile.rendererHash, profile.limitsHash, profile.osHash, profile.screenHash, profile.dprDepthHash,
+            profile.hardwareHash, profile.touchHash, profile.timezoneHash, profile.languageHash,
+            Number(profile.featureMask || 0), ts, ts,
+        )
+        .run();
+    const row = await env.DB.prepare("SELECT slot FROM device_fingerprint_profiles WHERE user_id=? AND profile_hash=? LIMIT 1")
+        .bind(Number(userId), profile.profileHash)
+        .first();
+    return Number(row?.slot || 0);
+}
+
+function fingerprintCandidateSql(column) {
+    return `SELECT p.*, u.username, u.full_name, u.note
+FROM device_fingerprint_profiles p
+JOIN users u ON u.user_id=p.user_id
+WHERE p.user_id<>? AND p.${column}=? AND p.${column}<>''
+ORDER BY p.last_seen_at DESC
+LIMIT ${FINGERPRINT_CANDIDATE_LIMIT}`;
+}
+
+function fingerprintWebRtcCandidateSql(column) {
+    return `SELECT p.*, u.username, u.full_name, u.note
+FROM device_fingerprint_profiles p
+JOIN users u ON u.user_id=p.user_id
+WHERE p.user_id<>? AND p.${column}=? AND p.${column}<>''
+ORDER BY p.last_seen_at DESC
+LIMIT ${FINGERPRINT_CANDIDATE_LIMIT}`;
+}
+
+async function findFingerprintSimilarityMatch(env, userId, profile, legacyFingerprint = "") {
+    if (!profile?.profileHash) return null;
+    const branches = [];
+    const addBranch = (column, value) => {
+        if (!value) return;
+        branches.push({
+            kind: column,
+            statement: env.DB.prepare(fingerprintCandidateSql(column)).bind(Number(userId), value),
+        });
+    };
+    addBranch("profile_hash", profile.profileHash);
+    const addWebRtcBranches = (version, firstHash, secondHash) => {
+        const prefix = version === "IPv4" ? "webrtc_ipv4" : "webrtc_ipv6";
+        const hashes = [...new Set([firstHash, secondHash].filter(Boolean))];
+        for (const hash of hashes) {
+            for (const column of [`${prefix}_hash`, `${prefix}_hash2`]) {
+                branches.push({
+                    kind: column,
+                    statement: env.DB.prepare(fingerprintWebRtcCandidateSql(column)).bind(Number(userId), hash),
+                });
+            }
+        }
+    };
+    addWebRtcBranches("IPv4", profile.webrtcIpv4Hash, profile.webrtcIpv4Hash2);
+    addWebRtcBranches("IPv6", profile.webrtcIpv6Hash, profile.webrtcIpv6Hash2);
+    addBranch("stable_hash", profile.stableHash);
+    addBranch("renderer_hash", profile.rendererHash);
+    addBranch("canvas_hash", profile.canvasHash);
+    if (legacyFingerprint) {
+        branches.push({
+            kind: "legacy",
+            statement: env.DB.prepare(`SELECT user_id, username, full_name, note, updated_at
+FROM users
+WHERE user_id<>? AND last_device_fingerprint=? AND last_device_fingerprint<>''
+ORDER BY updated_at DESC
+LIMIT ${FINGERPRINT_CANDIDATE_LIMIT}`).bind(Number(userId), legacyFingerprint),
+        });
+    }
+    if (!branches.length) return null;
+    const results = await env.DB.batch(branches.map((branch) => branch.statement));
+    const candidates = new Map();
+    const legacyRows = [];
+    for (let index = 0; index < results.length; index += 1) {
+        const rows = results[index]?.results || [];
+        if (branches[index].kind === "legacy") {
+            legacyRows.push(...rows);
+            continue;
+        }
+        for (const row of rows) {
+            const key = `${row.user_id}:${row.slot}`;
+            if (candidates.has(key)) continue;
+            const candidateProfile = fingerprintProfileFromRow(row);
+            const evidence = scoreFingerprintSimilarity(profile, candidateProfile);
+            if (!fingerprintMatchIsDisplayable(evidence)) continue;
+            candidates.set(key, {
+                userId: Number(row.user_id),
+                slot: Number(row.slot),
+                username: String(row.username || ""),
+                fullName: String(row.full_name || ""),
+                note: String(row.note || "").trim().slice(0, 200),
+                lastSeenAt: String(row.last_seen_at || ""),
+                profile: candidateProfile,
+                evidence,
+            });
+        }
+    }
+    const profileUsers = new Set([...candidates.values()].map((candidate) => candidate.userId));
+    for (const row of legacyRows) {
+        const candidateUserId = Number(row.user_id);
+        if (!candidateUserId || profileUsers.has(candidateUserId)) continue;
+        candidates.set(`legacy:${candidateUserId}`, {
+            userId: candidateUserId,
+            slot: 0,
+            username: String(row.username || ""),
+            fullName: String(row.full_name || ""),
+            note: String(row.note || "").trim().slice(0, 200),
+            lastSeenAt: String(row.updated_at || ""),
+            profile: null,
+            evidence: {
+                score: 100,
+                exactProfile: true,
+                webrtcExact: false,
+                highConfidence: false,
+                strongMatches: 0,
+                matchedFields: ["旧版完整指纹"],
+            },
+        });
+    }
+    const ranked = [...candidates.values()].sort((left, right) => {
+        const leftRank = left.evidence.webrtcExact ? 3 : left.evidence.highConfidence ? 2 : 1;
+        const rightRank = right.evidence.webrtcExact ? 3 : right.evidence.highConfidence ? 2 : 1;
+        if (leftRank !== rightRank) return rightRank - leftRank;
+        if (left.evidence.score !== right.evidence.score) return right.evidence.score - left.evidence.score;
+        return right.lastSeenAt.localeCompare(left.lastSeenAt);
+    });
+    const best = ranked[0];
+    if (!best) return null;
+    const label = await getIdentityLabelForUser(env, best.userId);
+    return {
+        ...best,
+        labelId: Number(label?.id || 0),
+        labelName: String(label?.label_name || best.note || "").slice(0, 80),
+        labelSourceUserId: Number(label?.source_user_id || 0),
+        canConfirm: Boolean(label?.id && best.slot && fingerprintMatchIsActionable(best.evidence)),
+    };
+}
+
+async function getFingerprintProfile(env, userId, slot) {
+    const row = await env.DB.prepare("SELECT * FROM device_fingerprint_profiles WHERE user_id=? AND slot=?")
+        .bind(Number(userId), Number(slot))
+        .first();
+    return row ? { row, profile: fingerprintProfileFromRow(row) } : null;
+}
+
+async function confirmFingerprintIdentity(env, userId, targetSlot, candidateUserId, candidateSlot, evidenceToken, adminId) {
+    if (Number(userId) === Number(candidateUserId)) return { error: "不能把用户与自己重复确认。" };
+    const [targetEntry, candidateEntry, user, label, confirmationState] = await Promise.all([
+        getFingerprintProfile(env, userId, targetSlot),
+        getFingerprintProfile(env, candidateUserId, candidateSlot),
+        getUser(env, Number(userId)),
+        getIdentityLabelForUser(env, candidateUserId),
+        getIdentityConfirmationState(env, userId),
+    ]);
+    if (!user) return { error: "找不到用户。" };
+    if (!targetEntry || !candidateEntry) return { error: "指纹档案已更新，请使用最新验证通知重新判断。" };
+    if (!label) return { error: "匹配用户尚未建立人工标签，请先设置备注并标记其 WebRTC。" };
+    const evidence = scoreFingerprintSimilarity(targetEntry.profile, candidateEntry.profile);
+    if (!fingerprintMatchIsActionable(evidence)) {
+        return { error: "当前证据已不足，不能使用旧通知确认。" };
+    }
+    const expectedToken = await buildFingerprintConfirmationToken(env, {
+        userId,
+        targetSlot,
+        targetProfile: targetEntry.profile,
+        candidateUserId,
+        candidateSlot,
+        candidateProfile: candidateEntry.profile,
+        labelId: label.id,
+        targetConfirmedLabelId: confirmationState.labelId,
+        targetConfirmedAt: confirmationState.confirmedAt,
+    });
+    if (!expectedToken || !/^[0-9a-f]{12}$/.test(String(evidenceToken || "")) || !constantTimeEqual(expectedToken, evidenceToken)) {
+        return { error: "确认凭证或证据已变化，请使用最新验证通知。" };
+    }
+    const ts = nowIso();
+    const result = await env.DB.prepare(`INSERT INTO webrtc_identity_confirmations(user_id, label_id, confirmed_by_user_id, confirmed_at)
+SELECT u.user_id, ?, ?, ? FROM users u
+WHERE u.user_id=?
+  AND EXISTS (SELECT 1 FROM device_fingerprint_profiles p WHERE p.user_id=? AND p.slot=? AND p.profile_hash=? AND p.webrtc_ipv4_hash=? AND p.webrtc_ipv4_hash2=? AND p.webrtc_ipv6_hash=? AND p.webrtc_ipv6_hash2=?)
+  AND EXISTS (SELECT 1 FROM device_fingerprint_profiles p WHERE p.user_id=? AND p.slot=? AND p.profile_hash=? AND p.webrtc_ipv4_hash=? AND p.webrtc_ipv4_hash2=? AND p.webrtc_ipv6_hash=? AND p.webrtc_ipv6_hash2=?)
+  AND (
+      (?=0 AND NOT EXISTS (SELECT 1 FROM webrtc_identity_confirmations current_confirmation WHERE current_confirmation.user_id=u.user_id))
+      OR
+      (?<>0 AND EXISTS (
+          SELECT 1 FROM webrtc_identity_confirmations current_confirmation
+          WHERE current_confirmation.user_id=u.user_id AND current_confirmation.label_id=? AND current_confirmation.confirmed_at=?
+      ))
+  )
+  AND EXISTS (
+      SELECT 1 FROM webrtc_identity_labels l
+      WHERE l.id=? AND (
+          l.source_user_id=? OR EXISTS (
+              SELECT 1 FROM webrtc_identity_confirmations c WHERE c.user_id=? AND c.label_id=l.id
+          )
+      )
+  )
+ON CONFLICT(user_id) DO UPDATE SET
+    label_id=excluded.label_id,
+    confirmed_by_user_id=excluded.confirmed_by_user_id,
+    confirmed_at=excluded.confirmed_at`)
+        .bind(
+            Number(label.id), Number(adminId), ts, Number(userId),
+            Number(userId), Number(targetSlot), targetEntry.profile.profileHash, targetEntry.profile.webrtcIpv4Hash, targetEntry.profile.webrtcIpv4Hash2, targetEntry.profile.webrtcIpv6Hash, targetEntry.profile.webrtcIpv6Hash2,
+            Number(candidateUserId), Number(candidateSlot), candidateEntry.profile.profileHash, candidateEntry.profile.webrtcIpv4Hash, candidateEntry.profile.webrtcIpv4Hash2, candidateEntry.profile.webrtcIpv6Hash, candidateEntry.profile.webrtcIpv6Hash2,
+            confirmationState.labelId, confirmationState.labelId, confirmationState.labelId, confirmationState.confirmedAt,
+            Number(label.id), Number(candidateUserId), Number(candidateUserId),
+        )
+        .run();
+    if (Number(result.meta?.changes || 0) < 1) {
+        return { error: "指纹档案或人工标签刚刚发生变化，请重新验证后再确认。" };
+    }
+    return { user, label, evidence };
 }
 
 function constantTimeEqual(a, b) {
@@ -536,7 +1075,7 @@ main{padding:24px;max-width:1360px}.top{display:flex;justify-content:space-betwe
 .btn.primary,button.primary{background:var(--blue);color:white}.btn.danger,button.danger{background:var(--red);color:white}.btn.ok{background:var(--green);color:white}
 input,textarea,select{width:100%;border:1px solid #cbd5e1;border-radius:8px;padding:10px 11px;font:inherit}textarea{min-height:120px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
 label{display:block;margin:10px 0 5px;font-weight:800}table{width:100%;border-collapse:collapse;background:white}th,td{border-bottom:1px solid #e2e8f0;text-align:left;padding:10px;vertical-align:top}th{font-size:12px;color:#475569;background:#f8fafc}
-.badge{display:inline-block;border-radius:999px;background:#e2e8f0;color:#0f172a;padding:3px 8px;font-size:12px;font-weight:900}.badge.red{background:#fee2e2;color:#991b1b}.badge.green{background:#dcfce7;color:#166534}
+.badge{display:inline-block;border-radius:999px;background:#e2e8f0;color:#0f172a;padding:3px 8px;font-size:12px;font-weight:900}.badge.red{background:#fee2e2;color:#991b1b}.badge.green{background:#dcfce7;color:#166534}.badge.warn{background:#fef3c7;color:#92400e}
 pre{white-space:pre-wrap;background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px;overflow:auto}.msg{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 12px;color:#1e3a8a;font-weight:700}
 @media(max-width:800px){.shell{grid-template-columns:1fr}.side{height:auto;position:relative}main{padding:16px}}
 </style></head><body><div class="shell"><aside class="side"><div class="brand">TG DualBot<small>Cloudflare 后台</small></div><nav>
@@ -685,6 +1224,7 @@ async function userTopicUnbind(request, env, userId) {
 async function userDelete(request, env, userId) {
     await ensureVerificationSchema(env);
     await env.DB.batch([
+        env.DB.prepare("DELETE FROM device_fingerprint_profiles WHERE user_id=?").bind(userId),
         env.DB.prepare("DELETE FROM webrtc_identity_confirmations WHERE label_id IN (SELECT id FROM webrtc_identity_labels WHERE source_user_id=?)").bind(userId),
         env.DB.prepare("DELETE FROM webrtc_identity_labels WHERE source_user_id=?").bind(userId),
         env.DB.prepare("DELETE FROM webrtc_identity_confirmations WHERE user_id=?").bind(userId),
@@ -792,10 +1332,160 @@ async function settingsSave(request, env) {
     return redirect("/settings", request);
 }
 
+const LOG_MESSAGE_TRANSLATIONS = {
+    "unhandled request error": {
+        title: "请求处理异常",
+        reason: "Worker 处理请求时出现了未捕获异常。",
+    },
+    "failed to create topic from web": {
+        title: "后台创建 Telegram 话题失败",
+        reason: "从用户管理页面创建或重建话题时失败。",
+    },
+    "turnstile verification failed": {
+        title: "Cloudflare Turnstile 验证失败",
+        reason: "用户提交的人机验证未通过 Cloudflare 校验。",
+    },
+    "BOT_TOKEN is missing": {
+        title: "缺少 Telegram Bot Token",
+        reason: "Worker 当前没有读取到 BOT_TOKEN。",
+    },
+    "failed to relay topic message": {
+        title: "话题消息转发给用户失败",
+        reason: "管理员在 Telegram 话题中发送的消息未能转发给对应用户。",
+    },
+    "partial relay failure": {
+        title: "部分消息转发失败",
+        reason: "Web 后台或 Telegram 话题通道中至少有一个失败，其他通道可能已经成功。",
+    },
+    "failed to send topic intro": {
+        title: "发送话题说明失败",
+        reason: "话题已经创建，但机器人未能发送用户说明消息。",
+    },
+    "failed to send current WebRTC identity label": {
+        title: "发送 WebRTC 标签信息失败",
+        reason: "机器人未能把当前 WebRTC 人工标签发送到 Telegram 话题。",
+    },
+    "failed to complete topic verification": {
+        title: "验证完成后的话题处理失败",
+        reason: "用户验证已经处理，但创建话题或发送验证信息时失败。",
+    },
+    "failed to relay user message": {
+        title: "用户消息转发失败",
+        reason: "用户消息已经进入系统，但未能转发到管理员通道。",
+    },
+    "failed to sync outbox to topic": {
+        title: "后台回复同步到话题失败",
+        reason: "消息已发送给用户，但同步显示到 Telegram 话题时失败。",
+    },
+    "failed to notify admin": {
+        title: "通知管理员失败",
+        reason: "机器人未能向某个管理员账号发送通知。",
+    },
+};
+
+function prettyLogData(value) {
+    const raw = typeof value === "string" ? value : JSON.stringify(value ?? "");
+    if (!raw) return "";
+    try {
+        return JSON.stringify(JSON.parse(raw), null, 2);
+    } catch (error) {
+        return raw;
+    }
+}
+
+export function localizeLogEntry(message, data = "") {
+    const rawMessage = String(message || "");
+    const rawData = typeof data === "string" ? data : JSON.stringify(data ?? "");
+    const base = LOG_MESSAGE_TRANSLATIONS[rawMessage] || {};
+    const combined = (rawMessage + "\n" + rawData).toLowerCase();
+    let reason = base.reason || "这条日志暂未匹配到专用翻译，请结合下方原始日志排查。";
+    let suggestion = "";
+
+    if (combined.includes("message thread not found")) {
+        reason = "Telegram 找不到保存的话题 ID；该话题可能已被删除、关闭后重建，或数据库仍绑定旧话题。";
+        suggestion = "在用户管理中点击“重建话题”，并停止使用旧话题。";
+    } else if (/message thread is closed|topic_closed/.test(combined)) {
+        reason = "目标 Telegram 话题已经关闭，当前无法继续发送消息。";
+        suggestion = "重新开启该话题，或者在用户管理中点击“重建话题”。";
+    } else if (/chat is not a forum|not a forum/.test(combined)) {
+        reason = "配置的目标群组没有开启 Topics/Forum，或者 TOPIC_GROUP_ID 指向了错误群组。";
+        suggestion = "确认目标是已开启话题功能的超级群，并重新核对 TOPIC_GROUP_ID。";
+    } else if (combined.includes("chat not found")) {
+        reason = "Telegram 找不到目标群组或聊天；当前 BOT_TOKEN 对应的机器人无法访问 TOPIC_GROUP_ID 指向的群。";
+        suggestion = "确认话题群 ID 属于当前超级群（通常以 -100 开头），并确认当前机器人已加入该群且拥有管理话题和发送消息权限；同群多个 Bot 时要分别核对各自配置。";
+    } else if (/bot is not a member|bot was kicked|user not found/.test(combined)) {
+        reason = "当前机器人不在目标群组中，或目标用户/聊天已不可访问。";
+        suggestion = "重新把当前 BOT_TOKEN 对应的机器人加入目标群，并检查是否被移除或封禁。";
+    } else if (/not enough rights|need administrator rights|not an administrator|have no rights/.test(combined)) {
+        reason = "机器人已经找到目标群组，但管理员权限不足。";
+        suggestion = "把机器人设为管理员，并允许管理话题、发送消息和查看话题。";
+    } else if (combined.includes("bot was blocked by the user")) {
+        reason = "目标用户已经屏蔽机器人，因此机器人无法向其发送消息。";
+        suggestion = "让用户重新打开机器人并点击 /start，解除屏蔽后再发送。";
+    } else if (combined.includes("can't initiate conversation")) {
+        reason = "用户尚未主动启动机器人，Telegram 不允许 Bot 主动发起私聊。";
+        suggestion = "让用户先打开机器人并发送 /start。";
+    } else if (/can't parse entities|message is too long|button_data_invalid/.test(combined)) {
+        reason = "发送给 Telegram 的消息格式、长度或按钮数据不符合限制。";
+        suggestion = "检查 HTML/Markdown 转义、消息长度以及 callback_data 是否超过 64 字节。";
+    } else if (combined.includes("immutable headers")) {
+        reason = "旧版本登录或退出流程尝试修改不可变的 HTTP 响应头。";
+        suggestion = "重新部署当前最新版；当前源码已改为使用可修改的 Response 构造重定向。";
+    } else if (combined.includes("bot_token is missing")) {
+        reason = "Cloudflare Worker 中没有配置 BOT_TOKEN Secret。";
+        suggestion = "在 Worker 的 Variables and Secrets 中添加正确的 BOT_TOKEN，然后重新部署。";
+    } else if (/invalid-input-secret|missing-input-secret/.test(combined)) {
+        reason = "Turnstile Secret Key 缺失或无效。";
+        suggestion = "检查 TURNSTILE_SECRET_KEY 是否使用当前 Turnstile 站点对应的密钥，而不是站点密钥。";
+    } else if (/invalid-input-response|missing-input-response|timeout-or-duplicate/.test(combined)) {
+        reason = "Turnstile 验证令牌无效、缺失、超时或已被重复使用。";
+        suggestion = "让用户刷新验证页重新完成验证；如果持续出现，再检查站点域名和 Turnstile 配置。";
+    } else if (combined.includes("no such column")) {
+        reason = "D1 表结构版本较旧，缺少当前代码需要的字段。";
+        suggestion = "执行尚未运行的数据库迁移，并确认 Worker 的 DB Binding 指向正确数据库。";
+    } else if (combined.includes("no such table")) {
+        reason = "D1 缺少代码需要的数据表，或数据库迁移尚未执行。";
+        suggestion = "对当前绑定的 D1 执行对应 migrations 升级文件，不要新建另一套数据库。";
+    } else if (/unique constraint failed|foreign key constraint failed|check constraint failed|not null constraint failed/.test(combined)) {
+        reason = "D1 写入的数据违反了唯一性、关联关系或字段取值约束。";
+        suggestion = "查看原始日志中的表名和字段名，确认是否重复写入、关联记录已删除或输入值不符合迁移定义。";
+    } else if (/database is locked|database busy/.test(combined)) {
+        reason = "D1 数据库暂时繁忙或发生写入竞争。";
+        suggestion = "稍后重试；如果频繁发生，需要检查是否存在高频重复写入。";
+    } else if (/d1_error|database or disk is full|maximum database size|quota exceeded/.test(combined)) {
+        reason = "D1 返回数据库错误或资源限制错误。";
+        suggestion = "查看原始 D1 错误内容，并检查数据库绑定、迁移状态、容量和账户配额。";
+    } else if (/too many requests|retry after|error_code["':\s]+429/.test(combined)) {
+        reason = "Telegram 或外部服务触发了请求频率限制。";
+        suggestion = "按照 retry_after 等待后再试，并减少短时间内的重复发送。";
+    } else if (/timeout|timed out/.test(combined)) {
+        reason = "请求在规定时间内没有完成，可能是 Telegram、Turnstile 或网络暂时超时。";
+        suggestion = "稍后重试，并查看相邻日志确认是哪个外部服务超时。";
+    }
+
+    return {
+        title: base.title || rawMessage || "未命名日志",
+        reason,
+        suggestion,
+        rawMessage,
+        rawData: prettyLogData(rawData),
+    };
+}
+
 async function logsPage(request, env) {
     const rows = await env.DB.prepare("SELECT * FROM event_logs ORDER BY id DESC LIMIT 200").all();
-    const bodyRows = (rows.results || []).map((r) => `<tr><td>#${r.id}<br><span class="badge">${h(r.level)}</span></td><td>${h(r.message)}${r.data ? `<pre>${h(r.data)}</pre>` : ""}</td><td>${h(r.created_at)}</td></tr>`).join("");
-    return html(layout("日志", `<div class="card"><h2>最近日志</h2><table><tr><th>ID</th><th>内容</th><th>时间</th></tr>${bodyRows}</table></div>`));
+    const bodyRows = (rows.results || []).map((r) => {
+        const translated = localizeLogEntry(r.message, r.data);
+        const level = String(r.level || "").toLowerCase();
+        const levelText = level === "error" ? "错误" : level === "warn" ? "警告" : level === "info" ? "信息" : (r.level || "日志");
+        const levelClass = level === "error" ? "red" : level === "warn" ? "warn" : "";
+        const original = [translated.rawMessage, translated.rawData].filter(Boolean).join("\n");
+        const suggestion = translated.suggestion
+            ? `<div class="msg" style="margin-top:10px"><b>处理建议：</b>${h(translated.suggestion)}</div>`
+            : "";
+        return `<tr><td>#${r.id}<br><span class="badge ${levelClass}">${h(levelText)}</span></td><td><b>${h(translated.title)}</b><div class="muted" style="margin-top:8px"><b>中文说明：</b>${h(translated.reason)}</div>${suggestion}<details style="margin-top:10px"><summary style="cursor:pointer;font-weight:700">查看原始日志</summary><pre>${h(original)}</pre></details></td><td>${h(r.created_at)}</td></tr>`;
+    }).join("");
+    return html(layout("日志", `<div class="card"><h2>最近日志</h2><p class="muted">系统会在页面中翻译常见错误并给出处理建议；原始日志完整保留在“查看原始日志”中。</p><table><tr><th>ID</th><th>中文说明 / 原始日志</th><th>时间</th></tr>${bodyRows}</table></div>`));
 }
 
 async function verifyPage(request, env, token = "", error = "") {
@@ -868,14 +1558,19 @@ function serializeClientData(data) {
             color_depth: Number(screenInfo.color_depth) || 0,
         },
         fingerprint: {
-            version: 1,
+            version: 2,
             hardware: {
                 cores: Number(hardware.cores) || 0,
                 memory_gb: Number(hardware.memory_gb) || 0,
                 touch_points: Number(hardware.touch_points) || 0,
             },
             canvas: { status: compactClientText(canvas.status, 20), hash: compactClientText(canvas.hash, 32) },
-            webgl: { status: compactClientText(webgl.status, 20), hash: compactClientText(webgl.hash, 32) },
+            webgl: {
+                status: compactClientText(webgl.status, 20),
+                hash: compactClientText(webgl.hash, 32),
+                renderer_hash: compactClientText(webgl.renderer_hash, 32),
+                limits_hash: compactClientText(webgl.limits_hash, 32),
+            },
         },
         probe: {
             http_ip: compactClientText(probe.http_ip, 128),
@@ -895,7 +1590,7 @@ function serializeClientData(data) {
             webrtc_protocol: compactClientText(webrtc.webrtc_protocol, 20),
             webrtc_candidate_type: compactClientText(webrtc.webrtc_candidate_type, 80),
             error: compactClientText(webrtc.error, 300),
-            candidates: Array.isArray(webrtc.candidates) ? webrtc.candidates.slice(0, 10).map((item) => ({
+            candidates: Array.isArray(webrtc.candidates) ? webrtc.candidates.slice(0, 4).map((item) => ({
                 ip: compactClientText(item && item.ip, 128),
                 version: compactClientText(item && item.version, 16),
                 protocol: compactClientText(item && item.protocol, 20),
@@ -934,7 +1629,7 @@ async function collectClientData() {
             color_depth: screen.colorDepth || 0,
         },
         fingerprint: {
-            version: 1,
+            version: 2,
             hardware: {
                 cores: navigator.hardwareConcurrency || 0,
                 memory_gb: navigator.deviceMemory || 0,
@@ -950,7 +1645,7 @@ async function collectClientData() {
         withClientTimeout(httpProbe(), 4000, { error: "timeout" }),
         withClientTimeout(collectWebRtcCandidates(), 4500, { udp_status: "failed", error: "timeout", candidates: [] }),
         withClientTimeout(collectCanvasSignal(), 1500, { status: "failed", hash: "" }),
-        withClientTimeout(collectWebGlSignal(), 1500, { status: "failed", hash: "" }),
+        withClientTimeout(collectWebGlSignal(), 1500, { status: "failed", hash: "", renderer_hash: "", limits_hash: "" }),
     ];
     const results = await Promise.allSettled(tasks);
     data.probe = results[0].status === "fulfilled" ? results[0].value : { error: String(results[0].reason || "failed").slice(0, 300) };
@@ -997,27 +1692,36 @@ async function collectWebGlSignal() {
     try {
         const canvas = document.createElement("canvas");
         const gl = canvas.getContext("webgl2") || canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
-        if (!gl) return { status: "unsupported", hash: "" };
+        if (!gl) return { status: "unsupported", hash: "", renderer_hash: "", limits_hash: "" };
         const debugInfo = gl.getExtension("WEBGL_debug_renderer_info");
-        const values = [
-            normalizedGlValue(gl.getParameter(gl.VENDOR)),
-            normalizedGlValue(gl.getParameter(gl.RENDERER)),
-            normalizedGlValue(gl.getParameter(gl.VERSION)),
-            normalizedGlValue(gl.getParameter(gl.SHADING_LANGUAGE_VERSION)),
-            normalizedGlValue(gl.getParameter(gl.MAX_TEXTURE_SIZE)),
-            normalizedGlValue(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE)),
-            normalizedGlValue(gl.getParameter(gl.MAX_VERTEX_ATTRIBS)),
-            normalizedGlValue(gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS)),
-            normalizedGlValue(gl.getParameter(gl.ALIASED_LINE_WIDTH_RANGE)),
-            debugInfo ? normalizedGlValue(gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL)) : "",
-            debugInfo ? normalizedGlValue(gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)) : "",
+        const vendor = normalizedGlValue(gl.getParameter(gl.VENDOR));
+        const renderer = normalizedGlValue(gl.getParameter(gl.RENDERER));
+        const version = normalizedGlValue(gl.getParameter(gl.VERSION));
+        const shadingVersion = normalizedGlValue(gl.getParameter(gl.SHADING_LANGUAGE_VERSION));
+        const maxTextureSize = normalizedGlValue(gl.getParameter(gl.MAX_TEXTURE_SIZE));
+        const maxRenderbufferSize = normalizedGlValue(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE));
+        const maxVertexAttribs = normalizedGlValue(gl.getParameter(gl.MAX_VERTEX_ATTRIBS));
+        const maxCombinedTextures = normalizedGlValue(gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS));
+        const lineWidthRange = normalizedGlValue(gl.getParameter(gl.ALIASED_LINE_WIDTH_RANGE));
+        const unmaskedVendor = debugInfo ? normalizedGlValue(gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL)) : "";
+        const unmaskedRenderer = debugInfo ? normalizedGlValue(gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)) : "";
+        const legacyValues = [
+            vendor, renderer, version, shadingVersion, maxTextureSize, maxRenderbufferSize,
+            maxVertexAttribs, maxCombinedTextures, lineWidthRange, unmaskedVendor, unmaskedRenderer,
         ];
-        const hash = await browserShortSha256(JSON.stringify(values));
+        const rendererValues = [vendor, renderer, unmaskedVendor, unmaskedRenderer];
+        const limitValues = [maxTextureSize, maxRenderbufferSize, maxVertexAttribs, maxCombinedTextures, lineWidthRange];
+        const hashes = await Promise.all([
+            browserShortSha256(JSON.stringify(legacyValues)),
+            browserShortSha256(JSON.stringify(rendererValues)),
+            browserShortSha256(JSON.stringify(limitValues)),
+        ]);
+        const hash = hashes[0];
         const loseContext = gl.getExtension("WEBGL_lose_context");
         if (loseContext) loseContext.loseContext();
-        return { status: hash ? "ok" : "unsupported", hash };
+        return { status: hash ? "ok" : "unsupported", hash, renderer_hash: hashes[1], limits_hash: hashes[2] };
     } catch (error) {
-        return { status: "failed", hash: "" };
+        return { status: "failed", hash: "", renderer_hash: "", limits_hash: "" };
     }
 }
 async function httpProbe() {
@@ -1030,53 +1734,104 @@ function collectWebRtcCandidates() {
             resolve({ udp_status: "unsupported", candidates: [] });
             return;
         }
-        const candidates = [];
-        const pc = new RTCPeerConnection({ iceServers: [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }] });
-        const finish = () => {
+        const candidates = new Map();
+        let settled = false;
+        let timer = 0;
+        let iceError = "";
+        let pc;
+        try {
+            pc = new RTCPeerConnection({
+                iceServers: [
+                    { urls: "stun:stun.cloudflare.com:3478" },
+                    { urls: "stun:stun.l.google.com:19302" },
+                ],
+            });
+        } catch (error) {
+            resolve({ udp_status: "failed", error: String(error && error.message || error).slice(0, 200), candidates: [] });
+            return;
+        }
+        const finish = (forcedStatus, errorText) => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearTimeout(timer);
             try { pc.close(); } catch (error) {}
-            const parsed = candidates.map(parseCandidate).filter(Boolean);
-            const udp = parsed.filter((x) => x.protocol === "udp");
-            const ipv4 = firstPublicIp(udp, "IPv4");
-            const ipv6 = firstPublicIp(udp, "IPv6");
+            const parsed = Array.from(candidates.values());
+            const udp = parsed.filter((item) => item.protocol === "udp" && item.type === "srflx" && !isPrivateIp(item.ip));
+            const ipv4Candidates = udp.filter((item) => item.version === "IPv4").sort((left, right) => left.ip.localeCompare(right.ip)).slice(0, 2);
+            const ipv6Candidates = udp.filter((item) => item.version === "IPv6").sort((left, right) => left.ip.localeCompare(right.ip)).slice(0, 2);
+            const selected = [...ipv4Candidates, ...ipv6Candidates];
+            const ipv4 = ipv4Candidates[0]?.ip || "";
+            const ipv6 = ipv6Candidates[0]?.ip || "";
+            const status = selected.length ? "success" : (forcedStatus || "empty");
             resolve({
-                udp_status: udp.length ? "success" : "empty",
+                udp_status: status,
                 webrtc_ipv4: ipv4,
                 webrtc_ipv6: ipv6,
-                webrtc_protocol: udp.length ? "udp" : "",
-                webrtc_candidate_type: udp.map((x) => x.type).filter(Boolean).join(",").slice(0, 80),
-                candidates: parsed.slice(0, 20),
+                webrtc_protocol: selected.length ? "udp" : "",
+                webrtc_candidate_type: selected.length ? "srflx" : "",
+                error: status === "success" || status === "empty" ? "" : String(errorText || iceError || status).slice(0, 200),
+                candidates: selected,
             });
         };
         pc.onicecandidate = (event) => {
-            if (event.candidate && event.candidate.candidate) candidates.push(event.candidate.candidate);
-            if (!event.candidate) finish();
+            if (event.candidate) {
+                const parsed = parseCandidate(event.candidate);
+                if (parsed && parsed.protocol === "udp" && parsed.type === "srflx" && !isPrivateIp(parsed.ip)) {
+                    const key = [parsed.ip, parsed.protocol, parsed.type].join("|");
+                    const familyCount = Array.from(candidates.values()).filter((item) => item.version === parsed.version).length;
+                    if (!candidates.has(key) && familyCount < 2) candidates.set(key, parsed);
+                }
+                return;
+            }
+            finish("", "");
+        };
+        pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === "complete") finish("", "");
+        };
+        pc.onicecandidateerror = (event) => {
+            iceError = "ice-error-" + String(event && event.errorCode || "unknown");
         };
         try {
             pc.createDataChannel("probe");
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
-            setTimeout(finish, 3500);
+            if (!settled) timer = setTimeout(() => finish("timeout", "timeout"), 3500);
         } catch (error) {
-            try { pc.close(); } catch (closeError) {}
-            resolve({ udp_status: "failed", error: String(error && error.message || error), candidates: [] });
+            finish("failed", String(error && error.message || error));
         }
     });
 }
 function parseCandidate(candidate) {
-    const parts = String(candidate || "").split(/\\s+/);
+    const raw = typeof candidate === "string" ? candidate : String(candidate && candidate.candidate || "");
+    const parts = raw.split(/\\s+/);
     const typIndex = parts.indexOf("typ");
-    const ip = parts[4] || "";
-    const protocol = String(parts[2] || "").toLowerCase();
-    const type = typIndex >= 0 ? parts[typIndex + 1] || "" : "";
+    const ip = String(candidate && candidate.address || parts[4] || "").replace(/^\\[|\\]$/g, "");
+    const protocol = String(candidate && candidate.protocol || parts[2] || "").toLowerCase();
+    const type = String(candidate && candidate.type || (typIndex >= 0 ? parts[typIndex + 1] || "" : "")).toLowerCase();
     if (!ip || ip.endsWith(".local")) return null;
     return { ip, version: ip.includes(":") ? "IPv6" : "IPv4", protocol, type };
 }
-function firstPublicIp(items, version) {
-    const item = items.find((x) => x.version === version && x.type !== "host" && !isPrivateIp(x.ip));
-    return item ? item.ip : "";
-}
 function isPrivateIp(ip) {
-    return /^(10\\.|127\\.|172\\.(1[6-9]|2\\d|3[0-1])\\.|192\\.168\\.|169\\.254\\.)/.test(ip) || /^f[cd][0-9a-f]{2}:/i.test(ip) || /^fe80:/i.test(ip) || ip === "::1";
+    const value = String(ip || "").toLowerCase();
+    if (value.includes(":")) {
+        if (/^f[cd]/.test(value) || /^fe[89ab]/.test(value) || /^ff/.test(value) || value === "::" || value === "::1" || /^2001:db8:/i.test(value)) return true;
+        const groups = value.split(":");
+        const firstGroup = Number.parseInt(groups[0] || "0", 16);
+        const secondGroup = Number.parseInt(groups[1] || "0", 16);
+        return !Number.isFinite(firstGroup) || firstGroup < 0x2000 || firstGroup > 0x3fff
+            || firstGroup === 0x3ffe || (firstGroup === 0x3fff && secondGroup <= 0x0fff);
+    }
+    const parts = value.split(".").map(Number);
+    if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
+    return parts[0] === 0 || parts[0] === 10 || parts[0] === 127 || parts[0] >= 224
+        || (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127)
+        || (parts[0] === 169 && parts[1] === 254)
+        || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
+        || (parts[0] === 192 && parts[1] === 168)
+        || (parts[0] === 192 && parts[1] === 0 && (parts[2] === 0 || parts[2] === 2))
+        || (parts[0] === 192 && parts[1] === 88 && parts[2] === 99)
+        || (parts[0] === 198 && (parts[1] === 18 || parts[1] === 19 || (parts[1] === 51 && parts[2] === 100)))
+        || (parts[0] === 203 && parts[1] === 0 && parts[2] === 113);
 }
 </script></body></html>`;
 }
@@ -1124,11 +1879,11 @@ async function verifySubmit(request, env, token = "") {
     const userAgent = request.headers.get("User-Agent") || "";
     const network = extractClientNetwork(clientData, ip);
     const deviceOs = detectDeviceOs(userAgent, clientData);
-    const rawClientData = JSON.stringify(clientDataForVerificationStorage(clientData)).slice(0, 6000);
+    const rawClientData = JSON.stringify(clientDataForVerificationStorage(clientData, network)).slice(0, 6000);
     const userId = Number(session.user_id);
     const deviceFingerprint = await buildDeviceFingerprint(clientData);
-    const fingerprintMatch = await findDeviceFingerprintMatch(env, userId, deviceFingerprint);
-    const webrtcIdentityMatch = await findWebRtcIdentityLabel(env, userId, network);
+    const webrtcIdentity = await buildWebRtcIdentity(network);
+    const fingerprintProfile = await buildFingerprintProfile(clientData, deviceOs, webrtcIdentity);
     await env.DB.prepare("UPDATE verification_sessions SET status='verified', verified_at=? WHERE token=?")
         .bind(ts, token)
         .run();
@@ -1139,6 +1894,27 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     await env.DB.prepare(`UPDATE users SET verified=1, verification_status='verified', verification_token=?, language_code=COALESCE(NULLIF(language_code,''), ?), last_verified_ip=?, last_verified_at=?, last_cf_country=?, last_http_ip=?, last_http_ip_version=?, last_http_ipv4=?, last_http_ipv6=?, last_webrtc_ipv4=?, last_webrtc_ipv6=?, last_udp_status=?, last_asn=?, last_as_organization=?, last_device_os=?, last_user_agent=?, last_device_fingerprint=COALESCE(NULLIF(?,''), last_device_fingerprint), updated_at=? WHERE user_id=?`)
         .bind(token, session.language_code || "", ip || "", ts, cfInfo.country, ip || "", ipVersion(ip), network.http_ipv4, network.http_ipv6, network.webrtc_ipv4, network.webrtc_ipv6, network.udp_status, cfInfo.asn, cfInfo.asOrganization, deviceOs, userAgent.slice(0, 500), deviceFingerprint, ts, userId)
         .run();
+    const fingerprintProfileSlot = await upsertFingerprintProfile(env, userId, fingerprintProfile);
+    const [fingerprintMatch, webrtcIdentityMatch] = await Promise.all([
+        findFingerprintSimilarityMatch(env, userId, fingerprintProfile, deviceFingerprint),
+        findWebRtcIdentityLabel(env, userId, network),
+    ]);
+    const fingerprintConfirmationState = fingerprintMatch?.canConfirm && fingerprintProfileSlot
+        ? await getIdentityConfirmationState(env, userId)
+        : { labelId: 0, confirmedAt: "" };
+    const fingerprintConfirmationToken = fingerprintMatch?.canConfirm && fingerprintProfileSlot
+        ? await buildFingerprintConfirmationToken(env, {
+            userId,
+            targetSlot: fingerprintProfileSlot,
+            targetProfile: fingerprintProfile,
+            candidateUserId: fingerprintMatch.userId,
+            candidateSlot: fingerprintMatch.slot,
+            candidateProfile: fingerprintMatch.profile,
+            labelId: fingerprintMatch.labelId,
+            targetConfirmedLabelId: fingerprintConfirmationState.labelId,
+            targetConfirmedAt: fingerprintConfirmationState.confirmedAt,
+        })
+        : "";
     const verificationInfo = {
         username: session.username || "",
         fullName: session.full_name || String(userId),
@@ -1157,11 +1933,20 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         colo: cfInfo.colo,
         deviceOs,
         deviceFingerprint,
-        fingerprintMatchedUserId: Number(fingerprintMatch?.user_id || 0),
+        fingerprintMatchedUserId: Number(fingerprintMatch?.userId || 0),
         fingerprintMatchedUsername: String(fingerprintMatch?.username || ""),
-        fingerprintLabel: String(fingerprintMatch?.note || "").trim().slice(0, 200),
-        fingerprintSimilarity: fingerprintMatch ? 100 : 0,
-        webrtcIdentityHash: String(webrtcIdentityMatch.hash || ""),
+        fingerprintLabel: String(fingerprintMatch?.labelName || fingerprintMatch?.note || "").trim().slice(0, 200),
+        fingerprintSimilarity: Number(fingerprintMatch?.evidence?.score || 0),
+        fingerprintMatchedFields: Array.isArray(fingerprintMatch?.evidence?.matchedFields) ? fingerprintMatch.evidence.matchedFields.slice(0, 10) : [],
+        fingerprintWebRtcExact: Boolean(fingerprintMatch?.evidence?.webrtcExact),
+        fingerprintExactProfile: Boolean(fingerprintMatch?.evidence?.exactProfile),
+        fingerprintHighConfidence: Boolean(fingerprintMatch?.evidence?.highConfidence),
+        fingerprintProfileSlot,
+        fingerprintMatchedProfileSlot: Number(fingerprintMatch?.slot || 0),
+        fingerprintMatchedLabelId: Number(fingerprintMatch?.labelId || 0),
+        fingerprintConfirmationToken,
+        fingerprintCanConfirm: Boolean(fingerprintConfirmationToken),
+        webrtcIdentityHash: String(webrtcIdentity.hash || ""),
         webrtcIdentityIpVersion: String(webrtcIdentityMatch.ipVersion || ""),
         webrtcIdentityLabelId: Number(webrtcIdentityMatch.label?.id || 0),
         webrtcIdentityLabelName: String(webrtcIdentityMatch.label?.label_name || "").slice(0, 80),
@@ -1211,7 +1996,7 @@ async function telegramWebhook(request, env) {
     return json({ ok: true });
 }
 
-async function handleTelegramUpdate(env, update) {
+export async function handleTelegramUpdate(env, update) {
     if (update.callback_query) {
         await handleCallbackQuery(env, update.callback_query);
         return;
@@ -1302,7 +2087,9 @@ async function handleTopicGroupMessage(env, message, command) {
     if (!(await isAdminChat(env, message.from?.id))) return;
     const groupId = await topicGroupId(env);
     const user = await getUserByTopicThreadId(env, groupId, Number(message.message_thread_id));
-    if (!user || user.blocked) return;
+    // 同一个超级群可以放置多个 Bot；不属于当前 D1 的话题必须静默忽略。
+    if (!user) return;
+    if (user.blocked) return;
     try {
         const sent = await tgCall(env, "copyMessage", {
             chat_id: Number(user.user_id),
@@ -1329,21 +2116,17 @@ async function handleTopicGroupMessage(env, message, command) {
 async function handleTopicAdminCommand(env, message) {
     const groupId = await topicGroupId(env);
     if (!groupId || Number(message.chat?.id) !== groupId || !message.message_thread_id) return;
+    const user = await getUserWithIdentityByTopicThreadId(env, groupId, Number(message.message_thread_id));
+    if (!user) {
+        // 共享群组中可能是其他 Bot 拥有的话题，不回应可避免跨 Bot 干扰。
+        return;
+    }
     if (!(await isAdminChat(env, message.from?.id))) {
         await tgCall(env, "sendMessage", {
             chat_id: groupId,
             message_thread_id: Number(message.message_thread_id),
             text: "无权限。",
         }).catch(() => {});
-        return;
-    }
-    const user = await getUserWithIdentityByTopicThreadId(env, groupId, Number(message.message_thread_id));
-    if (!user) {
-        await tgCall(env, "sendMessage", {
-            chat_id: groupId,
-            message_thread_id: Number(message.message_thread_id),
-            text: "当前话题没有绑定用户。",
-        });
         return;
     }
     await tgCall(env, "sendMessage", {
@@ -1614,6 +2397,26 @@ async function sendCurrentWebRtcIdentityToTopic(env, user, topic) {
     await tgCall(env, "sendMessage", payload);
 }
 
+function fingerprintConfirmCallbackData(userId, info) {
+    if (!info.fingerprintCanConfirm || !/^[0-9a-f]{12}$/.test(String(info.fingerprintConfirmationToken || "")) || !info.fingerprintProfileSlot || !info.fingerprintMatchedProfileSlot || !info.fingerprintMatchedUserId) return "";
+    const data = [
+        "fpconfirm",
+        Number(userId),
+        Number(info.fingerprintProfileSlot),
+        Number(info.fingerprintMatchedUserId),
+        Number(info.fingerprintMatchedProfileSlot),
+        info.fingerprintConfirmationToken,
+    ].join(":");
+    return data.length <= 64 ? data : "";
+}
+
+function fingerprintMatchTitle(info) {
+    if (info.fingerprintWebRtcExact) return "WebRTC 公网地址完全一致（待人工确认）";
+    if (info.fingerprintExactProfile && !info.fingerprintHighConfidence) return "设备指纹完全一致（采集字段不足，仅供参考）";
+    if (info.fingerprintExactProfile) return "设备指纹完全一致（待人工确认）";
+    return "跨浏览器/设备指纹相似候选（待人工确认）";
+}
+
 function topicVerificationText(info) {
     const lines = [
         "本次验证信息",
@@ -1630,7 +2433,16 @@ function topicVerificationText(info) {
         `设备指纹：${info.deviceFingerprint ? info.deviceFingerprint.slice(0, 32) : "-"}`,
     ];
     if (info.fingerprintMatchedUserId) {
-        lines.push("", "相似标签命中", `标签：${info.fingerprintLabel || "未设置"}`, "相似度：100%", `匹配用户 ID：${info.fingerprintMatchedUserId}`, `匹配用户名：${info.fingerprintMatchedUsername ? `@${info.fingerprintMatchedUsername}` : "无"}`);
+        lines.push(
+            "",
+            fingerprintMatchTitle(info),
+            `标签：${info.fingerprintLabel || "未设置"}`,
+            `指纹相似度：${Number(info.fingerprintSimilarity || 0)}%`,
+            `匹配字段：${Array.isArray(info.fingerprintMatchedFields) && info.fingerprintMatchedFields.length ? info.fingerprintMatchedFields.join("、") : "无"}`,
+            `匹配用户 ID：${info.fingerprintMatchedUserId}`,
+            `匹配用户名：${info.fingerprintMatchedUsername ? `@${info.fingerprintMatchedUsername}` : "无"}`,
+            "说明：浏览器采集线索仅供管理员人工判断。",
+        );
     }
     if (info.webrtcIdentityLabelId) {
         lines.push(
@@ -1656,12 +2468,29 @@ async function completeTopicVerification(env, userId, info) {
             text: topicVerificationText(info),
             disable_web_page_preview: true,
         };
+        const confirmationRows = [];
         if (info.webrtcIdentityLabelId && !info.webrtcIdentityConfirmed) {
+            confirmationRows.push([{
+                text: "确认同一人（WebRTC）",
+                callback_data: "rtcconfirm:" + userId + ":" + info.webrtcIdentityLabelId,
+            }]);
+        }
+        const fingerprintCallback = !info.webrtcIdentityLabelId ? fingerprintConfirmCallbackData(userId, info) : "";
+        if (fingerprintCallback) {
+            confirmationRows.push([{
+                text: "确认同一人（指纹候选）",
+                callback_data: fingerprintCallback,
+            }]);
+        }
+        if (info.fingerprintMatchedUserId) {
+            confirmationRows.push([{
+                text: "查看匹配账号",
+                callback_data: "who:" + info.fingerprintMatchedUserId,
+            }]);
+        }
+        if (confirmationRows.length) {
             payload.reply_markup = {
-                inline_keyboard: [[{
-                    text: "确认同一人",
-                    callback_data: "rtcconfirm:" + userId + ":" + info.webrtcIdentityLabelId,
-                }]],
+                inline_keyboard: confirmationRows,
             };
         }
         await tgCall(env, "sendMessage", payload);
@@ -2211,7 +3040,34 @@ async function handleCallbackQuery(env, query) {
         await answerCallbackQuery(env, query.id, "无权限");
         return;
     }
-    const [action, rawUserId, rawLabelId] = data.split(":");
+    const parts = data.split(":");
+    const [action, rawUserId, rawLabelId] = parts;
+    if (action === "fpconfirm") {
+        const userId = Number(rawUserId);
+        const targetSlot = Number(rawLabelId);
+        const candidateUserId = Number(parts[3]);
+        const candidateSlot = Number(parts[4]);
+        const evidenceToken = String(parts[5] || "");
+        if (![userId, targetSlot, candidateUserId, candidateSlot].every(Number.isFinite)) {
+            await answerCallbackQuery(env, query.id, "参数错误");
+            return;
+        }
+        const result = await confirmFingerprintIdentity(env, userId, targetSlot, candidateUserId, candidateSlot, evidenceToken, adminId);
+        if (result.error) {
+            await answerCallbackQuery(env, query.id, result.error.slice(0, 180));
+            return;
+        }
+        const basis = result.evidence.webrtcExact
+            ? "WebRTC 公网地址完全一致"
+            : `设备指纹相似度 ${result.evidence.score}%`;
+        await answerCallbackQuery(env, query.id, "已人工确认同一人");
+        await sendCallbackContextMessage(
+            env,
+            query,
+            "已人工确认\n用户 ID：" + userId + "\n标签：" + result.label.label_name + "\n重新计算依据：" + basis + "。",
+        );
+        return;
+    }
     if (action === "rtcmark") {
         const userId = Number(rawUserId);
         const user = Number.isFinite(userId) ? await getUser(env, userId) : null;
@@ -2304,14 +3160,27 @@ async function answerCallbackQuery(env, callbackQueryId, textValue) {
 async function notifyVerificationSuccess(env, userId, token, info) {
     const username = info.username ? `@${h(info.username)}` : "无";
     const fingerprintText = info.deviceFingerprint ? h(info.deviceFingerprint.slice(0, 32)) : "-";
-    const matchText = info.fingerprintMatchedUserId ? `\n\n相似标签命中\n标签：${h(info.fingerprintLabel || "未设置")}\n相似度：100%\n匹配用户 ID：<code>${info.fingerprintMatchedUserId}</code>\n匹配用户名：${info.fingerprintMatchedUsername ? `@${h(info.fingerprintMatchedUsername)}` : "无"}` : "";
+    const matchedFields = Array.isArray(info.fingerprintMatchedFields) && info.fingerprintMatchedFields.length
+        ? info.fingerprintMatchedFields.map((field) => h(field)).join("、")
+        : "无";
+    const matchText = info.fingerprintMatchedUserId
+        ? `\n\n${h(fingerprintMatchTitle(info))}\n标签：${h(info.fingerprintLabel || "未设置")}\n指纹相似度：${Number(info.fingerprintSimilarity || 0)}%\n匹配字段：${matchedFields}\n匹配用户 ID：<code>${info.fingerprintMatchedUserId}</code>\n匹配用户名：${info.fingerprintMatchedUsername ? `@${h(info.fingerprintMatchedUsername)}` : "无"}\n说明：浏览器采集线索仅供管理员人工判断。`
+        : "";
     const identityText = info.webrtcIdentityLabelId
         ? `\n\n${info.webrtcIdentityConfirmed ? "WebRTC 标签（管理员已确认）" : "WebRTC 标签命中（待人工确认）"}\n标签：${h(info.webrtcIdentityLabelName || "未设置")}\n来源用户 ID：<code>${info.webrtcIdentitySourceUserId || "-"}</code>\n匹配依据：WebRTC ${h(info.webrtcIdentityIpVersion || "-")} 完全相同`
         : "";
     const textValue = `新用户验证通过\n用户 ID：<code>${userId}</code>\n昵称：${h(info.fullName || "-")}\n用户名：${username}\n语言：${h(info.languageCode || "-")}\n\n本次验证信息\n设备系统：${h(info.deviceOs || "-")}\n设备指纹：<code>${fingerprintText}</code>\nHTTP IP：<code>${h(info.httpIp || "-")}</code>\nHTTP IP 类型：${h(info.httpIpVersion || "-")}\n公网 IPv4：<code>${h(info.httpIpv4 || "-")}</code>\n公网 IPv6：<code>${h(info.httpIpv6 || "-")}</code>\n公网 ASN：${h(info.asn || "-")}\n运营商：${h(info.asOrganization || "-")}\n国家/地区：${h(info.country || "-")}\nCloudflare 机房：${h(info.colo || "-")}\n\nUDP / WebRTC 信息\nWebRTC IPv4：<code>${h(info.webrtcIpv4 || "-")}</code>\nWebRTC IPv6：<code>${h(info.webrtcIpv6 || "-")}</code>\nUDP 状态：${h(info.udpStatus || "-")}\nCandidate 类型：${h(info.candidateType || "-")}${matchText}${identityText}`;
     const keyboard = [];
     if (info.webrtcIdentityLabelId && !info.webrtcIdentityConfirmed) {
-        keyboard.push([{ text: "确认同一人", callback_data: "rtcconfirm:" + userId + ":" + info.webrtcIdentityLabelId }]);
+        keyboard.push([{ text: "确认同一人（WebRTC）", callback_data: "rtcconfirm:" + userId + ":" + info.webrtcIdentityLabelId }]);
+    } else if (!info.webrtcIdentityLabelId) {
+        const fingerprintCallback = fingerprintConfirmCallbackData(userId, info);
+        if (fingerprintCallback) {
+            keyboard.push([{ text: "确认同一人（指纹候选）", callback_data: fingerprintCallback }]);
+        }
+    }
+    if (info.fingerprintMatchedUserId) {
+        keyboard.push([{ text: "查看匹配账号", callback_data: "who:" + info.fingerprintMatchedUserId }]);
     }
     const rtcActions = [{ text: "WebRTC 标签", callback_data: "rtclabels:" + userId }];
     if (info.webrtcIdentityHash) {
@@ -2342,47 +3211,101 @@ function parseClientData(value) {
     }
 }
 
-function extractClientNetwork(clientData, httpIp) {
-    const probe = clientData?.probe && typeof clientData.probe === "object" ? clientData.probe : {};
+export function extractClientNetwork(clientData, httpIp) {
     const webrtc = clientData?.webrtc && typeof clientData.webrtc === "object" ? clientData.webrtc : {};
-    const httpIps = [httpIp, probe.http_ip, probe.http_ipv4, probe.http_ipv6].filter(Boolean).map(String);
-    const httpIpv4 = firstIpByVersion(httpIps, "IPv4");
-    const httpIpv6 = firstIpByVersion(httpIps, "IPv6");
-    const webrtcIpv4 = cleanIp(webrtc.webrtc_ipv4, "IPv4");
-    const webrtcIpv6 = cleanIp(webrtc.webrtc_ipv6, "IPv6");
-    const udpStatus = String(webrtc.udp_status || (webrtcIpv4 || webrtcIpv6 ? "success" : "empty")).slice(0, 40);
+    const trustedHttpIp = cleanIp(httpIp);
+    const httpIpv4 = ipVersion(trustedHttpIp) === "IPv4" ? trustedHttpIp : "";
+    const httpIpv6 = ipVersion(trustedHttpIp) === "IPv6" ? trustedHttpIp : "";
+    const rawCandidates = Array.isArray(webrtc.candidates) ? webrtc.candidates : [];
+    const candidateBuckets = { IPv4: [], IPv6: [] };
+    const seenCandidates = new Set();
+    for (const candidate of rawCandidates) {
+        if (!candidate || typeof candidate !== "object") continue;
+        const protocol = String(candidate.protocol || "").trim().toLowerCase();
+        const type = String(candidate.type || "").trim().toLowerCase();
+        if (protocol !== "udp" || type !== "srflx") continue;
+        const ip = cleanIp(candidate.ip);
+        if (!ip || !isPublicWebRtcIp(ip)) continue;
+        const version = ipVersion(ip);
+        const bucket = candidateBuckets[version];
+        if (!bucket || bucket.length >= 2) continue;
+        const key = `${ip}|udp|srflx`;
+        if (seenCandidates.has(key)) continue;
+        seenCandidates.add(key);
+        bucket.push({ ip, version, protocol: "udp", type: "srflx" });
+        if (candidateBuckets.IPv4.length >= 2 && candidateBuckets.IPv6.length >= 2) break;
+    }
+    candidateBuckets.IPv4.sort((left, right) => left.ip.localeCompare(right.ip));
+    candidateBuckets.IPv6.sort((left, right) => left.ip.localeCompare(right.ip));
+    const validCandidates = [...candidateBuckets.IPv4, ...candidateBuckets.IPv6];
+    const webrtcIpv4Candidates = candidateBuckets.IPv4.map((candidate) => candidate.ip);
+    const webrtcIpv6Candidates = candidateBuckets.IPv6.map((candidate) => candidate.ip);
+    const webrtcIpv4 = webrtcIpv4Candidates[0] || "";
+    const webrtcIpv6 = webrtcIpv6Candidates[0] || "";
+    const reportedStatus = String(webrtc.udp_status || "").trim().toLowerCase();
+    const udpStatus = validCandidates.length
+        ? "success"
+        : (["unsupported", "failed", "timeout", "empty"].includes(reportedStatus) ? reportedStatus : "empty");
     return {
         http_ipv4: httpIpv4,
         http_ipv6: httpIpv6,
         webrtc_ipv4: webrtcIpv4,
         webrtc_ipv6: webrtcIpv6,
-        webrtc_protocol: String(webrtc.webrtc_protocol || "").slice(0, 20),
-        webrtc_candidate_type: String(webrtc.webrtc_candidate_type || "").slice(0, 80),
+        webrtc_protocol: validCandidates.length ? "udp" : "",
+        webrtc_candidate_type: validCandidates.length ? "srflx" : "",
         udp_status: udpStatus,
+        webrtc_candidates: validCandidates,
+        webrtc_ipv4_candidates: webrtcIpv4Candidates,
+        webrtc_ipv6_candidates: webrtcIpv6Candidates,
     };
 }
 
-function firstIpByVersion(values, version) {
-    for (const value of values) {
-        const ip = cleanIp(value, version);
-        if (ip) return ip;
-    }
-    return "";
-}
-
 function cleanIp(value, version = "") {
-    const ip = String(value || "").trim();
-    if (!ip || ip.length > 80) return "";
-    if (version && ipVersion(ip) !== version) return "";
-    return /^[0-9a-fA-F:.]+$/.test(ip) ? ip : "";
+    const raw = String(value || "").trim().replace(/^\[|\]$/g, "");
+    if (!raw || raw.length > 80) return "";
+    const detected = ipVersion(raw);
+    if (!detected || (version && detected !== version)) return "";
+    if (detected === "IPv4") return raw.split(".").map(Number).join(".");
+    return normalizeIpv6Address(raw);
 }
 
 function ipVersion(ip) {
     const value = String(ip || "").trim();
     if (!value) return "";
-    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(value)) return "IPv4";
-    if (value.includes(":")) return "IPv6";
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(value)) {
+        const octets = value.split(".").map(Number);
+        if (octets.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) return "IPv4";
+    }
+    if (value.includes(":") && normalizeIpv6Address(value)) return "IPv6";
     return "";
+}
+
+export function isPublicWebRtcIp(value) {
+    const ip = cleanIp(value);
+    const version = ipVersion(ip);
+    if (version === "IPv4") {
+        const parts = ip.split(".").map(Number);
+        if (parts[0] === 0 || parts[0] === 10 || parts[0] === 127 || parts[0] >= 224) return false;
+        if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return false;
+        if (parts[0] === 169 && parts[1] === 254) return false;
+        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
+        if (parts[0] === 192 && parts[1] === 168) return false;
+        if (parts[0] === 192 && parts[1] === 0 && (parts[2] === 0 || parts[2] === 2)) return false;
+        if (parts[0] === 192 && parts[1] === 88 && parts[2] === 99) return false;
+        if (parts[0] === 198 && (parts[1] === 18 || parts[1] === 19 || (parts[1] === 51 && parts[2] === 100))) return false;
+        if (parts[0] === 203 && parts[1] === 0 && parts[2] === 113) return false;
+        return true;
+    }
+    if (version === "IPv6") {
+        const normalized = normalizeIpv6Address(ip);
+        if (!normalized || normalized.startsWith("2001:0db8:")) return false;
+        const groups = normalized.split(":").map((part) => Number.parseInt(part, 16));
+        if (groups[0] === 0x3ffe) return false;
+        if (groups[0] === 0x3fff && groups[1] <= 0x0fff) return false;
+        const firstGroup = Number.parseInt(normalized.slice(0, 4), 16);
+        return firstGroup >= 0x2000 && firstGroup <= 0x3fff;
+    }
+    return false;
 }
 
 function requestCfInfo(request) {
@@ -2463,6 +3386,35 @@ async function ensureVerificationSchema(env) {
             "confirmed_at TEXT NOT NULL)",
         ).run();
     }
+    if (!schemaObjects.has("table:device_fingerprint_profiles")) {
+        await env.DB.prepare(
+            "CREATE TABLE IF NOT EXISTS device_fingerprint_profiles (" +
+            "user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE, " +
+            "slot INTEGER NOT NULL CHECK(slot BETWEEN 1 AND 3), " +
+            "profile_hash TEXT NOT NULL CHECK(length(profile_hash)=32), " +
+            "webrtc_ipv4_hash TEXT NOT NULL DEFAULT '' CHECK(webrtc_ipv4_hash='' OR length(webrtc_ipv4_hash)=32), " +
+            "webrtc_ipv4_hash2 TEXT NOT NULL DEFAULT '' CHECK(webrtc_ipv4_hash2='' OR length(webrtc_ipv4_hash2)=32), " +
+            "webrtc_ipv6_hash TEXT NOT NULL DEFAULT '' CHECK(webrtc_ipv6_hash='' OR length(webrtc_ipv6_hash)=32), " +
+            "webrtc_ipv6_hash2 TEXT NOT NULL DEFAULT '' CHECK(webrtc_ipv6_hash2='' OR length(webrtc_ipv6_hash2)=32), " +
+            "stable_hash TEXT NOT NULL DEFAULT '' CHECK(stable_hash='' OR length(stable_hash)=32), " +
+            "canvas_hash TEXT NOT NULL DEFAULT '' CHECK(canvas_hash='' OR length(canvas_hash)=32), " +
+            "renderer_hash TEXT NOT NULL DEFAULT '' CHECK(renderer_hash='' OR length(renderer_hash)=32), " +
+            "limits_hash TEXT NOT NULL DEFAULT '' CHECK(limits_hash='' OR length(limits_hash)=32), " +
+            "os_hash TEXT NOT NULL DEFAULT '' CHECK(os_hash='' OR length(os_hash)=32), " +
+            "screen_hash TEXT NOT NULL DEFAULT '' CHECK(screen_hash='' OR length(screen_hash)=32), " +
+            "dpr_depth_hash TEXT NOT NULL DEFAULT '' CHECK(dpr_depth_hash='' OR length(dpr_depth_hash)=32), " +
+            "hardware_hash TEXT NOT NULL DEFAULT '' CHECK(hardware_hash='' OR length(hardware_hash)=32), " +
+            "touch_hash TEXT NOT NULL DEFAULT '' CHECK(touch_hash='' OR length(touch_hash)=32), " +
+            "timezone_hash TEXT NOT NULL DEFAULT '' CHECK(timezone_hash='' OR length(timezone_hash)=32), " +
+            "language_hash TEXT NOT NULL DEFAULT '' CHECK(language_hash='' OR length(language_hash)=32), " +
+            "feature_mask INTEGER NOT NULL DEFAULT 0, " +
+            "seen_count INTEGER NOT NULL DEFAULT 1 CHECK(seen_count BETWEEN 1 AND 2147483647), " +
+            "first_seen_at TEXT NOT NULL, " +
+            "last_seen_at TEXT NOT NULL, " +
+            "PRIMARY KEY(user_id, slot), " +
+            "UNIQUE(user_id, profile_hash)) WITHOUT ROWID",
+        ).run();
+    }
     const userColumns = [
         "language_code TEXT DEFAULT ''",
         "verified INTEGER DEFAULT 0",
@@ -2517,6 +3469,15 @@ async function ensureVerificationSchema(env) {
     const indexes = [
         { name: "idx_users_topic", sql: "CREATE INDEX IF NOT EXISTS idx_users_topic ON users(topic_chat_id, topic_thread_id)" },
         { name: "idx_users_device_fingerprint", sql: "CREATE INDEX IF NOT EXISTS idx_users_device_fingerprint ON users(last_device_fingerprint) WHERE last_device_fingerprint<>''" },
+        { name: "idx_users_device_fingerprint_updated", sql: "CREATE INDEX IF NOT EXISTS idx_users_device_fingerprint_updated ON users(last_device_fingerprint, updated_at DESC) WHERE last_device_fingerprint<>''" },
+        { name: "idx_fp_profiles_profile", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_profile ON device_fingerprint_profiles(profile_hash, last_seen_at DESC)" },
+        { name: "idx_fp_profiles_webrtc4", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_webrtc4 ON device_fingerprint_profiles(webrtc_ipv4_hash, last_seen_at DESC) WHERE webrtc_ipv4_hash<>''" },
+        { name: "idx_fp_profiles_webrtc4b", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_webrtc4b ON device_fingerprint_profiles(webrtc_ipv4_hash2, last_seen_at DESC) WHERE webrtc_ipv4_hash2<>''" },
+        { name: "idx_fp_profiles_webrtc6", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_webrtc6 ON device_fingerprint_profiles(webrtc_ipv6_hash, last_seen_at DESC) WHERE webrtc_ipv6_hash<>''" },
+        { name: "idx_fp_profiles_webrtc6b", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_webrtc6b ON device_fingerprint_profiles(webrtc_ipv6_hash2, last_seen_at DESC) WHERE webrtc_ipv6_hash2<>''" },
+        { name: "idx_fp_profiles_stable", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_stable ON device_fingerprint_profiles(stable_hash, last_seen_at DESC) WHERE stable_hash<>''" },
+        { name: "idx_fp_profiles_renderer", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_renderer ON device_fingerprint_profiles(renderer_hash, last_seen_at DESC) WHERE renderer_hash<>''" },
+        { name: "idx_fp_profiles_canvas", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_canvas ON device_fingerprint_profiles(canvas_hash, last_seen_at DESC) WHERE canvas_hash<>''" },
         { name: "idx_webrtc_identity_labels_source", sql: "CREATE INDEX IF NOT EXISTS idx_webrtc_identity_labels_source ON webrtc_identity_labels(source_user_id, updated_at DESC)" },
         { name: "idx_webrtc_identity_confirmations_label", sql: "CREATE INDEX IF NOT EXISTS idx_webrtc_identity_confirmations_label ON webrtc_identity_confirmations(label_id)" },
         { name: "idx_inbox_topic_created", sql: "CREATE INDEX IF NOT EXISTS idx_inbox_topic_created ON inbox_messages(topic_chat_id, topic_thread_id, created_at)" },
