@@ -1045,40 +1045,59 @@ async function loginSubmit(request, env) {
 function loginPage(error = "") {
     return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>登录 · TG DualBot</title><style>
-body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f6fb;color:#111827;font-family:system-ui,-apple-system,Segoe UI,sans-serif}
-.card{width:min(420px,calc(100% - 32px));background:white;border:1px solid #d8dee9;border-radius:10px;padding:28px;box-shadow:0 18px 50px rgba(15,23,42,.12)}
-h1{margin:0 0 8px;font-size:26px}.muted{color:#64748b;margin:0 0 22px;line-height:1.5}label{display:block;font-weight:700;margin:14px 0 6px}
-input{width:100%;box-sizing:border-box;padding:11px 12px;border:1px solid #cbd5e1;border-radius:8px;font-size:15px}
-button{width:100%;margin-top:20px;border:0;border-radius:8px;background:#2563eb;color:white;font-weight:800;padding:12px;cursor:pointer}
-.error{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;border-radius:8px;padding:10px 12px;margin-bottom:14px}
+*,*::before,*::after{box-sizing:border-box}
+:root{--ink:#142033;--muted:#667085;--line:#d9e0ea;--blue:#1d4ed8;--blue-dark:#173f9f}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;background:radial-gradient(circle at 12% 12%,#dbeafe 0,transparent 34%),radial-gradient(circle at 88% 82%,#e0f2fe 0,transparent 30%),#eef2f7;color:var(--ink);font-family:"Noto Sans SC","Microsoft YaHei",Segoe UI,sans-serif}
+.card{width:min(430px,100%);background:rgba(255,255,255,.96);border:1px solid rgba(203,213,225,.9);border-radius:18px;padding:clamp(22px,6vw,34px);box-shadow:0 24px 70px rgba(15,23,42,.14)}
+.eyebrow{display:inline-flex;align-items:center;gap:8px;margin-bottom:18px;color:var(--blue);font-size:12px;font-weight:900;letter-spacing:.14em;text-transform:uppercase}.eyebrow::before{content:"";width:28px;height:3px;border-radius:999px;background:var(--blue)}
+h1{margin:0 0 8px;font-size:clamp(26px,7vw,32px);letter-spacing:-.03em}.muted{color:var(--muted);margin:0 0 24px;line-height:1.65}label{display:block;font-weight:800;margin:15px 0 7px}
+input{width:100%;min-height:46px;padding:11px 13px;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink);font:inherit;transition:border-color .18s,box-shadow .18s}
+input:focus{outline:0;border-color:#60a5fa;box-shadow:0 0 0 4px rgba(37,99,235,.12)}
+button{width:100%;min-height:47px;margin-top:22px;border:0;border-radius:10px;background:linear-gradient(135deg,var(--blue),var(--blue-dark));color:white;font:inherit;font-weight:900;cursor:pointer;box-shadow:0 10px 24px rgba(29,78,216,.22);transition:transform .18s,box-shadow .18s}button:hover{transform:translateY(-1px);box-shadow:0 14px 30px rgba(29,78,216,.28)}button:focus-visible{outline:3px solid rgba(37,99,235,.28);outline-offset:3px}
+.error{background:#fff1f2;color:#9f1239;border:1px solid #fecdd3;border-radius:10px;padding:11px 13px;margin-bottom:14px;line-height:1.5}
 </style></head><body><form class="card" method="post" action="/login">
-<h1>TG DualBot</h1><p class="muted">Cloudflare 双向机器人后台</p>
-${error ? `<div class="error">${h(error)}</div>` : ""}
-<label>用户名</label><input name="username" autocomplete="username" required>
-<label>密码</label><input name="password" type="password" autocomplete="current-password" required>
+<div class="eyebrow">Cloudflare Control</div><h1>TG DualBot</h1><p class="muted">登录双向机器人管理后台，集中管理用户、消息、验证和 Telegram 话题。</p>
+${error ? `<div class="error" role="alert">${h(error)}</div>` : ""}
+<label for="panel-username">用户名</label><input id="panel-username" name="username" autocomplete="username" required>
+<label for="panel-password">密码</label><input id="panel-password" name="password" type="password" autocomplete="current-password" required>
 <button type="submit">登录</button></form></body></html>`;
 }
 
 function layout(title, body) {
     return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${h(title)} · TG DualBot</title><style>
-:root{--bg:#f4f6fb;--panel:#fff;--line:#d8dee9;--ink:#111827;--muted:#64748b;--blue:#2563eb;--red:#dc2626;--green:#16a34a}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,sans-serif}
-.shell{display:grid;grid-template-columns:240px minmax(0,1fr);min-height:100vh}.side{background:#0f172a;color:white;padding:18px;position:sticky;top:0;height:100vh;overflow:auto}
-.brand{font-size:20px;font-weight:900;margin-bottom:18px}.brand small{display:block;color:#94a3b8;font-size:12px;margin-top:3px}
-nav{display:grid;gap:8px}nav a{color:#dbeafe;text-decoration:none;padding:10px 11px;border-radius:8px;font-weight:750}nav a:hover{background:#1e293b;text-decoration:none}
-main{padding:24px;max-width:1360px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:18px}.top h1{margin:0;font-size:28px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin:14px 0;box-shadow:0 8px 24px rgba(15,23,42,.05)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.metric{font-size:26px;font-weight:900}.muted{color:var(--muted);line-height:1.5}
-.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.btn,button{display:inline-block;border:0;border-radius:8px;background:#e2e8f0;color:#0f172a;padding:8px 11px;font-weight:800;text-decoration:none;cursor:pointer}
-.btn.primary,button.primary{background:var(--blue);color:white}.btn.danger,button.danger{background:var(--red);color:white}.btn.ok{background:var(--green);color:white}
-input,textarea,select{width:100%;border:1px solid #cbd5e1;border-radius:8px;padding:10px 11px;font:inherit}textarea{min-height:120px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
-label{display:block;margin:10px 0 5px;font-weight:800}table{width:100%;border-collapse:collapse;background:white}th,td{border-bottom:1px solid #e2e8f0;text-align:left;padding:10px;vertical-align:top}th{font-size:12px;color:#475569;background:#f8fafc}
-.badge{display:inline-block;border-radius:999px;background:#e2e8f0;color:#0f172a;padding:3px 8px;font-size:12px;font-weight:900}.badge.red{background:#fee2e2;color:#991b1b}.badge.green{background:#dcfce7;color:#166534}.badge.warn{background:#fef3c7;color:#92400e}
-pre{white-space:pre-wrap;background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px;overflow:auto}.msg{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 12px;color:#1e3a8a;font-weight:700}
-@media(max-width:800px){.shell{grid-template-columns:1fr}.side{height:auto;position:relative}main{padding:16px}}
-</style></head><body><div class="shell"><aside class="side"><div class="brand">TG DualBot<small>Cloudflare 后台</small></div><nav>
+:root{--bg:#eef2f7;--panel:#fff;--line:#d9e0ea;--ink:#172033;--muted:#667085;--nav:#0b1324;--nav-soft:#17233b;--blue:#1d4ed8;--blue-soft:#eff6ff;--red:#dc2626;--green:#15803d;--amber:#b45309;--shadow:0 12px 34px rgba(15,23,42,.07)}
+*,*::before,*::after{box-sizing:border-box}html{max-width:100%;overflow-x:clip;background:var(--bg)}body{margin:0;max-width:100%;overflow-x:clip;background:linear-gradient(180deg,#f7f9fc 0,var(--bg) 260px);color:var(--ink);font-family:"Noto Sans SC","Microsoft YaHei",Segoe UI,sans-serif;font-size:15px}
+.shell{display:grid;grid-template-columns:252px minmax(0,1fr);min-height:100vh}.side{position:sticky;top:0;height:100vh;overflow:auto;padding:24px 18px;background:linear-gradient(180deg,#0b1324,#101a30);color:#fff;border-right:1px solid rgba(148,163,184,.14)}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:26px;padding:0 7px;font-size:19px;font-weight:900;letter-spacing:-.02em}.brand-mark{display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:linear-gradient(145deg,#2563eb,#0ea5e9);box-shadow:0 10px 26px rgba(37,99,235,.3);font-size:14px;letter-spacing:.04em}.brand small{display:block;color:#93a4bf;font-size:12px;font-weight:700;letter-spacing:.02em;margin-top:3px}
+nav{display:grid;gap:5px}nav a{display:flex;align-items:center;min-height:43px;color:#dbe7f8;text-decoration:none;padding:10px 12px;border:1px solid transparent;border-radius:10px;font-weight:800;transition:background .16s,border-color .16s,transform .16s}nav a:hover,nav a:focus-visible{background:var(--nav-soft);border-color:rgba(148,163,184,.16);transform:translateX(2px);outline:0}nav a:last-child{margin-top:12px;color:#fecaca;border-top:1px solid rgba(148,163,184,.14);border-radius:0;padding-top:18px}
+main{min-width:0;width:100%;max-width:1540px;margin-inline:auto;padding:clamp(18px,2.4vw,34px)}.top{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:20px}.top h1{margin:0;font-size:clamp(25px,3vw,32px);letter-spacing:-.035em}.top>.badge{background:#e8eef7;color:#344054}
+.card{min-width:0;max-width:100%;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:clamp(15px,1.7vw,22px);margin:16px 0;box-shadow:var(--shadow)}.card h2{margin:0 0 8px;font-size:19px;letter-spacing:-.015em}.card p:last-child{margin-bottom:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.grid>.card{margin:0}.metrics-grid{grid-template-columns:repeat(5,minmax(0,1fr));margin-bottom:16px}.metric-card{position:relative;overflow:hidden;min-height:116px}.metric-card::after{content:"";position:absolute;right:-22px;bottom:-34px;width:92px;height:92px;border-radius:999px;background:var(--blue-soft)}.metric{position:relative;z-index:1;margin-top:12px;font-size:31px;font-weight:950;letter-spacing:-.04em}.muted,small{color:var(--muted);line-height:1.6}
+.toolbar{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap}.toolbar h2,.toolbar p{margin-top:0}.actions,.row-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row-actions{margin-top:10px}.row-actions form{display:inline-flex;margin:0}.note-form{display:grid;grid-template-columns:minmax(150px,1fr) auto;gap:8px;align-items:center}
+.btn,button{display:inline-flex;align-items:center;justify-content:center;min-height:38px;border:1px solid transparent;border-radius:9px;background:#e8edf4;color:#1e293b;padding:8px 12px;font:inherit;font-weight:850;line-height:1.2;text-decoration:none;white-space:nowrap;cursor:pointer;transition:transform .15s,box-shadow .15s,background .15s}.btn:hover,button:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(15,23,42,.1)}.btn:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid rgba(37,99,235,.22);outline-offset:2px}
+.btn.primary,button.primary{background:var(--blue);color:#fff}.btn.danger,button.danger{background:var(--red);color:#fff}.btn.ok,button.ok{background:var(--green);color:#fff}
+input,textarea,select{width:100%;min-height:42px;border:1px solid #cbd5e1;border-radius:9px;background:#fff;color:var(--ink);padding:9px 11px;font:inherit;transition:border-color .16s,box-shadow .16s}input:focus,textarea:focus,select:focus{border-color:#60a5fa;box-shadow:0 0 0 3px rgba(37,99,235,.1)}textarea{min-height:120px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}input[readonly]{background:#f8fafc;color:#475569}input[type="checkbox"]{width:18px;min-height:18px;height:18px;margin:0;accent-color:var(--blue)}
+label{display:block;margin:11px 0 6px;font-weight:850}.check-row{display:flex;align-items:center;gap:9px;min-height:42px;margin:11px 0 6px;padding:9px 11px;border:1px solid var(--line);border-radius:9px;background:#f8fafc;font-weight:800}
+.table-wrap{display:block;width:100%;max-width:100%;min-width:0;contain:inline-size;overflow-x:auto;border:1px solid var(--line);border-radius:11px;background:#fff;-webkit-overflow-scrolling:touch}.table-wrap table{min-width:var(--table-min,760px)}table{width:100%;border-collapse:separate;border-spacing:0;background:#fff;font-size:14px}thead th{position:sticky;top:0;z-index:1;background:#f6f8fb;color:#475467;font-size:12px;font-weight:900;letter-spacing:.02em}th,td{border-bottom:1px solid #e6ebf2;text-align:left;padding:12px;vertical-align:top;overflow-wrap:anywhere;word-break:break-word}tbody tr:last-child td{border-bottom:0}tbody tr:hover{background:#fbfdff}td .actions{min-width:max-content}.users-table td{min-width:140px}.users-table td:last-child{min-width:280px}.logs-table td:nth-child(2){min-width:460px}
+.badge{display:inline-flex;align-items:center;border-radius:999px;background:#e8edf4;color:#1f2937;padding:4px 9px;font-size:12px;font-weight:900;white-space:nowrap}.badge.red{background:#fee2e2;color:#991b1b}.badge.green{background:#dcfce7;color:#166534}.badge.warn{background:#fef3c7;color:#92400e}
+pre{max-width:100%;max-height:360px;white-space:pre-wrap;overflow:auto;overflow-wrap:anywhere;background:#0d1729;color:#e5edf8;border-radius:10px;padding:13px;line-height:1.55}.msg{background:#eff6ff;border:1px solid #bfdbfe;border-radius:9px;padding:10px 12px;color:#1e3a8a;font-weight:750;line-height:1.55}details summary{cursor:pointer;font-weight:800}code{overflow-wrap:anywhere;color:#1d4ed8}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media(max-width:1180px){.metrics-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media (max-width: 900px){
+.users-wrap{border:0;background:transparent;overflow:visible}
+.users-wrap .users-table{display:block!important;min-width:0!important;background:transparent}
+.users-wrap .users-table thead{display:none}
+.users-wrap .users-table tbody{display:grid;gap:12px}
+.users-wrap .users-table tr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow:hidden;border:1px solid var(--line);border-radius:12px;background:#fff;box-shadow:0 8px 22px rgba(15,23,42,.05)}
+.users-wrap .users-table td{display:block;min-width:0!important;padding:12px 14px;border:0;border-bottom:1px solid #edf1f6}
+.users-wrap .users-table td::before{content:attr(data-label);display:block;margin-bottom:5px;color:#667085;font-size:11px;font-weight:900;letter-spacing:.04em}
+.users-wrap .users-table td:first-child,.users-wrap .users-table td:last-child{grid-column:1/-1}
+.users-wrap .users-table td:last-child{border-bottom:0}
+.users-wrap .users-table tbody tr:hover{background:#fff}
+}
+@media(max-width:800px){.shell{grid-template-columns:1fr}.side{position:relative;height:auto;padding:13px 14px}.brand{margin-bottom:12px}.brand-mark{width:36px;height:36px}nav{display:flex;gap:7px;overflow-x:auto;padding-bottom:3px;scrollbar-width:thin}nav a{flex:0 0 auto;min-height:40px;padding:8px 11px}nav a:last-child{margin:0;border-top:1px solid rgba(248,113,113,.25);border-radius:9px;padding-top:8px}main{padding:16px}.top{align-items:flex-start;margin-bottom:12px}.top h1{font-size:25px}.card{padding:15px;margin:12px 0}.note-form{grid-template-columns:1fr}.btn,button{min-height:42px}.table-wrap{border-radius:9px}}
+@media(max-width:560px){.metrics-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric-card{min-height:104px}.metric{font-size:27px}.top>.badge{display:none}.grid{grid-template-columns:1fr}.users-table tr{grid-template-columns:1fr}.users-table td{grid-column:1/-1}.row-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.row-actions form,.row-actions button{width:100%}}
+</style></head><body><div class="shell"><aside class="side"><div class="brand"><span class="brand-mark">TG</span><span>TG DualBot<small>Cloudflare 控制台</small></span></div><nav aria-label="后台主导航">
 <a href="/">总览</a><a href="/inbox">收件箱</a><a href="/users">用户管理</a><a href="/rules">广告拦截</a><a href="/verifications">CF 验证记录</a><a href="/settings">设置</a><a href="/logs">日志</a><a href="/logout">退出</a>
 </nav></aside><main><div class="top"><h1>${h(title)}</h1><span class="badge">Worker + D1</span></div>${body}</main></div></body></html>`;
 }
@@ -1093,12 +1112,12 @@ async function dashboard(request, env) {
         scalar(env, "SELECT COUNT(*) FROM ip_verifications WHERE passed=1"),
     ]);
     const base = publicBaseUrl(env, request);
-    const body = `<div class="grid">
-<div class="card"><div class="muted">用户数</div><div class="metric">${stats[0]}</div></div>
-<div class="card"><div class="muted">封禁用户</div><div class="metric">${stats[1]}</div></div>
-<div class="card"><div class="muted">已验证用户</div><div class="metric">${stats[2]}</div></div>
-<div class="card"><div class="muted">消息记录</div><div class="metric">${stats[3]}</div></div>
-<div class="card"><div class="muted">CF 验证通过</div><div class="metric">${stats[4]}</div></div>
+    const body = `<div class="grid metrics-grid">
+<div class="card metric-card"><div class="muted">用户数</div><div class="metric">${stats[0]}</div></div>
+<div class="card metric-card"><div class="muted">封禁用户</div><div class="metric">${stats[1]}</div></div>
+<div class="card metric-card"><div class="muted">已验证用户</div><div class="metric">${stats[2]}</div></div>
+<div class="card metric-card"><div class="muted">消息记录</div><div class="metric">${stats[3]}</div></div>
+<div class="card metric-card"><div class="muted">CF 验证通过</div><div class="metric">${stats[4]}</div></div>
 </div>
 <div class="card"><h2>项目状态</h2><p class="muted">当前版本提供 Telegram 私聊双向通信、验证后聊天门禁、管理员回复、收件箱、用户管理、备注、封禁、广告拦截、多管理员、Cloudflare Turnstile 验证、IPv4/IPv6/UDP WebRTC 记录，并同时支持 Workers 和 Pages Functions 部署。</p>
 <p><b>公开地址：</b><code>${h(base)}</code></p><p><b>验证入口：</b><code>${h(`${base}/verify/{token}`)}</code></p></div>`;
@@ -1114,14 +1133,14 @@ async function inboxPage(request, env) {
         const retry = r.direction === "in" && !r.forwarded ? `<form method="post" action="/inbox/${r.id}/retry"><button>重试转发</button></form>` : "";
         return `<tr><td>#${r.id}<br><span class="badge ${cls}">${h(status)}</span></td><td><b>${h(r.full_name || r.user_id)}</b><br><small>${r.user_id} @${h(r.username || "")}</small></td><td>${h(flow)}<br><small>${h(r.source || "")} · ${h(r.created_at)}</small></td><td>${h(r.text || "(非文本/媒体消息)")}${r.error ? `<br><small class="muted">${h(r.error)}</small>` : ""}</td><td><div class="actions"><a class="btn primary" href="/inbox/${r.id}/reply">回复</a>${retry}</div></td></tr>`;
     }).join("");
-    return html(layout("收件箱", `<div class="card"><div class="toolbar"><div><h2>双向消息记录</h2><p class="muted">用户入站消息、Telegram 管理员回复、Web 后台回复都会记录在这里。</p></div></div><table><tr><th>ID/状态</th><th>用户</th><th>方向/来源</th><th>内容/错误</th><th>操作</th></tr>${bodyRows}</table></div>`));
+    return html(layout("收件箱", `<div class="card"><div class="toolbar"><div><h2>双向消息记录</h2><p class="muted">用户入站消息、Telegram 管理员回复、Web 后台回复都会记录在这里。</p></div></div><div class="table-wrap" style="--table-min:900px"><table><caption class="sr-only">双向消息记录</caption><thead><tr><th scope="col">ID/状态</th><th scope="col">用户</th><th scope="col">方向/来源</th><th scope="col">内容/错误</th><th scope="col">操作</th></tr></thead><tbody>${bodyRows}</tbody></table></div></div>`));
 }
 
 async function inboxReplyPage(request, env, id) {
     const row = await getInboxMessage(env, id);
     if (!row) return html(layout("未找到", `<div class="card">消息不存在。</div>`), 404);
     const body = `<div class="card"><h2>回复用户</h2><p class="muted">#${row.id} · ${h(row.full_name)} · ${row.user_id}</p><pre>${h(row.text || "(非文本/媒体消息)")}</pre>
-<form method="post"><label>回复内容</label><textarea name="text" required></textarea><div class="actions"><button class="primary" type="submit">发送回复</button><a class="btn" href="/inbox">返回</a></div></form></div>`;
+<form method="post"><label for="reply-text">回复内容</label><textarea id="reply-text" name="text" required></textarea><div class="actions"><button class="primary" type="submit">发送回复</button><a class="btn" href="/inbox">返回</a></div></form></div>`;
     return html(layout("回复用户", body));
 }
 
@@ -1179,12 +1198,12 @@ async function usersPage(request, env) {
             u.topic_title ? `标题: ${h(u.topic_title)}` : "标题: -",
             u.topic_last_error ? `错误: ${h(u.topic_last_error)}` : "",
         ].filter(Boolean).join("<br>");
-        const unverify = u.verified ? `<form method="post" action="/users/${u.user_id}/unverify" style="margin-top:8px"><button type="submit">取消验证</button></form>` : "";
-        const topicActions = `<form method="post" action="/users/${u.user_id}/topic/create" style="margin-top:8px"><button type="submit">创建话题</button></form><form method="post" action="/users/${u.user_id}/topic/rebuild" style="margin-top:8px"><button type="submit">重建话题</button></form><form method="post" action="/users/${u.user_id}/topic/unbind" style="margin-top:8px"><button type="submit">解除话题绑定</button></form>`;
-        const deleteAction = `<form method="post" action="/users/${u.user_id}/delete" style="margin-top:8px" onsubmit="return confirm('确定要永久删除该用户及其全部消息和验证记录吗？此操作无法恢复。')"><button class="danger" type="submit">删除用户</button></form>`;
-        return `<tr><td><b>${h(u.full_name || u.user_id)}</b><br><small>${u.user_id} @${h(u.username || "")}<br>语言: ${h(u.language_code || "-")}</small></td><td>${status}<br><small>${h(u.verification_status || "")}<br>${h(u.updated_at)}</small></td><td>${http}<br><small>${h(u.last_verified_at || "")}</small></td><td>${udp}</td><td>${topic}</td><td>${h(u.note || "")}</td><td><form method="post" action="/users/${u.user_id}/note"><input name="note" value="${h(u.note || "")}"><button type="submit">保存标签 / 备注</button></form><form method="post" action="/users/${u.user_id}/${actionPath}" style="margin-top:8px"><button class="${actionClass}" type="submit">${actionText}</button></form>${unverify}${topicActions}${deleteAction}</td></tr>`;
+        const unverify = u.verified ? `<form method="post" action="/users/${u.user_id}/unverify"><button type="submit">取消验证</button></form>` : "";
+        const topicActions = `<form method="post" action="/users/${u.user_id}/topic/create"><button type="submit">创建话题</button></form><form method="post" action="/users/${u.user_id}/topic/rebuild"><button type="submit">重建话题</button></form><form method="post" action="/users/${u.user_id}/topic/unbind"><button type="submit">解除话题绑定</button></form>`;
+        const deleteAction = `<form method="post" action="/users/${u.user_id}/delete" onsubmit="return confirm('确定要永久删除该用户及其全部消息和验证记录吗？此操作无法恢复。')"><button class="danger" type="submit">删除用户</button></form>`;
+        return `<tr><td data-label="用户"><b>${h(u.full_name || u.user_id)}</b><br><small>${u.user_id} @${h(u.username || "")}<br>语言: ${h(u.language_code || "-")}</small></td><td data-label="状态">${status}<br><small>${h(u.verification_status || "")}<br>${h(u.updated_at)}</small></td><td data-label="公网 HTTP 信息">${http}<br><small>${h(u.last_verified_at || "")}</small></td><td data-label="UDP / WebRTC / 指纹">${udp}</td><td data-label="话题">${topic}</td><td data-label="标签 / 备注">${h(u.note || "-")}</td><td data-label="操作"><form class="note-form" method="post" action="/users/${u.user_id}/note"><label class="sr-only" for="note-${u.user_id}">用户 ${u.user_id} 的标签或备注</label><input id="note-${u.user_id}" name="note" value="${h(u.note || "")}" placeholder="标签 / 备注"><button type="submit">保存备注</button></form><div class="row-actions"><form method="post" action="/users/${u.user_id}/${actionPath}"><button class="${actionClass}" type="submit">${actionText}</button></form>${unverify}${topicActions}${deleteAction}</div></td></tr>`;
     }).join("");
-    return html(layout("用户管理", `<div class="card"><h2>用户管理</h2><p class="muted">展示已私聊过 Bot 的用户、验证状态、IPv4/IPv6、UDP WebRTC、设备指纹、话题绑定、封禁状态和标签 / 备注；备注同时作为精确指纹命中的标签。</p><table><tr><th>用户</th><th>状态</th><th>公网 HTTP 信息</th><th>UDP / WebRTC / 指纹</th><th>话题</th><th>标签 / 备注</th><th>操作</th></tr>${bodyRows}</table></div>`));
+    return html(layout("用户管理", `<div class="card"><h2>用户管理</h2><p class="muted">展示已私聊过 Bot 的用户、验证状态、IPv4/IPv6、UDP WebRTC、设备指纹、话题绑定、封禁状态和标签 / 备注；备注同时作为精确指纹命中的标签。</p><div class="table-wrap users-wrap" style="--table-min:1320px"><table class="users-table"><caption class="sr-only">机器人用户管理</caption><thead><tr><th scope="col">用户</th><th scope="col">状态</th><th scope="col">公网 HTTP 信息</th><th scope="col">UDP / WebRTC / 指纹</th><th scope="col">话题</th><th scope="col">标签 / 备注</th><th scope="col">操作</th></tr></thead><tbody>${bodyRows}</tbody></table></div></div>`));
 }
 
 async function userNoteSave(request, env, userId) {
@@ -1242,8 +1261,8 @@ async function rulesPage(request, env) {
     const keywords = await getSpamKeywords(env);
     const autoBlock = await getSetting(env, "spam_auto_block", "true");
     const body = `<div class="card"><h2>私聊广告拦截</h2><p class="muted">只拦截用户私聊 Bot 的消息。命中后可自动封禁，并通知管理员。</p>
-<form method="post"><label><input type="checkbox" name="auto_block" ${autoBlock !== "false" ? "checked" : ""} style="width:auto"> 命中后自动封禁</label>
-<label>关键词（一行一个）</label><textarea name="keywords">${h(keywords.join("\n"))}</textarea>
+<form method="post"><label class="check-row" for="auto-block"><input id="auto-block" type="checkbox" name="auto_block" ${autoBlock !== "false" ? "checked" : ""}> 命中后自动封禁</label>
+<label for="spam-keywords">关键词（一行一个）</label><textarea id="spam-keywords" name="keywords">${h(keywords.join("\n"))}</textarea>
 <div class="actions"><button class="primary" type="submit">保存规则</button></div></form></div>`;
     return html(layout("广告拦截", body));
 }
@@ -1280,7 +1299,7 @@ async function verificationsPage(request, env) {
         ].join("<br>");
         return `<tr><td>#${r.id}<br><span class="badge green">通过</span></td><td>${r.user_id ? `<b>${h(r.full_name || r.user_id)}</b><br><small>${r.user_id} @${h(r.username || "")}</small>` : "-"}</td><td>${http}<br><small>${h(r.country || "")} · ${h(r.colo || "")}</small></td><td>${udp}</td><td>${h(r.device_os || "-")}<br><small>${h(r.user_agent || "")}</small></td><td>${h(r.created_at)}</td></tr>`;
     }).join("");
-    return html(layout("CF 验证记录", `<div class="card"><h2>CF 验证记录</h2><p class="muted">访客通过 Cloudflare Turnstile 后会记录 HTTP IPv4/IPv6、UDP WebRTC IPv4/IPv6、ASN、设备系统和 User-Agent。验证入口使用一次性 token 关联 Telegram 用户。</p><table><tr><th>ID</th><th>用户</th><th>公网 HTTP</th><th>UDP / WebRTC</th><th>设备/User-Agent</th><th>时间</th></tr>${bodyRows}</table></div>`));
+    return html(layout("CF 验证记录", `<div class="card"><h2>CF 验证记录</h2><p class="muted">访客通过 Cloudflare Turnstile 后会记录 HTTP IPv4/IPv6、UDP WebRTC IPv4/IPv6、ASN、设备系统和 User-Agent。验证入口使用一次性 token 关联 Telegram 用户。</p><div class="table-wrap" style="--table-min:1080px"><table><caption class="sr-only">Cloudflare 验证记录</caption><thead><tr><th scope="col">ID</th><th scope="col">用户</th><th scope="col">公网 HTTP</th><th scope="col">UDP / WebRTC</th><th scope="col">设备/User-Agent</th><th scope="col">时间</th></tr></thead><tbody>${bodyRows}</tbody></table></div></div>`));
 }
 
 async function settingsPage(request, env) {
@@ -1293,14 +1312,14 @@ async function settingsPage(request, env) {
     const base = publicBaseUrl(env, request);
     const option = (value, label, selected) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`;
     const body = `<div class="card"><h2>后台设置</h2><form method="post">
-<label>管理员 Telegram Chat ID（最多 3 个，逗号分隔）</label><input name="admin_chat_ids" value="${h(adminIds.join(","))}">
-<label>用户 /start 欢迎语</label><textarea name="welcome_message">${h(welcome)}</textarea>
-<div class="grid"><div><label>控制模式</label><select name="control_mode">${option("web", "仅 Web 后台", mode)}${option("topic", "仅 Telegram 话题", mode)}${option("both", "Web 后台 + Telegram 话题", mode)}</select></div><div><label>Telegram 话题群 ID</label><input name="topic_group_id" value="${h(groupId || "")}" placeholder="-1001234567890"></div></div>
-<div class="grid"><div><label>话题创建策略</label><select name="topic_create_policy">${option("after_verify", "验证通过后创建", createPolicy)}${option("first_message", "用户首条消息时创建", createPolicy)}</select></div><div><label><input type="checkbox" name="topic_sync_web_replies" ${syncWebReplies ? "checked" : ""} style="width:auto"> Web/私聊回复同步到话题</label></div></div>
-<div class="grid"><div><label>公开地址</label><input value="${h(base)}" readonly></div><div><label>验证入口</label><input value="${h(`${base}/verify/{token}`)}" readonly></div></div>
+<label for="admin-chat-ids">管理员 Telegram Chat ID（最多 3 个，逗号分隔）</label><input id="admin-chat-ids" name="admin_chat_ids" value="${h(adminIds.join(","))}">
+<label for="welcome-message">用户 /start 欢迎语</label><textarea id="welcome-message" name="welcome_message">${h(welcome)}</textarea>
+<div class="grid"><div><label for="control-mode">控制模式</label><select id="control-mode" name="control_mode">${option("web", "仅 Web 后台", mode)}${option("topic", "仅 Telegram 话题", mode)}${option("both", "Web 后台 + Telegram 话题", mode)}</select></div><div><label for="topic-group-id">Telegram 话题群 ID</label><input id="topic-group-id" name="topic_group_id" value="${h(groupId || "")}" placeholder="-1001234567890"></div></div>
+<div class="grid"><div><label for="topic-create-policy">话题创建策略</label><select id="topic-create-policy" name="topic_create_policy">${option("after_verify", "验证通过后创建", createPolicy)}${option("first_message", "用户首条消息时创建", createPolicy)}</select></div><div><label class="check-row" for="topic-sync-web"><input id="topic-sync-web" type="checkbox" name="topic_sync_web_replies" ${syncWebReplies ? "checked" : ""}> Web/私聊回复同步到话题</label></div></div>
+<div class="grid"><div><label for="public-base-url">公开地址</label><input id="public-base-url" value="${h(base)}" readonly></div><div><label for="verify-entry">验证入口</label><input id="verify-entry" value="${h(`${base}/verify/{token}`)}" readonly></div></div>
 <div class="actions"><button class="primary" type="submit">保存设置</button></div></form></div>
 <div class="card"><h2>Cloudflare Secrets 状态</h2>
-<table><tr><th>名称</th><th>状态</th><th>说明</th></tr>
+<div class="table-wrap" style="--table-min:620px"><table><caption class="sr-only">Cloudflare Secrets 配置状态</caption><thead><tr><th scope="col">名称</th><th scope="col">状态</th><th scope="col">说明</th></tr></thead><tbody>
 ${secretRow("BOT_TOKEN", env.BOT_TOKEN, "Telegram Bot Token")}
 ${secretRow("PANEL_PASSWORD", env.PANEL_PASSWORD, "后台登录密码")}
 ${secretRow("PANEL_SECRET", env.PANEL_SECRET, "Cookie session secret")}
@@ -1309,7 +1328,7 @@ ${secretRow("TURNSTILE_SECRET_KEY", env.TURNSTILE_SECRET_KEY, "Cloudflare Turnst
 ${secretRow("TURNSTILE_SITE_KEY", env.TURNSTILE_SITE_KEY, "Cloudflare Turnstile site key，可放 vars")}
 ${secretRow("CONTROL_MODE", mode, "web / topic / both")}
 ${secretRow("TOPIC_GROUP_ID", groupId, "开启 Topics 的 Telegram 超级群 ID")}
-</table></div>`;
+</tbody></table></div></div>`;
     return html(layout("设置", body));
 }
 
@@ -1485,7 +1504,7 @@ async function logsPage(request, env) {
             : "";
         return `<tr><td>#${r.id}<br><span class="badge ${levelClass}">${h(levelText)}</span></td><td><b>${h(translated.title)}</b><div class="muted" style="margin-top:8px"><b>中文说明：</b>${h(translated.reason)}</div>${suggestion}<details style="margin-top:10px"><summary style="cursor:pointer;font-weight:700">查看原始日志</summary><pre>${h(original)}</pre></details></td><td>${h(r.created_at)}</td></tr>`;
     }).join("");
-    return html(layout("日志", `<div class="card"><h2>最近日志</h2><p class="muted">系统会在页面中翻译常见错误并给出处理建议；原始日志完整保留在“查看原始日志”中。</p><table><tr><th>ID</th><th>中文说明 / 原始日志</th><th>时间</th></tr>${bodyRows}</table></div>`));
+    return html(layout("日志", `<div class="card"><h2>最近日志</h2><p class="muted">系统会在页面中翻译常见错误并给出处理建议；原始日志完整保留在“查看原始日志”中。</p><div class="table-wrap" style="--table-min:780px"><table class="logs-table"><caption class="sr-only">最近系统日志</caption><thead><tr><th scope="col">ID</th><th scope="col">中文说明 / 原始日志</th><th scope="col">时间</th></tr></thead><tbody>${bodyRows}</tbody></table></div></div>`));
 }
 
 async function verifyPage(request, env, token = "", error = "") {
