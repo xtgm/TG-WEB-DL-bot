@@ -13,6 +13,16 @@ assert.match(chatNotFound.reason, /找不到目标群组或聊天/);
 assert.match(chatNotFound.suggestion, /TOPIC_GROUP_ID|话题群 ID/);
 assert.match(chatNotFound.rawData, /createForumTopic/);
 
+const botBlocked = localizeLogEntry(
+    "failed to relay topic message",
+    JSON.stringify({
+        error: "Telegram copyMessage failed: {\"ok\":false,\"error_code\":403,\"description\":\"Forbidden: bot was blocked by the user\"}",
+    }),
+);
+assert.equal(botBlocked.title, "话题消息转发给用户失败");
+assert.match(botBlocked.reason, /目标用户已经屏蔽机器人/);
+assert.match(botBlocked.suggestion, /\/start/);
+
 const immutableHeaders = localizeLogEntry(
     "unhandled request error",
     JSON.stringify({ error: "TypeError: Can't modify immutable headers. at loginSubmit (worker.js:200:22)" }),
@@ -20,10 +30,6 @@ const immutableHeaders = localizeLogEntry(
 assert.equal(immutableHeaders.title, "请求处理异常");
 assert.match(immutableHeaders.reason, /不可变的 HTTP 响应头/);
 assert.match(immutableHeaders.suggestion, /重新部署当前最新版/);
-
-const d1Schema = localizeLogEntry("unhandled request error", JSON.stringify({ error: "D1_ERROR: no such table: device_fingerprint_profiles" }));
-assert.match(d1Schema.reason, /缺少代码需要的数据表/);
-assert.match(d1Schema.suggestion, /migrations/);
 
 const d1Column = localizeLogEntry("unhandled request error", JSON.stringify({ error: "D1_ERROR: no such column: webrtc_ipv4_hash2" }));
 assert.match(d1Column.reason, /表结构版本较旧/);

@@ -80,6 +80,7 @@ Secrets 不要写进 `wrangler.toml`、README、GitHub 仓库或截图里，只�
 | `PANEL_SECRET` | `random-long-session-secret` | 是 | Cookie Session 签名密钥，建议使用随机长字符串。 |
 | `TELEGRAM_SECRET_TOKEN` | `random-webhook-secret` | 强烈建议 | Telegram Webhook 请求头校验密钥，设置 Webhook 时要填同一个值。 |
 | `TURNSTILE_SECRET_KEY` | `0x4AAAAA_secret_example` | 是 | Turnstile 服务端校验密钥。 |
+| `FINGERPRINT_HMAC_KEY` | `random-32-byte-or-longer-secret` | 强烈建议 | V2 指纹哈希专用密钥。建议首次启用时生成并长期保持不变；更换后旧指纹参考档案需要重新标记。未配置时功能仍可运行，但会退化为带域隔离的 SHA-256。 |
 | `PANEL_USER` | `admin` | 否 | Web 后台用户名，不设置时默认 `admin`。 |
 
 Wrangler Secret 命令示例：
@@ -90,6 +91,7 @@ npx wrangler secret put PANEL_PASSWORD
 npx wrangler secret put PANEL_SECRET
 npx wrangler secret put TELEGRAM_SECRET_TOKEN
 npx wrangler secret put TURNSTILE_SECRET_KEY
+npx wrangler secret put FINGERPRINT_HMAC_KEY
 ```
 
 ### Dashboard 填写位置
@@ -165,7 +167,11 @@ npm run db:apply
 | `verification_sessions` | Telegram 用户一次性验证 token 和验证会话。 |
 | `webrtc_identity_labels` | 管理员手动标记的 WebRTC 精确哈希和标签；同一哈希全局唯一。 |
 | `webrtc_identity_confirmations` | 管理员人工确认后的用户与 WebRTC 标签关联；每个用户最多一行。 |
-| `device_fingerprint_profiles` | 跨浏览器/设备相似度使用的紧凑哈希档案；每个用户固定最多 3 行。 |
+| `fingerprint_profiles_v2` | 每个用户最多 3 个滚动 V2 指纹档案。 |
+| `fingerprint_labels_v2` | 管理员手动建立的观察/指纹黑名单标签；每个来源用户最多 5 个。 |
+| `fingerprint_reference_profiles_v2` | 人工确认后的参考锚点；每个标签最多 12 个。 |
+| `fingerprint_reference_lookup_v2` | 只为人工锚点建立的有界候选索引；每个锚点最多 14 行。 |
+| `fingerprint_user_labels_v2` | 用户与人工确认标签的关联；每个用户最多一行。 |
 
 ### 旧库升级
 
@@ -174,9 +180,8 @@ npm run db:apply
 ```powershell
 npm run db:upgrade:verification
 npm run db:upgrade:topics
-npm run db:upgrade:fingerprint
 npm run db:upgrade:webrtc-identity
-npm run db:upgrade:fingerprint-similarity
+npm run db:upgrade:fingerprint-v2
 ```
 
 如果旧库已经运行过新版 Worker，运行时代码可能已经自动补齐字段；这时升级 SQL 遇到重复字段可以停止，不影响新版运行。
@@ -189,7 +194,7 @@ npm run db:upgrade:fingerprint-similarity
 
 1. Cloudflare Dashboard 进入 `Workers & Pages`。
 2. 创建 Worker。
-3. 打开在线编辑器，把 `worker.js` 全部内容复制进去并保存部署。
+3. 打开模块编辑器，保持 `worker.js` 和 `fingerprint-v2.js` 位于同一根目录后保存部署；如果当前在线编辑器只能粘贴单个文件，请改用 Workers + GitHub 或 Wrangler 部署，不能只复制 `worker.js`。
 4. 在 Worker 设置里添加 D1 Binding：
    - Binding name：`DB`
    - Database：选择 `tg-dualbot-db`
@@ -207,6 +212,7 @@ npm run db:upgrade:fingerprint-similarity
    - `PANEL_SECRET`
    - `TELEGRAM_SECRET_TOKEN`
    - `TURNSTILE_SECRET_KEY`
+   - `FINGERPRINT_HMAC_KEY`
 7. 打开 D1 控制台，对 `tg-dualbot-db` 执行 `migrations/0001_initial.sql`。
 8. 访问 `/health`，应返回 `ok`。
 9. 设置 Telegram Webhook。
@@ -258,6 +264,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
    - `PANEL_SECRET`
    - `TELEGRAM_SECRET_TOKEN`
    - `TURNSTILE_SECRET_KEY`
+   - `FINGERPRINT_HMAC_KEY`
 10. 在 D1 控制台执行 `migrations/0001_initial.sql`。
 11. 重新部署 Pages。
 12. 设置 Telegram Webhook。
@@ -288,8 +295,8 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 用户管理 | `/users` 展示用户资料、验证状态、备注、封禁状态、HTTP IPv4/IPv6、UDP WebRTC IPv4/IPv6、ASN、设备系统。 |
 | 广告拦截 | `/rules` 支持维护私聊关键词，命中后可自动封禁并通知管理员。 |
 | Cloudflare 验证记录 | `/verifications` 展示 Turnstile 通过记录、HTTP IP、WebRTC UDP 结果、国家、机房、ASN、User-Agent。 |
-| 设备指纹相似度候选 | 验证页生成 Canvas、拆分后的 WebGL、屏幕、硬件、系统、语言和时区哈希；完整指纹可精确匹配，不同浏览器或设备按固定权重计算相似度，最终必须由管理员确认。 |
 | WebRTC 人工身份标签 | 管理员使用现有备注手动标记 WebRTC；后续 WebRTC 精确命中只显示“待人工确认”，点击“确认同一人”后才建立持久标签关联。 |
+| V2 设备与网络指纹 | 验证页采集 Canvas、WebGL、Audio、字体、CPU/屏幕、UA-CH、Telegram 客户端和 HTTP/WebRTC 网络层；后台只生成候选，所有标记和确认都必须由管理员手动完成。 |
 | Telegram 话题控制 | `CONTROL_MODE=topic/both` 时，验证通过后可自动创建用户专属群话题，管理员在话题里回复会回到用户。 |
 | 多管理员 | `ADMIN_CHAT_IDS` 最多取 3 个管理员 ID，可通过后台设置或 Cloudflare 环境变量配置；话题回复也只允许这些 ID。 |
 | 后台登录 | `/login` 使用用户名、密码和 Cookie Session；密码、Bot Token 等敏感值通过 Cloudflare Secrets 保存。 |
@@ -304,7 +311,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 登录 | `/login` | 输入后台用户名和密码，成功后写入 `tg_dualbot_session` Cookie。 |
 | 总览 | `/` | 显示用户数、封禁用户、已验证用户、消息记录、CF 验证通过数、公开地址和验证入口格式。 |
 | 收件箱 | `/inbox` | 显示用户入站消息、管理员出站回复、消息方向、来源、状态和错误；支持回复与重试。 |
-| 用户管理 | `/users` | 查看用户资料、备注标签、封禁、验证状态、HTTP IP、UDP WebRTC、ASN、设备系统、设备指纹和话题绑定；支持备注、封禁、解封、取消验证、创建话题、重建话题、解除话题绑定和完整删除用户数据。 |
+| 用户管理 | `/users` | 查看用户资料、备注标签、封禁、验证状态、HTTP IP、UDP WebRTC、ASN、设备系统和话题绑定；支持备注、封禁、解封、取消验证、创建话题、重建话题、解除话题绑定和完整删除用户数据。 |
 | 广告拦截 | `/rules` | 一行一个关键词；可开关命中后自动封禁。 |
 | CF 验证记录 | `/verifications` | 展示每次 Turnstile 通过后的 IP、UDP/WebRTC、ASN、设备系统、User-Agent 和时间。 |
 | 设置 | `/settings` | 保存管理员 Chat ID、欢迎语；查看公开地址、验证入口和 Secrets 配置状态。 |
@@ -339,7 +346,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 - ASN、运营商、国家/地区、Cloudflare 机房。
 - 设备系统。
 - inline 操作按钮：取消验证、拉黑、获取用户名。
-- 命中时显示 WebRTC 是否完全一致、指纹相似度、命中字段和“确认同一人”按钮；点击前不会建立身份关系。
+- WebRTC 标签命中时显示“确认同一人”按钮；点击前不会建立身份关系。
 
 <a id="cloudflare-verification"></a>
 
@@ -374,21 +381,9 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 - WebRTC UDP 记录受浏览器、代理、系统隐私设置、企业网络和运营商网络影响，可能显示 `empty`、`unsupported` 或 `failed`。
 - 本项目会记录字段和状态，不把空值伪造成真实 IP。
 
-### 设备指纹与标签匹配
-
-验证页会计算 Canvas、WebGL 显卡、WebGL 能力、屏幕尺寸、像素比、颜色深度、CPU/内存、触控、系统、时区和语言等特征。Canvas 图片和 WebGL 原始参数不会写入 D1；服务端只保存固定长度 SHA-256 摘要。
-
-- 完整档案哈希一致时显示 `100%`；否则按照固定满分 100 计算相似度，缺失字段得 0 分，不会按剩余字段重新折算成 100%。即使哈希完全一致，如果缺少“至少两项强特征 + 系统”证据，也只展示参考信息，不显示确认按钮。
-- WebRTC 完全一致与设备指纹百分比分开显示。WebRTC 完全一致优先作为网络出口证据；指纹只提供辅助判断。
-- 跨浏览器候选至少需要两项强特征、设备系统以及 WebGL 显卡或 Canvas 命中，并达到 `75%` 才主动提示；系统不会自动贴标签、封禁或确认身份。
-- 只有匹配用户已经具备人工标签时才显示指纹确认按钮；尚无标签时仍显示候选信息，但需要先设置备注并标记该用户 WebRTC。
-- 管理员点击“确认同一人（指纹候选）”时，Worker 会重新读取双方档案、WebRTC 哈希和标签并重新计算；按钮还包含由 `PANEL_SECRET` 生成的短 HMAC，旧档案、旧标签或伪造 callback 都会被拒绝。
-- 每个用户在 `device_fingerprint_profiles` 中最多保留 3 个档案；第 4 个新档案覆盖最旧槽位。每个档案可在同一行保存最多 2 个 WebRTC IPv4 哈希和 2 个 IPv6 哈希，任一地址交集都视为 WebRTC 完全一致；候选查询只走固定索引，每个分支最多 10 行，并保留旧版复合索引精确查询，不扫描全表。
-- 指纹分项不会重复写入 `ip_verifications` 或 `verification_sessions`；完整删除用户时三条档案一并删除。旧用户无需强制重新验证，但再次验证后才会生成可参与相似度计算的新档案。
-
 ### WebRTC 标签与人工确认
 
-WebRTC 标签是独立于设备指纹的人工流程：
+WebRTC 标签采用独立的人工流程：
 
 1. 先通过 `/note <user_id> <标签>` 或 Web 后台给已知用户设置备注，例如 `小孩`。
 2. 管理员在验证通知或用户话题中点击“标记 WebRTC”。系统只保存当前 WebRTC 地址计算出的 32 字符 SHA-256 哈希，不在标签表重复保存原始 IP。
@@ -404,6 +399,31 @@ WebRTC 标签是独立于设备指纹的人工流程：
 - 删除标签会同步删除对应确认关系；完整删除用户会同步清理其标签和确认记录。
 
 WebRTC 精确一致通常表示相同公网 NAT、代理或 VPN 出口，不等于自动证明同一人，因此最终确认必须由管理员完成。WebRTC candidate 来自浏览器提交的客户端数据，Turnstile 不会验证该字段真实性；恶意用户可能伪造，所以人工确认时还应结合 Telegram 账号、历史消息等其他证据。
+
+### V2 设备与网络指纹
+
+V2 在 Turnstile 验证页并行采集设备与网络信号，上传后立即计算 HMAC/SHA-256、64 位 SimHash、字体 MinHash/Jaccard 和 10 维 Gower 向量。原始设备采集值不会重复写入 `ip_verifications.raw_client_data`；D1 只保存有界的派生值和少量设备摘要。
+
+评分结构：
+
+- WebRTC 层 35 分：IP 15、ASN 5、ISP 15。
+- HTTP 层 25 分：IP 10、ASN 5、ISP 10。
+- 设备层 40 分：Canvas 4、WebGL 5、Audio 3、SimHash/Hamming 12、Fonts Jaccard 6、Device Vector/Gower 10。
+- 质量达到 63% 且算法版本、完整哈希、HTTP HMAC 都一致时显示 100%。
+- 其他候选的最终分数及分项最高显示 99%；WebRTC 公网 IP 完全一致时最低进入 60% 人工候选。
+- 候选只用于提醒管理员，不会自动确认同一人、自动封禁或自动加入黑名单。
+
+D1 固定边界：
+
+- 每个用户最多 3 个滚动档案；同一档案重复验证只增加次数并更新时间。
+- 每个来源用户最多 5 个直接标签；每个标签最多 12 个已确认参考锚点。
+- 每个锚点最多 14 条小型 lookup；普通验证不会创建全局 lookup。
+- 每次先执行 1 个 exact 等值查询；未命中时最多批量执行 13 个等值索引分支。每个分支都有硬 `LIMIT`，最坏最多读取 140 条小型 lookup 行，再去重截取 24 个参考候选并按标签保留前 5 个提示。
+- 标签和锚点使用原子限额写入；重复操作不会突破 5/12 上限。
+
+同一网络下跨设备、同一设备跨网络以及浏览器变化时，系统可以通过剩余有效层生成相似候选，但任何浏览器指纹都不能保证跨所有设备、代理和隐私设置百分之百识别同一人。最终判断必须由管理员结合聊天记录等证据手动确认。
+
+`FINGERPRINT_HMAC_KEY` 建议使用至少 32 字节随机密钥并长期保持不变。更换该密钥后，旧锚点的 HMAC lookup 无法再与新验证匹配，需要删除或重新标记相关 V2 标签。
 
 <a id="topic-mode"></a>
 
@@ -493,7 +513,6 @@ Telegram 群要求：
 | `ip_verifications` | 每次 Turnstile 通过后的验证记录。 |
 | `webrtc_identity_labels` | 管理员手动标记的 WebRTC 哈希、标签、来源用户和创建人。 |
 | `webrtc_identity_confirmations` | 每个用户当前由管理员确认的 WebRTC 标签关联。 |
-| `device_fingerprint_profiles` | 每用户 0～3 个紧凑哈希档案，用于 WebRTC 精确候选和跨浏览器/设备相似度计算。 |
 | `inbox_messages` | 入站消息、出站回复、消息类型、Web/话题转发状态、错误信息和话题消息元数据。 |
 | `message_map` | 管理员 Telegram 消息 ID 到用户消息的映射，用于回复定位。 |
 | `spam_keywords` | 广告关键词。 |
@@ -516,11 +535,9 @@ tg-dualbot-cloudflare/
 │  ├─ npm run db:apply：新部署初始化 D1。
 │  ├─ npm run db:upgrade:verification：旧库补验证门禁字段。
 │  ├─ npm run db:upgrade:topics：旧库补 Telegram 话题字段。
-│  ├─ npm run db:upgrade:fingerprint：旧库补设备指纹字段和索引。
 │  ├─ npm run db:upgrade:webrtc-identity：旧库新增 WebRTC 标签与人工确认表。
-│  ├─ npm run db:upgrade:fingerprint-similarity：旧库新增三槽指纹相似度档案表与索引。
-│  ├─ npm run test:fingerprint：测试固定权重、缺失字段和公网 IP 校验。
-│  ├─ npm run test:fingerprint-schema：测试迁移及第 4 个档案覆盖最旧槽位。
+│  ├─ npm run db:upgrade:fingerprint-v2：旧库新增 V2 指纹五张表。
+│  ├─ npm run test:fingerprint：运行 V2 算法和 D1 有界性测试。
 │  ├─ npm run test:verification-client：渲染并检查验证页内嵌采集脚本。
 │  └─ npm run pages:deploy：Pages Direct Upload。
 ├─ wrangler.toml
@@ -539,6 +556,8 @@ tg-dualbot-cloudflare/
 │  ├─ verifyPage()/verifySubmit()：Turnstile 验证页和服务端校验。
 │  ├─ ensureVerificationSchema()：运行时补齐验证字段。
 │  └─ tgCall()、D1 helper、Cookie helper、日志 helper。
+├─ fingerprint-v2.js
+│  └─ V2 HMAC、SimHash、MinHash/Jaccard、Gower、35/25/40 评分和有界 lookup 生成。
 ├─ functions/
 │  └─ [[path]].js
 │     └─ Pages Functions catch-all 入口，导入 ../worker.js 并调用 handleRequest()。
@@ -552,15 +571,13 @@ tg-dualbot-cloudflare/
 │  │  └─ 旧数据库升级到验证门禁版本。
 │  ├─ 0003_topic_mode.sql
 │  │  └─ 旧数据库升级到 Telegram 话题双通道版本。
-│  ├─ 0004_device_fingerprint.sql
-│  │  └─ 旧数据库升级到设备指纹精确匹配版本。
 │  ├─ 0005_webrtc_identity.sql
 │  │  └─ 旧数据库新增 WebRTC 标签与人工确认表。
-│  └─ 0006_fingerprint_similarity.sql
-│     └─ 旧数据库新增有界指纹相似度档案表与候选索引。
+│  └─ 0007_fingerprint_v2.sql
+│     └─ 旧数据库新增 V2 指纹五张表和索引。
 ├─ tests/
-│  ├─ fingerprint_similarity.test.mjs
-│  ├─ fingerprint_schema.test.mjs
+│  ├─ fingerprint_v2_algorithm.test.mjs
+│  ├─ fingerprint_v2_schema.test.mjs
 │  └─ verification_client_script.test.mjs
 └─ README.md
    └─ 功能、部署、配置、验证和排错说明。
@@ -591,6 +608,7 @@ tg-dualbot-cloudflare/
 | `PANEL_SECRET` | Cookie Session 签名密钥，建议使用随机长字符串。 |
 | `TELEGRAM_SECRET_TOKEN` | Telegram Webhook 请求头校验密钥。 |
 | `TURNSTILE_SECRET_KEY` | Turnstile 服务端 `siteverify` 使用。 |
+| `FINGERPRINT_HMAC_KEY` | V2 指纹专用 HMAC 密钥；建议至少 32 字节并长期保持不变。 |
 | `PANEL_USER` | 可选，后台用户名；不设置时默认 `admin`。 |
 
 <a id="requirements"></a>
@@ -685,6 +703,7 @@ npx wrangler secret put PANEL_PASSWORD
 npx wrangler secret put PANEL_SECRET
 npx wrangler secret put TELEGRAM_SECRET_TOKEN
 npx wrangler secret put TURNSTILE_SECRET_KEY
+npx wrangler secret put FINGERPRINT_HMAC_KEY
 ```
 
 3. 初始化数据库：
@@ -719,7 +738,7 @@ npm run pages:deploy
 
 - D1 Binding：`DB`。
 - 普通变量：`PUBLIC_BASE_URL`、`TURNSTILE_SITE_KEY`、`ADMIN_CHAT_IDS`、`CONTROL_MODE`、`TOPIC_GROUP_ID`、`TOPIC_CREATE_POLICY`、`TOPIC_SYNC_WEB_REPLIES`。
-- Secrets：`BOT_TOKEN`、`PANEL_PASSWORD`、`PANEL_SECRET`、`TELEGRAM_SECRET_TOKEN`、`TURNSTILE_SECRET_KEY`。
+- Secrets：`BOT_TOKEN`、`PANEL_PASSWORD`、`PANEL_SECRET`、`TELEGRAM_SECRET_TOKEN`、`TURNSTILE_SECRET_KEY`、`FINGERPRINT_HMAC_KEY`。
 
 <a id="telegram-webhook-setup"></a>
 
@@ -821,7 +840,7 @@ https://你的地址/login
 ### 7. D1 数据检查
 
 ```powershell
-npx wrangler d1 execute tg-dualbot-db --remote --command "SELECT user_id,verified,last_http_ipv4,last_http_ipv6,last_webrtc_ipv4,last_webrtc_ipv6,last_asn,last_device_fingerprint FROM users ORDER BY updated_at DESC LIMIT 10"
+npx wrangler d1 execute tg-dualbot-db --remote --command "SELECT user_id,verified,last_http_ipv4,last_http_ipv6,last_webrtc_ipv4,last_webrtc_ipv6,last_asn FROM users ORDER BY updated_at DESC LIMIT 10"
 ```
 
 ```powershell
@@ -850,25 +869,21 @@ npm run db:upgrade:verification
 npm run db:upgrade:topics
 ```
 
-如果旧库还没有设备指纹字段和索引，可以执行：
-
-```powershell
-npm run db:upgrade:fingerprint
-```
-
 如果旧库还没有 WebRTC 标签与人工确认表，可以执行：
 
 ```powershell
 npm run db:upgrade:webrtc-identity
 ```
 
-如果旧库还没有跨浏览器/设备相似度档案表，可以执行：
+`0005` 不执行删除操作，只使用外键开关和 `CREATE TABLE/INDEX IF NOT EXISTS`，可以安全重复执行。新版 Worker 也会在首次相关请求时自动补齐这些表和索引，因此不会清空已有用户、黑名单、验证状态或 WebRTC 标签。
+
+如果旧库还没有 V2 指纹五张表，可以执行：
 
 ```powershell
-npm run db:upgrade:fingerprint-similarity
+npm run db:upgrade:fingerprint-v2
 ```
 
-`0005` 和 `0006` 不执行删除操作，只使用外键开关和 `CREATE TABLE/INDEX IF NOT EXISTS`，可以安全重复执行。新版 Worker 也会在首次相关请求时自动补齐这些表和索引，因此不会清空已有用户、黑名单、验证状态或 WebRTC 标签。
+`0007` 只使用 `CREATE TABLE/INDEX IF NOT EXISTS`，不会删除或重置已有用户、黑名单、验证状态、WebRTC 标签和消息。已经部署过并拥有 D1 的项目只执行这条升级命令，不要重新执行 `0001_initial.sql`。
 
 如果旧库已经运行过新版 Worker，运行时代码可能已经自动补齐字段；这时升级 SQL 遇到重复字段可以停止，不影响新版运行。
 

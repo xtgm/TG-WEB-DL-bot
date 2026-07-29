@@ -1,17 +1,33 @@
+import {
+    FINGERPRINT_FONT_CATALOG,
+    FINGERPRINT_MIN_EXACT_QUALITY,
+    buildFingerprintProfile,
+    fingerprintLookupEntries,
+    fingerprintProfileDatabaseValues,
+    profileFromDatabaseRow,
+    scoreFingerprintProfiles,
+} from "./fingerprint-v2.js";
+
 const COOKIE_NAME = "tg_dualbot_session";
 const DEFAULT_PANEL_USER = "admin";
 const VERIFY_SESSION_HOURS = 24;
+const VERIFY_PROCESSING_STALE_MS = 2 * 60 * 1000;
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const DEFAULT_CONTROL_MODE = "web";
 const DEFAULT_TOPIC_CREATE_POLICY = "after_verify";
-const DEVICE_FINGERPRINT_VERSION = "tg-dualbot-fp-v1";
-const DEVICE_FINGERPRINT_PROFILE_VERSION = "tg-dualbot-fp-profile-v2";
 const WEBRTC_IDENTITY_VERSION = "tg-dualbot-webrtc-v1";
 const MAX_WEBRTC_LABELS_PER_USER = 5;
 const MAX_FINGERPRINT_PROFILES_PER_USER = 3;
-const FINGERPRINT_SIMILARITY_THRESHOLD = 75;
-const FINGERPRINT_CANDIDATE_LIMIT = 10;
-const USER_WITH_IDENTITY_SELECT = "SELECT u.*, c.label_id AS confirmed_identity_label_id, c.confirmed_at AS identity_confirmed_at, l.label_name AS identity_label_name, l.source_user_id AS identity_label_source_user_id FROM users u LEFT JOIN webrtc_identity_confirmations c ON c.user_id=u.user_id LEFT JOIN webrtc_identity_labels l ON l.id=c.label_id";
+const MAX_FINGERPRINT_LABELS_PER_USER = 5;
+const MAX_FINGERPRINT_REFERENCES_PER_LABEL = 12;
+const MAX_FINGERPRINT_CANDIDATES = 24;
+const USER_WITH_IDENTITY_SELECT = "SELECT u.*, c.label_id AS confirmed_identity_label_id, c.confirmed_at AS identity_confirmed_at, l.label_name AS identity_label_name, l.source_user_id AS identity_label_source_user_id, " +
+    "ful.label_id AS fingerprint_confirmed_label_id, ful.weighted_score AS fingerprint_confirmed_score, ful.confirmed_at AS fingerprint_confirmed_at, " +
+    "fl.label_name AS fingerprint_label_name, fl.state AS fingerprint_label_state, " +
+    "fp.exact_hash AS latest_fingerprint_hash, fp.slot AS latest_fingerprint_slot, fp.quality_score AS latest_fingerprint_quality " +
+    "FROM users u LEFT JOIN webrtc_identity_confirmations c ON c.user_id=u.user_id LEFT JOIN webrtc_identity_labels l ON l.id=c.label_id " +
+    "LEFT JOIN fingerprint_user_labels_v2 ful ON ful.user_id=u.user_id LEFT JOIN fingerprint_labels_v2 fl ON fl.id=ful.label_id " +
+    "LEFT JOIN fingerprint_profiles_v2 fp ON fp.user_id=u.user_id AND fp.slot=(SELECT p2.slot FROM fingerprint_profiles_v2 p2 WHERE p2.user_id=u.user_id ORDER BY p2.last_seen_at DESC LIMIT 1)";
 
 let verificationSchemaReady = false;
 
@@ -103,6 +119,15 @@ export async function handleRequest(request, env, ctx) {
     match = path.match(/^\/users\/(-?\d+)\/unverify$/);
     if (match && method === "POST") return userVerifyCancel(request, env, Number(match[1]));
 
+    match = path.match(/^\/users\/(-?\d+)\/fingerprints$/);
+    if (match && method === "GET") return userFingerprintsPage(request, env, Number(match[1]));
+
+    match = path.match(/^\/users\/(-?\d+)\/fingerprints\/mark$/);
+    if (match && method === "POST") return userFingerprintMark(request, env, Number(match[1]));
+
+    match = path.match(/^\/fingerprint-labels\/(\d+)\/delete$/);
+    if (match && method === "POST") return fingerprintLabelDeleteWeb(request, env, Number(match[1]));
+
     match = path.match(/^\/users\/(-?\d+)\/topic\/create$/);
     if (match && method === "POST") return userTopicCreate(request, env, Number(match[1]), false);
 
@@ -172,270 +197,76 @@ async function sha256Hex(input) {
     return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function hmacSha256Hex(secret, input) {
-    const encoder = new TextEncoder();
-    const key = await crypto.subtle.importKey(
-        "raw",
-        encoder.encode(String(secret || "")),
-        { name: "HMAC", hash: "SHA-256" },
-        false,
-        ["sign"],
-    );
-    const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(String(input || "")));
-    return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+function parseCymruTxt(value) {
+    return String(value || "").replace(/^"|"$/g, "").replace(/"\s+"/g, "").split("|").map((part) => part.trim());
 }
 
-function boundedFingerprintNumber(value, max, precision = 0) {
-    const number = Number(value);
-    if (!Number.isFinite(number)) return 0;
-    const bounded = Math.max(0, Math.min(max, number));
-    const factor = 10 ** precision;
-    return Math.round(bounded * factor) / factor;
-}
-
-function normalizedClientHash(value) {
-    const hash = String(value || "").trim().toLowerCase();
-    return /^[0-9a-f]{32}$/.test(hash) ? hash : "";
-}
-
-async function buildDeviceFingerprint(clientData = {}) {
-    const fingerprint = clientData?.fingerprint && typeof clientData.fingerprint === "object" ? clientData.fingerprint : {};
-    const hardware = fingerprint.hardware && typeof fingerprint.hardware === "object" ? fingerprint.hardware : {};
-    const screenInfo = clientData?.screen && typeof clientData.screen === "object" ? clientData.screen : {};
-    const canvasHash = normalizedClientHash(fingerprint.canvas?.hash);
-    const webglHash = normalizedClientHash(fingerprint.webgl?.hash);
-    if (!canvasHash && !webglHash) return "";
-    const width = boundedFingerprintNumber(screenInfo.width, 32768);
-    const height = boundedFingerprintNumber(screenInfo.height, 32768);
-    const payload = JSON.stringify([
-        DEVICE_FINGERPRINT_VERSION,
-        String(clientData.platform || "").trim().toLowerCase().slice(0, 80),
-        String(clientData.language || "").trim().toLowerCase().slice(0, 32),
-        Array.isArray(clientData.languages) ? clientData.languages.map((value) => String(value).toLowerCase().slice(0, 32)).slice(0, 5).join(",") : "",
-        String(clientData.timezone || "").trim().slice(0, 64),
-        Math.min(width, height),
-        Math.max(width, height),
-        boundedFingerprintNumber(screenInfo.pixel_ratio, 16, 3),
-        boundedFingerprintNumber(screenInfo.color_depth, 64),
-        boundedFingerprintNumber(hardware.cores, 64),
-        boundedFingerprintNumber(hardware.memory_gb, 64, 1),
-        boundedFingerprintNumber(hardware.touch_points, 32),
-        canvasHash,
-        webglHash,
-    ]);
-    return (await sha256Hex(payload)).slice(0, 32);
-}
-
-function normalizedFingerprintText(value, max = 80) {
-    return String(value || "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, max);
-}
-
-function fingerprintRangeBucket(value, boundaries) {
-    const number = Number(value);
-    if (!Number.isFinite(number) || number <= 0) return "";
-    for (const boundary of boundaries) {
-        if (number <= boundary) return String(boundary);
-    }
-    return String(boundaries[boundaries.length - 1]) + "+";
-}
-
-async function fingerprintFeatureHash(name, value) {
-    const normalized = String(value || "");
+function cymruOriginHost(ip) {
+    const version = ipVersion(ip);
+    if (version === "IPv4") return `${ip.split(".").reverse().join(".")}.origin.asn.cymru.com`;
+    if (version !== "IPv6") return "";
+    const normalized = normalizeIpv6Address(ip);
     if (!normalized) return "";
-    return (await sha256Hex(JSON.stringify([DEVICE_FINGERPRINT_PROFILE_VERSION, name, normalized]))).slice(0, 32);
+    return `${normalized.replaceAll(":", "").split("").reverse().join(".")}.origin6.asn.cymru.com`;
 }
 
-async function buildFingerprintProfile(clientData = {}, deviceOs = "", webrtcIdentity = {}) {
-    const fingerprint = clientData?.fingerprint && typeof clientData.fingerprint === "object" ? clientData.fingerprint : {};
-    const hardware = fingerprint.hardware && typeof fingerprint.hardware === "object" ? fingerprint.hardware : {};
-    const screenInfo = clientData?.screen && typeof clientData.screen === "object" ? clientData.screen : {};
-    const canvasHash = normalizedClientHash(fingerprint.canvas?.hash);
-    const webglHash = normalizedClientHash(fingerprint.webgl?.hash);
-    const rendererHash = normalizedClientHash(fingerprint.webgl?.renderer_hash) || webglHash;
-    const limitsHash = normalizedClientHash(fingerprint.webgl?.limits_hash);
-    if (!canvasHash && !rendererHash && !limitsHash) return null;
-
-    const width = boundedFingerprintNumber(screenInfo.width, 32768);
-    const height = boundedFingerprintNumber(screenInfo.height, 32768);
-    const shortSide = Math.min(width, height);
-    const longSide = Math.max(width, height);
-    const screenBucketValue = shortSide > 0 && longSide > 0
-        ? `${Math.round(shortSide / 50) * 50}x${Math.round(longSide / 50) * 50}`
-        : "";
-    const pixelRatio = boundedFingerprintNumber(screenInfo.pixel_ratio, 16, 3);
-    const colorDepth = boundedFingerprintNumber(screenInfo.color_depth, 64);
-    const dprDepthValue = colorDepth > 0 ? `${Math.round(pixelRatio * 4) / 4}|${colorDepth}` : "";
-    const coresBucket = fingerprintRangeBucket(hardware.cores, [1, 2, 4, 6, 8, 12, 16, 32, 64]);
-    const memoryBucket = fingerprintRangeBucket(hardware.memory_gb, [1, 2, 4, 8, 16, 32, 64]);
-    const hardwareValue = coresBucket || memoryBucket ? `${coresBucket}|${memoryBucket}` : "";
-    const touchNumber = Number(hardware.touch_points);
-    const touchValue = Number.isFinite(touchNumber) ? (touchNumber > 0 ? "touch" : "no-touch") : "";
-    const osValue = normalizedFingerprintText(deviceOs || clientData.platform || "", 32);
-    const timezoneValue = normalizedFingerprintText(clientData.timezone, 64);
-    const languageValue = normalizedFingerprintText(clientData.language, 32).split("-")[0];
-
-    const [osHash, screenHash, dprDepthHash, hardwareHash, touchHash, timezoneHash, languageHash] = await Promise.all([
-        fingerprintFeatureHash("os", osValue),
-        fingerprintFeatureHash("screen", screenBucketValue),
-        fingerprintFeatureHash("dpr-depth", dprDepthValue),
-        fingerprintFeatureHash("hardware", hardwareValue),
-        fingerprintFeatureHash("touch", touchValue),
-        fingerprintFeatureHash("timezone", timezoneValue),
-        fingerprintFeatureHash("language", languageValue),
-    ]);
-    const profileHash = (await sha256Hex(JSON.stringify([
-        DEVICE_FINGERPRINT_PROFILE_VERSION,
-        canvasHash,
-        rendererHash,
-        limitsHash,
-        osHash,
-        screenHash,
-        dprDepthHash,
-        hardwareHash,
-        touchHash,
-        timezoneHash,
-        languageHash,
-    ]))).slice(0, 32);
-    const stableHash = osHash && rendererHash && (limitsHash || hardwareHash)
-        ? (await sha256Hex(JSON.stringify([DEVICE_FINGERPRINT_PROFILE_VERSION, "stable", osHash, rendererHash, limitsHash, hardwareHash]))).slice(0, 32)
-        : "";
-    let featureMask = 0;
-    if (canvasHash) featureMask |= 1;
-    if (rendererHash) featureMask |= 2;
-    if (limitsHash) featureMask |= 4;
-    if (osHash) featureMask |= 8;
-    if (screenHash) featureMask |= 16;
-    if (dprDepthHash) featureMask |= 32;
-    if (hardwareHash) featureMask |= 64;
-    if (touchHash) featureMask |= 128;
-    if (timezoneHash) featureMask |= 256;
-    if (languageHash) featureMask |= 512;
-    return {
-        profileHash,
-        webrtcIpv4Hash: normalizedClientHash(webrtcIdentity.ipv4Hash),
-        webrtcIpv4Hash2: normalizedClientHash(webrtcIdentity.ipv4Hash2),
-        webrtcIpv6Hash: normalizedClientHash(webrtcIdentity.ipv6Hash),
-        webrtcIpv6Hash2: normalizedClientHash(webrtcIdentity.ipv6Hash2),
-        stableHash,
-        canvasHash,
-        rendererHash,
-        limitsHash,
-        osHash,
-        screenHash,
-        dprDepthHash,
-        hardwareHash,
-        touchHash,
-        timezoneHash,
-        languageHash,
-        featureMask,
-    };
-}
-
-export function scoreFingerprintSimilarity(current, candidate) {
-    const fields = [
-        ["rendererHash", 24, "WebGL 显卡", true],
-        ["limitsHash", 14, "WebGL 能力", true],
-        ["canvasHash", 18, "Canvas", true],
-        ["osHash", 10, "设备系统", false],
-        ["screenHash", 8, "屏幕尺寸", false],
-        ["dprDepthHash", 5, "像素比例/色深", false],
-        ["hardwareHash", 10, "CPU/内存", false],
-        ["touchHash", 3, "触控能力", false],
-        ["timezoneHash", 5, "时区", false],
-        ["languageHash", 3, "语言", false],
-    ];
-    let score = 0;
-    let strongMatches = 0;
-    const matchedFields = [];
-    const matchedKeys = new Set();
-    for (const [key, weight, label, strong] of fields) {
-        if (current?.[key] && candidate?.[key] && current[key] === candidate[key]) {
-            score += weight;
-            matchedFields.push(label);
-            matchedKeys.add(key);
-            if (strong) strongMatches += 1;
-        }
+async function dnsTxtLookup(name, timeoutMs = 1200) {
+    if (!name) return [];
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=TXT`, {
+            headers: { Accept: "application/dns-json" },
+            signal: controller.signal,
+        });
+        if (!response.ok) return [];
+        const body = await response.json();
+        return (Array.isArray(body.Answer) ? body.Answer : []).map((item) => String(item?.data || "")).filter(Boolean);
+    } catch {
+        return [];
+    } finally {
+        clearTimeout(timer);
     }
-    const exactProfile = Boolean(current?.profileHash && candidate?.profileHash && current.profileHash === candidate.profileHash);
-    if (exactProfile) score = 100;
-    const currentIpv4Hashes = [current?.webrtcIpv4Hash, current?.webrtcIpv4Hash2].filter(Boolean);
-    const candidateIpv4Hashes = new Set([candidate?.webrtcIpv4Hash, candidate?.webrtcIpv4Hash2].filter(Boolean));
-    const currentIpv6Hashes = [current?.webrtcIpv6Hash, current?.webrtcIpv6Hash2].filter(Boolean);
-    const candidateIpv6Hashes = new Set([candidate?.webrtcIpv6Hash, candidate?.webrtcIpv6Hash2].filter(Boolean));
-    const webrtcIpv4Exact = currentIpv4Hashes.some((hash) => candidateIpv4Hashes.has(hash));
-    const webrtcIpv6Exact = currentIpv6Hashes.some((hash) => candidateIpv6Hashes.has(hash));
-    const webrtcExact = webrtcIpv4Exact || webrtcIpv6Exact;
-    const highConfidence = (
-        score >= FINGERPRINT_SIMILARITY_THRESHOLD
-        && strongMatches >= 2
-        && matchedKeys.has("osHash")
-        && (matchedKeys.has("rendererHash") || matchedKeys.has("canvasHash"))
-    );
+}
+
+async function lookupWebRtcNetworkMetadata(ip) {
+    const normalized = cleanIp(ip);
+    if (!normalized || !isPublicWebRtcIp(normalized)) return { ip: normalized, asn: "", isp: "" };
+    const cache = globalThis.caches?.default;
+    const cacheRequest = new Request(`https://fingerprint-network-cache.invalid/ip/${encodeURIComponent(normalized)}`);
+    try {
+        const cached = cache ? await cache.match(cacheRequest) : null;
+        if (cached) return cached.json();
+    } catch {}
+    const origin = parseCymruTxt((await dnsTxtLookup(cymruOriginHost(normalized)))[0] || "");
+    const asn = String(origin[0] || "").replace(/^AS/i, "");
+    let isp = "";
+    if (asn) {
+        const details = parseCymruTxt((await dnsTxtLookup(`AS${asn}.asn.cymru.com`))[0] || "");
+        isp = String(details[4] || "");
+    }
+    const result = { ip: normalized, asn, isp };
+    try {
+        if (cache) {
+            await cache.put(cacheRequest, new Response(JSON.stringify(result), {
+                headers: { "content-type": "application/json", "cache-control": `public, max-age=${asn ? 2592000 : 21600}` },
+            }));
+        }
+    } catch {}
+    return result;
+}
+
+async function fingerprintNetworkMetadata(request, network, cfInfo) {
+    const httpIp = visitorIp(request);
+    const primaryWebRtc = [...new Set([network.webrtc_ipv4, network.webrtc_ipv6].filter(Boolean))].slice(0, 2);
+    const webrtc = await Promise.all(primaryWebRtc.map(async (ip) => {
+        if (cleanIp(ip) === cleanIp(httpIp)) return { ip: cleanIp(ip), asn: String(cfInfo.asn || ""), isp: String(cfInfo.asOrganization || "") };
+        return lookupWebRtcNetworkMetadata(ip);
+    }));
     return {
-        score: Math.min(100, score),
-        exactProfile,
-        webrtcExact,
-        webrtcIpv4Exact,
-        webrtcIpv6Exact,
-        highConfidence,
-        strongMatches,
-        matchedFields: exactProfile && !matchedFields.length ? ["完整指纹"] : matchedFields,
+        http: { ip: httpIp, asn: String(cfInfo.asn || ""), isp: String(cfInfo.asOrganization || "") },
+        webrtc,
     };
-}
-
-function fingerprintMatchIsActionable(evidence) {
-    return Boolean(evidence?.webrtcExact || evidence?.highConfidence);
-}
-
-function fingerprintMatchIsDisplayable(evidence) {
-    return Boolean(evidence?.webrtcExact || evidence?.exactProfile || evidence?.highConfidence);
-}
-
-function fingerprintProfileFromRow(row = {}) {
-    return {
-        profileHash: String(row.profile_hash || ""),
-        webrtcIpv4Hash: String(row.webrtc_ipv4_hash || ""),
-        webrtcIpv4Hash2: String(row.webrtc_ipv4_hash2 || ""),
-        webrtcIpv6Hash: String(row.webrtc_ipv6_hash || ""),
-        webrtcIpv6Hash2: String(row.webrtc_ipv6_hash2 || ""),
-        stableHash: String(row.stable_hash || ""),
-        canvasHash: String(row.canvas_hash || ""),
-        rendererHash: String(row.renderer_hash || ""),
-        limitsHash: String(row.limits_hash || ""),
-        osHash: String(row.os_hash || ""),
-        screenHash: String(row.screen_hash || ""),
-        dprDepthHash: String(row.dpr_depth_hash || ""),
-        hardwareHash: String(row.hardware_hash || ""),
-        touchHash: String(row.touch_hash || ""),
-        timezoneHash: String(row.timezone_hash || ""),
-        languageHash: String(row.language_hash || ""),
-        featureMask: Number(row.feature_mask || 0),
-    };
-}
-
-export async function buildFingerprintConfirmationToken(env, values = {}) {
-    if (!env.PANEL_SECRET || !values.targetProfile?.profileHash || !values.candidateProfile?.profileHash || !values.labelId) return "";
-    const payload = JSON.stringify([
-        "tg-dualbot-fp-confirm-v1",
-        Number(values.userId),
-        Number(values.targetSlot),
-        values.targetProfile.profileHash,
-        values.targetProfile.webrtcIpv4Hash || "",
-        values.targetProfile.webrtcIpv4Hash2 || "",
-        values.targetProfile.webrtcIpv6Hash || "",
-        values.targetProfile.webrtcIpv6Hash2 || "",
-        Number(values.candidateUserId),
-        Number(values.candidateSlot),
-        values.candidateProfile.profileHash,
-        values.candidateProfile.webrtcIpv4Hash || "",
-        values.candidateProfile.webrtcIpv4Hash2 || "",
-        values.candidateProfile.webrtcIpv6Hash || "",
-        values.candidateProfile.webrtcIpv6Hash2 || "",
-        Number(values.labelId),
-        Number(values.targetConfirmedLabelId || 0),
-        String(values.targetConfirmedAt || ""),
-    ]);
-    return (await hmacSha256Hex(env.PANEL_SECRET, payload)).slice(0, 12);
 }
 
 function normalizeIpv6Address(value) {
@@ -681,19 +512,331 @@ async function sendWebRtcIdentityLabels(env, query, userId) {
     await sendCallbackContextMessage(env, query, lines.join("\n"), replyMarkup);
 }
 
+function fingerprintProfileColumns(prefix = "") {
+    const p = prefix ? `${prefix}.` : "";
+    return [
+        "algorithm_version", "exact_hash", "device_simhash", "device_feature_mask", "font_bits", "font_minhash",
+        "device_vector", "device_vector_mask", "canvas_key", "webgl_key", "audio_key", "webrtc_keys",
+        "webrtc_asn_keys", "webrtc_isp_keys", "http_key", "http_asn_key", "http_isp_key", "quality_score", "summary_json",
+    ].map((column) => `${p}${column}`).join(", ");
+}
+
+function fingerprintProfileBindings(profile) {
+    const values = fingerprintProfileDatabaseValues(profile);
+    return [
+        values.algorithm_version, values.exact_hash, values.device_simhash, values.device_feature_mask,
+        values.font_bits, values.font_minhash, values.device_vector, values.device_vector_mask,
+        values.canvas_key, values.webgl_key, values.audio_key, values.webrtc_keys,
+        values.webrtc_asn_keys, values.webrtc_isp_keys, values.http_key, values.http_asn_key,
+        values.http_isp_key, values.quality_score, values.summary_json,
+    ];
+}
+
+async function latestFingerprintProfile(env, userId) {
+    const row = await env.DB.prepare(
+        `SELECT user_id, slot, ${fingerprintProfileColumns()}, seen_count, first_seen_at, last_seen_at ` +
+        "FROM fingerprint_profiles_v2 WHERE user_id=? ORDER BY last_seen_at DESC LIMIT 1",
+    ).bind(Number(userId)).first();
+    return row ? { row, profile: profileFromDatabaseRow(row) } : null;
+}
+
+async function saveRollingFingerprintProfile(env, userId, profile) {
+    const exact = await env.DB.prepare(
+        "SELECT slot FROM fingerprint_profiles_v2 WHERE user_id=? AND exact_hash=? LIMIT 1",
+    ).bind(Number(userId), profile.exactHash).first();
+    const ts = nowIso();
+    if (exact) {
+        await env.DB.prepare(
+            "UPDATE fingerprint_profiles_v2 SET seen_count=seen_count+1, last_seen_at=?, quality_score=?, summary_json=? WHERE user_id=? AND slot=?",
+        ).bind(ts, Number(profile.qualityScore || 0), JSON.stringify(profile.summary || {}), Number(userId), Number(exact.slot)).run();
+        return latestFingerprintProfile(env, userId);
+    }
+    const slots = await env.DB.prepare(
+        "SELECT slot, last_seen_at FROM fingerprint_profiles_v2 WHERE user_id=? ORDER BY last_seen_at ASC",
+    ).bind(Number(userId)).all();
+    const rows = slots.results || [];
+    const used = new Set(rows.map((row) => Number(row.slot)));
+    let slot = 0;
+    for (let candidate = 1; candidate <= MAX_FINGERPRINT_PROFILES_PER_USER; candidate += 1) {
+        if (!used.has(candidate)) { slot = candidate; break; }
+    }
+    if (!slot) slot = Number(rows[0]?.slot || 1);
+    const columns = fingerprintProfileColumns().split(", ");
+    const placeholders = columns.map(() => "?").join(",");
+    const updates = columns.map((column) => `${column}=excluded.${column}`).join(",");
+    await env.DB.prepare(
+        `INSERT INTO fingerprint_profiles_v2(user_id,slot,${columns.join(",")},seen_count,first_seen_at,last_seen_at) ` +
+        `VALUES(?,?,${placeholders},1,?,?) ON CONFLICT(user_id,slot) DO UPDATE SET ${updates},seen_count=1,first_seen_at=excluded.first_seen_at,last_seen_at=excluded.last_seen_at`,
+    ).bind(Number(userId), slot, ...fingerprintProfileBindings(profile), ts, ts).run();
+    return latestFingerprintProfile(env, userId);
+}
+
+async function getFingerprintLabelById(env, labelId) {
+    return env.DB.prepare("SELECT * FROM fingerprint_labels_v2 WHERE id=? AND active=1")
+        .bind(Number(labelId)).first();
+}
+
+async function getFingerprintReferenceById(env, referenceId) {
+    return env.DB.prepare(
+        `SELECT r.*, l.label_name, l.note, l.state, l.active FROM fingerprint_reference_profiles_v2 r ` +
+        "JOIN fingerprint_labels_v2 l ON l.id=r.label_id WHERE r.id=? AND l.active=1",
+    ).bind(Number(referenceId)).first();
+}
+
+async function ensureFingerprintReferenceLookups(env, referenceId, profile) {
+    const entries = fingerprintLookupEntries(profile).slice(0, 14);
+    if (!entries.length) return;
+    await env.DB.batch(entries.map((entry) => env.DB.prepare(
+        "INSERT OR IGNORE INTO fingerprint_reference_lookup_v2(kind,band,lookup_key,reference_id) VALUES(?,?,?,?)",
+    ).bind(entry.kind, entry.band, entry.key, Number(referenceId))));
+}
+
+async function insertFingerprintReference(env, label, sourceUserId, sourceSlot, profile, adminId) {
+    if (Number(profile?.qualityScore || 0) < FINGERPRINT_MIN_EXACT_QUALITY || !profile?.httpKey) {
+        throw new Error("当前指纹质量或HTTP信息不足，不能保存为参考锚点。");
+    }
+    const existing = await env.DB.prepare(
+        "SELECT id FROM fingerprint_reference_profiles_v2 WHERE label_id=? AND exact_hash=? LIMIT 1",
+    ).bind(Number(label.id), profile.exactHash).first();
+    if (existing) {
+        await ensureFingerprintReferenceLookups(env, Number(existing.id), profile);
+        return getFingerprintReferenceById(env, Number(existing.id));
+    }
+    const columns = fingerprintProfileColumns().split(", ");
+    const placeholders = columns.map(() => "?").join(",");
+    const ts = nowIso();
+    const insertSql = "INSERT INTO fingerprint_reference_profiles_v2(label_id,source_user_id,source_slot," +
+        columns.join(",") + ",created_by_user_id,created_at,last_matched_at,match_count) SELECT ?,?,?," +
+        placeholders + ",?,?,NULL,0 WHERE " +
+        "(SELECT COUNT(*) FROM fingerprint_reference_profiles_v2 WHERE label_id=?) < ? AND " +
+        "NOT EXISTS (SELECT 1 FROM fingerprint_reference_profiles_v2 WHERE label_id=? AND exact_hash=?)";
+    const result = await env.DB.prepare(insertSql).bind(
+        Number(label.id), Number(sourceUserId), Number(sourceSlot), ...fingerprintProfileBindings(profile), Number(adminId), ts,
+        Number(label.id), MAX_FINGERPRINT_REFERENCES_PER_LABEL, Number(label.id), profile.exactHash,
+    ).run();
+    let referenceId = Number(result.meta?.changes || 0) > 0 ? Number(result.meta?.last_row_id || 0) : 0;
+    if (!referenceId) {
+        const row = await env.DB.prepare(
+            "SELECT id FROM fingerprint_reference_profiles_v2 WHERE label_id=? AND exact_hash=? LIMIT 1",
+        ).bind(Number(label.id), profile.exactHash).first();
+        referenceId = Number(row?.id || 0);
+    }
+    if (!referenceId) throw new Error(`该标签最多保存 ${MAX_FINGERPRINT_REFERENCES_PER_LABEL} 个已确认指纹，请先删除旧标签或建立新标签。`);
+    await ensureFingerprintReferenceLookups(env, referenceId, profile);
+    return getFingerprintReferenceById(env, referenceId);
+}
+
+async function upsertFingerprintUserLabel(env, userId, labelId, referenceId, adminId, match) {
+    await env.DB.prepare(
+        "INSERT INTO fingerprint_user_labels_v2(user_id,label_id,reference_id,confirmed_by_user_id,match_method,weighted_score,evidence_mask,confirmed_at) " +
+        "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET label_id=excluded.label_id,reference_id=excluded.reference_id," +
+        "confirmed_by_user_id=excluded.confirmed_by_user_id,match_method=excluded.match_method,weighted_score=excluded.weighted_score," +
+        "evidence_mask=excluded.evidence_mask,confirmed_at=excluded.confirmed_at",
+    ).bind(
+        Number(userId), Number(labelId), Number(referenceId || 0) || null, Number(adminId),
+        match?.exact ? "exact" : match?.webrtcIpExact ? "webrtc" : "similarity",
+        Number(match?.score || 100), Number(match?.evidenceMask || 0), nowIso(),
+    ).run();
+}
+
+async function fingerprintReferenceRows(env, referenceIds) {
+    const ids = [...new Set(referenceIds.map(Number).filter((value) => Number.isFinite(value) && value > 0))].slice(0, MAX_FINGERPRINT_CANDIDATES);
+    if (!ids.length) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    const result = await env.DB.prepare(
+        `SELECT r.*, l.label_name, l.note, l.state, l.source_user_id AS label_source_user_id ` +
+        `FROM fingerprint_reference_profiles_v2 r JOIN fingerprint_labels_v2 l ON l.id=r.label_id ` +
+        `WHERE r.id IN (${placeholders}) AND l.active=1 LIMIT ${MAX_FINGERPRINT_CANDIDATES}`,
+    ).bind(...ids).all();
+    return result.results || [];
+}
+
+async function findFingerprintMatches(env, currentProfile) {
+    if (!currentProfile?.exactHash) return [];
+    const exactRows = await env.DB.prepare(
+        "SELECT reference_id FROM fingerprint_reference_lookup_v2 WHERE kind=0 AND band=0 AND lookup_key=? " +
+        "ORDER BY reference_id DESC LIMIT " + MAX_FINGERPRINT_CANDIDATES,
+    ).bind(currentProfile.exactHash).all();
+    let referenceIds = (exactRows.results || []).map((row) => Number(row.reference_id)).filter((id) => id > 0);
+    if (!referenceIds.length) {
+        const entries = fingerprintLookupEntries(currentProfile).slice(0, 14);
+        const ordered = [
+            ...entries.filter((entry) => entry.kind === 1),
+            ...entries.filter((entry) => entry.kind === 3),
+            ...entries.filter((entry) => entry.kind === 4),
+            ...entries.filter((entry) => entry.kind === 2),
+        ];
+        const statements = ordered.map((entry) => {
+            const limit = entry.kind === 1 ? MAX_FINGERPRINT_CANDIDATES : entry.kind === 3 ? 6 : 4;
+            return env.DB.prepare(
+                "SELECT reference_id FROM fingerprint_reference_lookup_v2 WHERE kind=? AND band=? AND lookup_key=? " +
+                "ORDER BY reference_id DESC LIMIT " + limit,
+            ).bind(entry.kind, entry.band, entry.key);
+        });
+        const results = statements.length ? await env.DB.batch(statements) : [];
+        const seen = new Set();
+        referenceIds = [];
+        for (const result of results) {
+            for (const row of (result.results || [])) {
+                const id = Number(row.reference_id);
+                if (!id || seen.has(id)) continue;
+                seen.add(id);
+                referenceIds.push(id);
+                if (referenceIds.length >= MAX_FINGERPRINT_CANDIDATES) break;
+            }
+            if (referenceIds.length >= MAX_FINGERPRINT_CANDIDATES) break;
+        }
+    }
+    const rows = await fingerprintReferenceRows(env, referenceIds);
+    const bestByLabel = new Map();
+    for (const row of rows) {
+        const match = scoreFingerprintProfiles(currentProfile, profileFromDatabaseRow(row));
+        if (!match.qualifies) continue;
+        const candidate = { ...match, referenceId: Number(row.id), labelId: Number(row.label_id), labelName: row.label_name, note: row.note, state: row.state, sourceUserId: Number(row.label_source_user_id || row.source_user_id) };
+        const previous = bestByLabel.get(candidate.labelId);
+        if (!previous || candidate.score > previous.score) bestByLabel.set(candidate.labelId, candidate);
+    }
+    return [...bestByLabel.values()].sort((left, right) => {
+        const stateOrder = Number(right.state === "blacklist") - Number(left.state === "blacklist");
+        return stateOrder || right.score - left.score || right.referenceId - left.referenceId;
+    }).slice(0, 5);
+}
+
+async function markFingerprintLabel(env, userId, adminId, expectedPrefix = "") {
+    const [user, latest] = await Promise.all([getUser(env, Number(userId)), latestFingerprintProfile(env, Number(userId))]);
+    if (!user) return { error: "找不到用户。" };
+    if (!latest?.profile?.exactHash) return { error: "该用户没有可标记的指纹，请先重新验证。" };
+    if (Number(latest.profile.qualityScore || 0) < FINGERPRINT_MIN_EXACT_QUALITY || !latest.profile.httpKey) return { error: "当前指纹质量或HTTP信息不足，不能建立参考档案；请让用户在信息采集更完整的环境重新验证。" };
+    if (expectedPrefix && !latest.profile.exactHash.startsWith(String(expectedPrefix))) return { error: "用户指纹已经变化，请使用最新验证通知重新标记。" };
+    const labelName = String(user.note || "").trim().slice(0, 80);
+    if (!labelName) return { error: "请先使用 /note 或后台备注设置标签，再标记指纹。" };
+    let label = await env.DB.prepare(
+        "SELECT * FROM fingerprint_labels_v2 WHERE source_user_id=? AND label_name=? AND active=1 ORDER BY updated_at DESC LIMIT 1",
+    ).bind(Number(userId), labelName).first();
+    if (!label) {
+        const ts = nowIso();
+        const insert = await env.DB.prepare(
+            "INSERT INTO fingerprint_labels_v2(label_name,note,state,active,source_user_id,created_by_user_id,created_at,updated_at) " +
+            "SELECT ?,?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM fingerprint_labels_v2 WHERE source_user_id=? AND active=1) < ? " +
+            "AND NOT EXISTS (SELECT 1 FROM fingerprint_labels_v2 WHERE source_user_id=? AND label_name=? AND active=1)",
+        ).bind(
+            labelName, "", user.blocked ? "blacklist" : "watch", 1, Number(userId), Number(adminId), ts, ts,
+            Number(userId), MAX_FINGERPRINT_LABELS_PER_USER, Number(userId), labelName,
+        ).run();
+        if (Number(insert.meta?.changes || 0) > 0) label = await getFingerprintLabelById(env, Number(insert.meta?.last_row_id || 0));
+        if (!label) {
+            label = await env.DB.prepare(
+                "SELECT * FROM fingerprint_labels_v2 WHERE source_user_id=? AND label_name=? AND active=1 ORDER BY updated_at DESC LIMIT 1",
+            ).bind(Number(userId), labelName).first();
+        }
+        if (!label) return { error: `该用户最多保存 ${MAX_FINGERPRINT_LABELS_PER_USER} 个指纹标签。` };
+    }
+    if (!label) return { error: "指纹标签保存失败。" };
+    try {
+        const reference = await insertFingerprintReference(env, label, userId, latest.row.slot, latest.profile, adminId);
+        await upsertFingerprintUserLabel(env, userId, label.id, reference.id, adminId, { exact: true, score: 100, evidenceMask: 1 });
+        return { label, reference, latest };
+    } catch (error) {
+        return { error: String(error?.message || error) };
+    }
+}
+
+async function confirmFingerprintMatch(env, userId, labelId, adminId, expectedPrefix = "") {
+    const [latest, label] = await Promise.all([latestFingerprintProfile(env, Number(userId)), getFingerprintLabelById(env, Number(labelId))]);
+    if (!latest?.profile) return { error: "用户没有当前指纹，请先重新验证。" };
+    if (!label) return { error: "指纹标签已经不存在。" };
+    if (expectedPrefix && !latest.profile.exactHash.startsWith(String(expectedPrefix))) return { error: "用户指纹已经变化，不能使用旧通知确认。" };
+    const refs = await env.DB.prepare(
+        "SELECT * FROM fingerprint_reference_profiles_v2 WHERE label_id=? ORDER BY created_at DESC LIMIT 12",
+    ).bind(Number(labelId)).all();
+    let best = null;
+    for (const row of (refs.results || [])) {
+        const match = scoreFingerprintProfiles(latest.profile, profileFromDatabaseRow(row));
+        if (!best || match.score > best.match.score) best = { row, match };
+    }
+    if (!best?.match?.qualifies) return { error: "当前指纹与该标签未达到候选门槛，不能确认。" };
+    try {
+        const reference = Number(latest.profile.qualityScore || 0) >= FINGERPRINT_MIN_EXACT_QUALITY && latest.profile.httpKey
+            ? await insertFingerprintReference(env, label, userId, latest.row.slot, latest.profile, adminId)
+            : best.row;
+        await upsertFingerprintUserLabel(env, userId, labelId, reference.id, adminId, best.match);
+        return { label, reference, match: best.match, latest };
+    } catch (error) {
+        return { error: String(error?.message || error) };
+    }
+}
+
+async function deleteFingerprintLabel(env, labelId) {
+    const label = await env.DB.prepare("SELECT * FROM fingerprint_labels_v2 WHERE id=?").bind(Number(labelId)).first();
+    if (!label) return null;
+    await env.DB.batch([
+        env.DB.prepare("DELETE FROM fingerprint_reference_lookup_v2 WHERE reference_id IN (SELECT id FROM fingerprint_reference_profiles_v2 WHERE label_id=?)").bind(Number(labelId)),
+        env.DB.prepare("DELETE FROM fingerprint_user_labels_v2 WHERE label_id=?").bind(Number(labelId)),
+        env.DB.prepare("DELETE FROM fingerprint_reference_profiles_v2 WHERE label_id=?").bind(Number(labelId)),
+        env.DB.prepare("DELETE FROM fingerprint_labels_v2 WHERE id=?").bind(Number(labelId)),
+    ]);
+    return label;
+}
+
+async function sendFingerprintLabels(env, query, userId) {
+    const [user, labels, confirmed] = await Promise.all([
+        getUserWithIdentity(env, Number(userId)),
+        env.DB.prepare(
+            "SELECT l.id,l.label_name,l.note,l.state,l.updated_at,COUNT(r.id) AS reference_count " +
+            "FROM fingerprint_labels_v2 l LEFT JOIN fingerprint_reference_profiles_v2 r ON r.label_id=l.id " +
+            "WHERE l.source_user_id=? AND l.active=1 GROUP BY l.id ORDER BY l.updated_at DESC LIMIT 10",
+        ).bind(Number(userId)).all(),
+        env.DB.prepare(
+            "SELECT l.id,l.label_name,l.state,ul.weighted_score,ul.confirmed_at FROM fingerprint_user_labels_v2 ul " +
+            "JOIN fingerprint_labels_v2 l ON l.id=ul.label_id WHERE ul.user_id=? LIMIT 1",
+        ).bind(Number(userId)).first(),
+    ]);
+    if (!user) {
+        await sendCallbackContextMessage(env, query, "找不到用户。");
+        return;
+    }
+    const rows = labels.results || [];
+    const lines = [
+        "指纹标签 V2",
+        "用户 ID：" + user.user_id,
+        "当前人工确认：" + (confirmed ? `${confirmed.label_name}（${confirmed.weighted_score}%）` : "无"),
+        "直接标记数量：" + rows.length,
+    ];
+    for (const row of rows) {
+        lines.push(
+            "",
+            `#${row.id} ${row.label_name}`,
+            "状态：" + (row.state === "blacklist" ? "指纹黑名单" : "观察标签"),
+            "参考档案：" + Number(row.reference_count || 0),
+            "更新时间：" + row.updated_at,
+        );
+    }
+    const replyMarkup = rows.length ? {
+        inline_keyboard: rows.map((row) => [{
+            text: `删除 #${row.id} ${String(row.label_name || "").slice(0, 20)}`,
+            callback_data: `fpdelete:${row.id}`,
+        }]),
+    } : null;
+    await sendCallbackContextMessage(env, query, lines.join("\n"), replyMarkup);
+}
+
+function fingerprintMatchText(matches = []) {
+    if (!matches.length) return "";
+    const lines = ["指纹候选（仅供人工确认）"];
+    for (const match of matches.slice(0, 5)) {
+        const state = match.state === "blacklist" ? "指纹黑名单" : "观察标签";
+        lines.push(
+            `- ${match.labelName}：${match.score}%（${state}）`,
+            `  总分/网络/设备：${match.weightedScore}% / ${match.networkScore}% / ${match.deviceScore}%`,
+            `  依据：${match.evidence?.join("、") || "稀疏特征相似"}`,
+        );
+    }
+    return lines.join("\n");
+}
+
 function clientDataForVerificationStorage(clientData = {}, network = {}) {
-    const screenInfo = clientData?.screen && typeof clientData.screen === "object" ? clientData.screen : {};
     const probe = clientData?.probe && typeof clientData.probe === "object" ? clientData.probe : {};
     return {
-        language: String(clientData.language || "").slice(0, 32),
-        platform: String(clientData.platform || "").slice(0, 80),
-        user_agent: String(clientData.user_agent || "").slice(0, 500),
-        timezone: String(clientData.timezone || "").slice(0, 64),
-        screen: {
-            width: Number(screenInfo.width) || 0,
-            height: Number(screenInfo.height) || 0,
-            pixel_ratio: Number(screenInfo.pixel_ratio) || 1,
-        },
         probe: {
             http_ip_version: String(probe.http_ip_version || "").slice(0, 16),
             country: String(probe.country || "").slice(0, 16),
@@ -723,275 +866,6 @@ async function getIdentityLabelForUser(env, userId) {
         "WHERE c.user_id IS NOT NULL OR l.source_user_id=? " +
         "ORDER BY CASE WHEN c.user_id IS NULL THEN 1 ELSE 0 END, l.updated_at DESC LIMIT 1",
     ).bind(Number(userId), Number(userId)).first();
-}
-
-async function getIdentityConfirmationState(env, userId) {
-    const row = await env.DB.prepare("SELECT label_id, confirmed_at FROM webrtc_identity_confirmations WHERE user_id=?")
-        .bind(Number(userId))
-        .first();
-    return {
-        labelId: Number(row?.label_id || 0),
-        confirmedAt: String(row?.confirmed_at || ""),
-    };
-}
-
-async function upsertFingerprintProfile(env, userId, profile) {
-    if (!profile?.profileHash) return 0;
-    const slots = Array.from({ length: MAX_FINGERPRINT_PROFILES_PER_USER }, (_, index) => `(${index + 1})`).join(",");
-    const ts = nowIso();
-    await env.DB.prepare(`WITH slots(slot) AS (VALUES${slots}),
-chosen AS (
-    SELECT s.slot
-    FROM slots s
-    LEFT JOIN device_fingerprint_profiles p ON p.user_id=? AND p.slot=s.slot
-    ORDER BY CASE
-        WHEN p.profile_hash=? THEN 0
-        WHEN p.user_id IS NULL THEN 1
-        ELSE 2
-    END, p.last_seen_at ASC, s.slot ASC
-    LIMIT 1
-)
-INSERT INTO device_fingerprint_profiles(
-    user_id, slot, profile_hash, webrtc_ipv4_hash, webrtc_ipv4_hash2, webrtc_ipv6_hash, webrtc_ipv6_hash2, stable_hash, canvas_hash, renderer_hash, limits_hash,
-    os_hash, screen_hash, dpr_depth_hash, hardware_hash, touch_hash, timezone_hash, language_hash,
-    feature_mask, seen_count, first_seen_at, last_seen_at
-)
-SELECT ?, slot, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ? FROM chosen WHERE 1
-ON CONFLICT(user_id, slot) DO UPDATE SET
-    first_seen_at=CASE WHEN device_fingerprint_profiles.profile_hash=excluded.profile_hash THEN device_fingerprint_profiles.first_seen_at ELSE excluded.first_seen_at END,
-    seen_count=CASE WHEN device_fingerprint_profiles.profile_hash=excluded.profile_hash THEN MIN(device_fingerprint_profiles.seen_count+1, 2147483647) ELSE 1 END,
-    profile_hash=excluded.profile_hash,
-    webrtc_ipv4_hash=excluded.webrtc_ipv4_hash,
-    webrtc_ipv4_hash2=excluded.webrtc_ipv4_hash2,
-    webrtc_ipv6_hash=excluded.webrtc_ipv6_hash,
-    webrtc_ipv6_hash2=excluded.webrtc_ipv6_hash2,
-    stable_hash=excluded.stable_hash,
-    canvas_hash=excluded.canvas_hash,
-    renderer_hash=excluded.renderer_hash,
-    limits_hash=excluded.limits_hash,
-    os_hash=excluded.os_hash,
-    screen_hash=excluded.screen_hash,
-    dpr_depth_hash=excluded.dpr_depth_hash,
-    hardware_hash=excluded.hardware_hash,
-    touch_hash=excluded.touch_hash,
-    timezone_hash=excluded.timezone_hash,
-    language_hash=excluded.language_hash,
-    feature_mask=excluded.feature_mask,
-    last_seen_at=excluded.last_seen_at`)
-        .bind(
-            Number(userId), profile.profileHash,
-            Number(userId), profile.profileHash, profile.webrtcIpv4Hash, profile.webrtcIpv4Hash2, profile.webrtcIpv6Hash, profile.webrtcIpv6Hash2, profile.stableHash, profile.canvasHash,
-            profile.rendererHash, profile.limitsHash, profile.osHash, profile.screenHash, profile.dprDepthHash,
-            profile.hardwareHash, profile.touchHash, profile.timezoneHash, profile.languageHash,
-            Number(profile.featureMask || 0), ts, ts,
-        )
-        .run();
-    const row = await env.DB.prepare("SELECT slot FROM device_fingerprint_profiles WHERE user_id=? AND profile_hash=? LIMIT 1")
-        .bind(Number(userId), profile.profileHash)
-        .first();
-    return Number(row?.slot || 0);
-}
-
-function fingerprintCandidateSql(column) {
-    return `SELECT p.*, u.username, u.full_name, u.note
-FROM device_fingerprint_profiles p
-JOIN users u ON u.user_id=p.user_id
-WHERE p.user_id<>? AND p.${column}=? AND p.${column}<>''
-ORDER BY p.last_seen_at DESC
-LIMIT ${FINGERPRINT_CANDIDATE_LIMIT}`;
-}
-
-function fingerprintWebRtcCandidateSql(column) {
-    return `SELECT p.*, u.username, u.full_name, u.note
-FROM device_fingerprint_profiles p
-JOIN users u ON u.user_id=p.user_id
-WHERE p.user_id<>? AND p.${column}=? AND p.${column}<>''
-ORDER BY p.last_seen_at DESC
-LIMIT ${FINGERPRINT_CANDIDATE_LIMIT}`;
-}
-
-async function findFingerprintSimilarityMatch(env, userId, profile, legacyFingerprint = "") {
-    if (!profile?.profileHash) return null;
-    const branches = [];
-    const addBranch = (column, value) => {
-        if (!value) return;
-        branches.push({
-            kind: column,
-            statement: env.DB.prepare(fingerprintCandidateSql(column)).bind(Number(userId), value),
-        });
-    };
-    addBranch("profile_hash", profile.profileHash);
-    const addWebRtcBranches = (version, firstHash, secondHash) => {
-        const prefix = version === "IPv4" ? "webrtc_ipv4" : "webrtc_ipv6";
-        const hashes = [...new Set([firstHash, secondHash].filter(Boolean))];
-        for (const hash of hashes) {
-            for (const column of [`${prefix}_hash`, `${prefix}_hash2`]) {
-                branches.push({
-                    kind: column,
-                    statement: env.DB.prepare(fingerprintWebRtcCandidateSql(column)).bind(Number(userId), hash),
-                });
-            }
-        }
-    };
-    addWebRtcBranches("IPv4", profile.webrtcIpv4Hash, profile.webrtcIpv4Hash2);
-    addWebRtcBranches("IPv6", profile.webrtcIpv6Hash, profile.webrtcIpv6Hash2);
-    addBranch("stable_hash", profile.stableHash);
-    addBranch("renderer_hash", profile.rendererHash);
-    addBranch("canvas_hash", profile.canvasHash);
-    if (legacyFingerprint) {
-        branches.push({
-            kind: "legacy",
-            statement: env.DB.prepare(`SELECT user_id, username, full_name, note, updated_at
-FROM users
-WHERE user_id<>? AND last_device_fingerprint=? AND last_device_fingerprint<>''
-ORDER BY updated_at DESC
-LIMIT ${FINGERPRINT_CANDIDATE_LIMIT}`).bind(Number(userId), legacyFingerprint),
-        });
-    }
-    if (!branches.length) return null;
-    const results = await env.DB.batch(branches.map((branch) => branch.statement));
-    const candidates = new Map();
-    const legacyRows = [];
-    for (let index = 0; index < results.length; index += 1) {
-        const rows = results[index]?.results || [];
-        if (branches[index].kind === "legacy") {
-            legacyRows.push(...rows);
-            continue;
-        }
-        for (const row of rows) {
-            const key = `${row.user_id}:${row.slot}`;
-            if (candidates.has(key)) continue;
-            const candidateProfile = fingerprintProfileFromRow(row);
-            const evidence = scoreFingerprintSimilarity(profile, candidateProfile);
-            if (!fingerprintMatchIsDisplayable(evidence)) continue;
-            candidates.set(key, {
-                userId: Number(row.user_id),
-                slot: Number(row.slot),
-                username: String(row.username || ""),
-                fullName: String(row.full_name || ""),
-                note: String(row.note || "").trim().slice(0, 200),
-                lastSeenAt: String(row.last_seen_at || ""),
-                profile: candidateProfile,
-                evidence,
-            });
-        }
-    }
-    const profileUsers = new Set([...candidates.values()].map((candidate) => candidate.userId));
-    for (const row of legacyRows) {
-        const candidateUserId = Number(row.user_id);
-        if (!candidateUserId || profileUsers.has(candidateUserId)) continue;
-        candidates.set(`legacy:${candidateUserId}`, {
-            userId: candidateUserId,
-            slot: 0,
-            username: String(row.username || ""),
-            fullName: String(row.full_name || ""),
-            note: String(row.note || "").trim().slice(0, 200),
-            lastSeenAt: String(row.updated_at || ""),
-            profile: null,
-            evidence: {
-                score: 100,
-                exactProfile: true,
-                webrtcExact: false,
-                highConfidence: false,
-                strongMatches: 0,
-                matchedFields: ["旧版完整指纹"],
-            },
-        });
-    }
-    const ranked = [...candidates.values()].sort((left, right) => {
-        const leftRank = left.evidence.webrtcExact ? 3 : left.evidence.highConfidence ? 2 : 1;
-        const rightRank = right.evidence.webrtcExact ? 3 : right.evidence.highConfidence ? 2 : 1;
-        if (leftRank !== rightRank) return rightRank - leftRank;
-        if (left.evidence.score !== right.evidence.score) return right.evidence.score - left.evidence.score;
-        return right.lastSeenAt.localeCompare(left.lastSeenAt);
-    });
-    const best = ranked[0];
-    if (!best) return null;
-    const label = await getIdentityLabelForUser(env, best.userId);
-    return {
-        ...best,
-        labelId: Number(label?.id || 0),
-        labelName: String(label?.label_name || best.note || "").slice(0, 80),
-        labelSourceUserId: Number(label?.source_user_id || 0),
-        canConfirm: Boolean(label?.id && best.slot && fingerprintMatchIsActionable(best.evidence)),
-    };
-}
-
-async function getFingerprintProfile(env, userId, slot) {
-    const row = await env.DB.prepare("SELECT * FROM device_fingerprint_profiles WHERE user_id=? AND slot=?")
-        .bind(Number(userId), Number(slot))
-        .first();
-    return row ? { row, profile: fingerprintProfileFromRow(row) } : null;
-}
-
-async function confirmFingerprintIdentity(env, userId, targetSlot, candidateUserId, candidateSlot, evidenceToken, adminId) {
-    if (Number(userId) === Number(candidateUserId)) return { error: "不能把用户与自己重复确认。" };
-    const [targetEntry, candidateEntry, user, label, confirmationState] = await Promise.all([
-        getFingerprintProfile(env, userId, targetSlot),
-        getFingerprintProfile(env, candidateUserId, candidateSlot),
-        getUser(env, Number(userId)),
-        getIdentityLabelForUser(env, candidateUserId),
-        getIdentityConfirmationState(env, userId),
-    ]);
-    if (!user) return { error: "找不到用户。" };
-    if (!targetEntry || !candidateEntry) return { error: "指纹档案已更新，请使用最新验证通知重新判断。" };
-    if (!label) return { error: "匹配用户尚未建立人工标签，请先设置备注并标记其 WebRTC。" };
-    const evidence = scoreFingerprintSimilarity(targetEntry.profile, candidateEntry.profile);
-    if (!fingerprintMatchIsActionable(evidence)) {
-        return { error: "当前证据已不足，不能使用旧通知确认。" };
-    }
-    const expectedToken = await buildFingerprintConfirmationToken(env, {
-        userId,
-        targetSlot,
-        targetProfile: targetEntry.profile,
-        candidateUserId,
-        candidateSlot,
-        candidateProfile: candidateEntry.profile,
-        labelId: label.id,
-        targetConfirmedLabelId: confirmationState.labelId,
-        targetConfirmedAt: confirmationState.confirmedAt,
-    });
-    if (!expectedToken || !/^[0-9a-f]{12}$/.test(String(evidenceToken || "")) || !constantTimeEqual(expectedToken, evidenceToken)) {
-        return { error: "确认凭证或证据已变化，请使用最新验证通知。" };
-    }
-    const ts = nowIso();
-    const result = await env.DB.prepare(`INSERT INTO webrtc_identity_confirmations(user_id, label_id, confirmed_by_user_id, confirmed_at)
-SELECT u.user_id, ?, ?, ? FROM users u
-WHERE u.user_id=?
-  AND EXISTS (SELECT 1 FROM device_fingerprint_profiles p WHERE p.user_id=? AND p.slot=? AND p.profile_hash=? AND p.webrtc_ipv4_hash=? AND p.webrtc_ipv4_hash2=? AND p.webrtc_ipv6_hash=? AND p.webrtc_ipv6_hash2=?)
-  AND EXISTS (SELECT 1 FROM device_fingerprint_profiles p WHERE p.user_id=? AND p.slot=? AND p.profile_hash=? AND p.webrtc_ipv4_hash=? AND p.webrtc_ipv4_hash2=? AND p.webrtc_ipv6_hash=? AND p.webrtc_ipv6_hash2=?)
-  AND (
-      (?=0 AND NOT EXISTS (SELECT 1 FROM webrtc_identity_confirmations current_confirmation WHERE current_confirmation.user_id=u.user_id))
-      OR
-      (?<>0 AND EXISTS (
-          SELECT 1 FROM webrtc_identity_confirmations current_confirmation
-          WHERE current_confirmation.user_id=u.user_id AND current_confirmation.label_id=? AND current_confirmation.confirmed_at=?
-      ))
-  )
-  AND EXISTS (
-      SELECT 1 FROM webrtc_identity_labels l
-      WHERE l.id=? AND (
-          l.source_user_id=? OR EXISTS (
-              SELECT 1 FROM webrtc_identity_confirmations c WHERE c.user_id=? AND c.label_id=l.id
-          )
-      )
-  )
-ON CONFLICT(user_id) DO UPDATE SET
-    label_id=excluded.label_id,
-    confirmed_by_user_id=excluded.confirmed_by_user_id,
-    confirmed_at=excluded.confirmed_at`)
-        .bind(
-            Number(label.id), Number(adminId), ts, Number(userId),
-            Number(userId), Number(targetSlot), targetEntry.profile.profileHash, targetEntry.profile.webrtcIpv4Hash, targetEntry.profile.webrtcIpv4Hash2, targetEntry.profile.webrtcIpv6Hash, targetEntry.profile.webrtcIpv6Hash2,
-            Number(candidateUserId), Number(candidateSlot), candidateEntry.profile.profileHash, candidateEntry.profile.webrtcIpv4Hash, candidateEntry.profile.webrtcIpv4Hash2, candidateEntry.profile.webrtcIpv6Hash, candidateEntry.profile.webrtcIpv6Hash2,
-            confirmationState.labelId, confirmationState.labelId, confirmationState.labelId, confirmationState.confirmedAt,
-            Number(label.id), Number(candidateUserId), Number(candidateUserId),
-        )
-        .run();
-    if (Number(result.meta?.changes || 0) < 1) {
-        return { error: "指纹档案或人工标签刚刚发生变化，请重新验证后再确认。" };
-    }
-    return { user, label, evidence };
 }
 
 function constantTimeEqual(a, b) {
@@ -1203,8 +1077,9 @@ async function usersPage(request, env) {
             u.last_webrtc_ipv6 ? `UDP IPv6: ${h(u.last_webrtc_ipv6)}` : "UDP IPv6: -",
             `UDP 状态: ${h(u.last_udp_status || "-")}`,
             u.last_device_os ? `设备: ${h(u.last_device_os)}` : "设备: -",
-            u.last_device_fingerprint ? `指纹: ${h(String(u.last_device_fingerprint).slice(0, 32))}` : "指纹: -",
             u.identity_label_name ? "人工确认标签: " + h(u.identity_label_name) : "人工确认标签: -",
+            u.latest_fingerprint_hash ? `V2指纹: <code>${h(String(u.latest_fingerprint_hash).slice(0, 16))}</code>` : "V2指纹: -",
+            u.fingerprint_label_name ? `V2确认: ${h(u.fingerprint_label_name)} (${h(u.fingerprint_confirmed_score || 0)}%)` : "V2确认: -",
         ].join("<br>");
         const topic = [
             u.topic_thread_id ? `话题 ID: ${h(u.topic_thread_id)}` : "话题 ID: -",
@@ -1214,6 +1089,7 @@ async function usersPage(request, env) {
         ].filter(Boolean).join("<br>");
         const unverify = u.verified ? `<form method="post" action="/users/${u.user_id}/unverify"><button type="submit">取消验证</button></form>` : "";
         const topicActions = `<form method="post" action="/users/${u.user_id}/topic/create"><button type="submit">创建话题</button></form><form method="post" action="/users/${u.user_id}/topic/rebuild"><button type="submit">重建话题</button></form><form method="post" action="/users/${u.user_id}/topic/unbind"><button type="submit">解除话题绑定</button></form>`;
+        const fingerprintActions = `<a class="btn" href="/users/${u.user_id}/fingerprints">指纹标签</a>${u.latest_fingerprint_hash ? `<form method="post" action="/users/${u.user_id}/fingerprints/mark"><button type="submit">标记指纹</button></form>` : ""}`;
         const deleteAction = `<form method="post" action="/users/${u.user_id}/delete" onsubmit="return confirm('确定要永久删除该用户及其全部消息和验证记录吗？此操作无法恢复。')"><button class="danger" type="submit">删除用户</button></form>`;
         const username = u.username ? `<span class="table-username">@${h(u.username)}</span>` : "";
         return `<tr>
@@ -1225,11 +1101,11 @@ async function usersPage(request, env) {
 <td data-label="标签 / 备注">${h(u.note || "-")}</td>
 <td data-label="操作">
 <form class="note-form" method="post" action="/users/${u.user_id}/note"><label class="sr-only" for="note-${u.user_id}">用户 ${u.user_id} 的标签或备注</label><input id="note-${u.user_id}" name="note" value="${h(u.note || "")}" placeholder="标签 / 备注"><button type="submit">保存备注</button></form>
-<div class="row-actions"><form method="post" action="/users/${u.user_id}/${actionPath}"><button class="${actionClass}" type="submit">${actionText}</button></form>${unverify}${topicActions}${deleteAction}</div>
+<div class="row-actions"><form method="post" action="/users/${u.user_id}/${actionPath}"><button class="${actionClass}" type="submit">${actionText}</button></form>${unverify}${fingerprintActions}${topicActions}${deleteAction}</div>
 </td>
 </tr>`;
     }).join("");
-    return html(layout("用户管理", `<div class="card"><h2>用户管理</h2><p class="muted">展示已私聊过 Bot 的用户、验证状态、IPv4/IPv6、UDP WebRTC、设备指纹、话题绑定、封禁状态和标签 / 备注；备注同时作为精确指纹命中的标签。</p><div class="table-wrap users-wrap" style="--table-min:1480px" tabindex="0" aria-label="机器人用户管理，可横向滚动"><table class="users-table"><caption class="sr-only">机器人用户管理</caption><thead><tr><th scope="col">用户</th><th scope="col">状态</th><th scope="col">公网 HTTP 信息</th><th scope="col">UDP / WebRTC / 指纹</th><th scope="col">话题</th><th scope="col">标签 / 备注</th><th scope="col">操作</th></tr></thead><tbody>${bodyRows}</tbody></table></div></div>`));
+    return html(layout("用户管理", `<div class="card"><h2>用户管理</h2><p class="muted">展示已私聊过 Bot 的用户、验证状态、IPv4/IPv6、UDP WebRTC、设备系统、话题绑定、封禁状态和标签 / 备注。</p><div class="table-wrap users-wrap" style="--table-min:1480px" tabindex="0" aria-label="机器人用户管理，可横向滚动"><table class="users-table"><caption class="sr-only">机器人用户管理</caption><thead><tr><th scope="col">用户</th><th scope="col">状态</th><th scope="col">公网 HTTP 信息</th><th scope="col">UDP / WebRTC / 指纹</th><th scope="col">话题</th><th scope="col">标签 / 备注</th><th scope="col">操作</th></tr></thead><tbody>${bodyRows}</tbody></table></div></div>`));
 }
 
 async function userNoteSave(request, env, userId) {
@@ -1248,6 +1124,43 @@ async function userBlockSet(request, env, userId, blocked) {
 async function userVerifyCancel(request, env, userId) {
     await setUserVerified(env, userId, false, "cancelled");
     return redirect("/users", request);
+}
+
+async function userFingerprintsPage(request, env, userId) {
+    await ensureVerificationSchema(env);
+    const [user, latest, labels, confirmed] = await Promise.all([
+        getUserWithIdentity(env, userId),
+        latestFingerprintProfile(env, userId),
+        env.DB.prepare(
+            "SELECT l.*,COUNT(r.id) AS reference_count FROM fingerprint_labels_v2 l " +
+            "LEFT JOIN fingerprint_reference_profiles_v2 r ON r.label_id=l.id WHERE l.source_user_id=? AND l.active=1 " +
+            "GROUP BY l.id ORDER BY l.updated_at DESC LIMIT 20",
+        ).bind(userId).all(),
+        env.DB.prepare(
+            "SELECT l.label_name,l.state,ul.weighted_score,ul.match_method,ul.confirmed_at FROM fingerprint_user_labels_v2 ul " +
+            "JOIN fingerprint_labels_v2 l ON l.id=ul.label_id WHERE ul.user_id=? LIMIT 1",
+        ).bind(userId).first(),
+    ]);
+    if (!user) return html(layout("用户不存在", `<div class="card"><p>找不到用户 ${h(userId)}。</p></div>`), 404);
+    const current = latest?.profile;
+    const currentText = current ? `<dl class="kv"><dt>完整指纹</dt><dd><code>${h(current.exactHash)}</code></dd><dt>档案槽位</dt><dd>${latest.row.slot}</dd><dt>质量</dt><dd>${current.qualityScore}%</dd><dt>设备</dt><dd>${h(current.summary?.model || "-")} / ${h(current.summary?.performanceClass || "-")}</dd></dl>` : `<p class="muted">当前还没有V2指纹，请让用户重新完成验证。</p>`;
+    const rows = (labels.results || []).map((row) => `<tr><td data-label="ID"><span class="table-id">#${h(row.id)}</span></td><td data-label="标签">${h(row.label_name)}</td><td data-label="状态">${row.state === "blacklist" ? '<span class="badge red">指纹黑名单</span>' : '<span class="badge green">观察</span>'}</td><td data-label="参考档案">${Number(row.reference_count || 0)}</td><td data-label="更新时间">${tableTime(row.updated_at)}</td><td data-label="操作"><form method="post" action="/fingerprint-labels/${row.id}/delete" onsubmit="return confirm('确定删除该指纹标签和全部参考档案吗？')"><button class="danger" type="submit">删除</button></form></td></tr>`).join("");
+    const mark = current ? `<form method="post" action="/users/${userId}/fingerprints/mark"><button class="primary" type="submit">使用当前备注标记指纹</button></form>` : "";
+    const confirmedText = confirmed ? `${h(confirmed.label_name)} · ${confirmed.weighted_score}% · ${h(confirmed.match_method)} · ${h(confirmed.confirmed_at)}` : "无";
+    return html(layout("指纹标签", `<div class="card"><h2>${h(user.full_name || userId)} · 指纹V2</h2><p class="muted">完整哈希相同为100%；其余结果只作为人工候选，不会自动封禁。</p>${currentText}<p><b>当前人工确认：</b>${confirmedText}</p>${mark}</div><div class="card"><h2>直接标记的标签</h2><div class="table-wrap responsive-wrap" style="--table-min:760px" tabindex="0" aria-label="指纹标签列表，可横向滚动"><table class="responsive-table"><caption class="sr-only">直接标记的指纹标签</caption><thead><tr><th scope="col">ID</th><th scope="col">标签</th><th scope="col">状态</th><th scope="col">参考档案</th><th scope="col">更新时间</th><th scope="col">操作</th></tr></thead><tbody>${rows || '<tr><td data-label="状态" data-span="full" colspan="6">暂无标签</td></tr>'}</tbody></table></div></div>`));
+}
+
+async function userFingerprintMark(request, env, userId) {
+    await ensureVerificationSchema(env);
+    const result = await markFingerprintLabel(env, userId, 0);
+    if (result.error) return html(layout("标记失败", `<div class="card"><h2>标记失败</h2><p>${h(result.error)}</p><a class="btn" href="/users/${userId}/fingerprints">返回</a></div>`), 400);
+    return redirect(`/users/${userId}/fingerprints`, request);
+}
+
+async function fingerprintLabelDeleteWeb(request, env, labelId) {
+    await ensureVerificationSchema(env);
+    const label = await deleteFingerprintLabel(env, labelId);
+    return redirect(label ? `/users/${label.source_user_id}/fingerprints` : "/users", request);
 }
 
 async function userTopicCreate(request, env, userId, forceNew) {
@@ -1269,7 +1182,15 @@ async function userTopicUnbind(request, env, userId) {
 async function userDelete(request, env, userId) {
     await ensureVerificationSchema(env);
     await env.DB.batch([
-        env.DB.prepare("DELETE FROM device_fingerprint_profiles WHERE user_id=?").bind(userId),
+        env.DB.prepare("DELETE FROM fingerprint_reference_lookup_v2 WHERE reference_id IN (SELECT id FROM fingerprint_reference_profiles_v2 WHERE source_user_id=?)").bind(userId),
+        env.DB.prepare("UPDATE fingerprint_user_labels_v2 SET reference_id=NULL WHERE reference_id IN (SELECT id FROM fingerprint_reference_profiles_v2 WHERE source_user_id=?)").bind(userId),
+        env.DB.prepare("DELETE FROM fingerprint_reference_profiles_v2 WHERE source_user_id=?").bind(userId),
+        env.DB.prepare("DELETE FROM fingerprint_reference_lookup_v2 WHERE reference_id IN (SELECT r.id FROM fingerprint_reference_profiles_v2 r JOIN fingerprint_labels_v2 l ON l.id=r.label_id WHERE l.source_user_id=?)").bind(userId),
+        env.DB.prepare("DELETE FROM fingerprint_user_labels_v2 WHERE label_id IN (SELECT id FROM fingerprint_labels_v2 WHERE source_user_id=?)").bind(userId),
+        env.DB.prepare("DELETE FROM fingerprint_reference_profiles_v2 WHERE label_id IN (SELECT id FROM fingerprint_labels_v2 WHERE source_user_id=?)").bind(userId),
+        env.DB.prepare("DELETE FROM fingerprint_labels_v2 WHERE source_user_id=?").bind(userId),
+        env.DB.prepare("DELETE FROM fingerprint_user_labels_v2 WHERE user_id=?").bind(userId),
+        env.DB.prepare("DELETE FROM fingerprint_profiles_v2 WHERE user_id=?").bind(userId),
         env.DB.prepare("DELETE FROM webrtc_identity_confirmations WHERE label_id IN (SELECT id FROM webrtc_identity_labels WHERE source_user_id=?)").bind(userId),
         env.DB.prepare("DELETE FROM webrtc_identity_labels WHERE source_user_id=?").bind(userId),
         env.DB.prepare("DELETE FROM webrtc_identity_confirmations WHERE user_id=?").bind(userId),
@@ -1360,6 +1281,7 @@ ${secretRow("PANEL_PASSWORD", env.PANEL_PASSWORD, "后台登录密码")}
 ${secretRow("PANEL_SECRET", env.PANEL_SECRET, "Cookie session secret")}
 ${secretRow("TELEGRAM_SECRET_TOKEN", env.TELEGRAM_SECRET_TOKEN, "Telegram webhook secret token")}
 ${secretRow("TURNSTILE_SECRET_KEY", env.TURNSTILE_SECRET_KEY, "Cloudflare Turnstile secret")}
+${secretRow("FINGERPRINT_HMAC_KEY", env.FINGERPRINT_HMAC_KEY, "V2指纹HMAC专用密钥；未配置时使用带域隔离的SHA-256")}
 ${secretRow("TURNSTILE_SITE_KEY", env.TURNSTILE_SITE_KEY, "Cloudflare Turnstile site key，可放 vars")}
 ${secretRow("CONTROL_MODE", mode, "web / topic / both")}
 ${secretRow("TOPIC_GROUP_ID", groupId, "开启 Topics 的 Telegram 超级群 ID")}
@@ -1558,16 +1480,21 @@ async function verifyPage(request, env, token = "", error = "") {
     if (session.status === "verified") {
         return verifySuccessPage();
     }
+    if (session.status === "processing" && Date.parse(session.verified_at || "") > Date.now() - VERIFY_PROCESSING_STALE_MS) {
+        return verifyMessagePage("正在处理验证", '<p class="muted">验证结果正在写入，请稍候返回 Telegram；无需重复提交。</p>');
+    }
     if (!env.TURNSTILE_SITE_KEY) {
         return verifyMessagePage("CF 验证未配置", `<p>请先配置 <code>TURNSTILE_SITE_KEY</code> 和 <code>TURNSTILE_SECRET_KEY</code>。</p>`);
     }
     const tokenJson = JSON.stringify(token);
+    const fingerprintFontsJson = JSON.stringify(FINGERPRINT_FONT_CATALOG);
     return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>继续聊天前需要验证</title>${verifyStyle()}<script src="https://telegram.org/js/telegram-web-app.js"></script><script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body><main><form id="verifyForm" class="card" method="post" action="/verify/${h(token)}">
 <h1>继续聊天前需要验证</h1><p class="muted">此页面使用 Cloudflare Turnstile 进行人机验证。验证通过后，机器人会为你建立独立话题并转发后续消息。</p>${error ? `<div class="error">${h(error)}</div>` : ""}
 <input type="hidden" id="client_data" name="client_data" value="">
 <div class="cf-turnstile" data-sitekey="${h(env.TURNSTILE_SITE_KEY)}"></div>
 <button id="submitBtn" type="submit">完成验证</button></form></main><script>
 const VERIFY_TOKEN = ${tokenJson};
+const FINGERPRINT_FONTS = ${fingerprintFontsJson};
 const telegramWebApp = window.Telegram && window.Telegram.WebApp;
 if (telegramWebApp) {
     telegramWebApp.ready();
@@ -1592,40 +1519,14 @@ function compactClientText(value, max) {
     return String(value || "").slice(0, max);
 }
 function serializeClientData(data) {
-    const screenInfo = data && data.screen && typeof data.screen === "object" ? data.screen : {};
-    const fingerprint = data && data.fingerprint && typeof data.fingerprint === "object" ? data.fingerprint : {};
-    const hardware = fingerprint.hardware && typeof fingerprint.hardware === "object" ? fingerprint.hardware : {};
-    const canvas = fingerprint.canvas && typeof fingerprint.canvas === "object" ? fingerprint.canvas : {};
-    const webgl = fingerprint.webgl && typeof fingerprint.webgl === "object" ? fingerprint.webgl : {};
     const probe = data && data.probe && typeof data.probe === "object" ? data.probe : {};
     const webrtc = data && data.webrtc && typeof data.webrtc === "object" ? data.webrtc : {};
+    const device = data && data.device && typeof data.device === "object" ? data.device : {};
+    const cpu = device.cpu && typeof device.cpu === "object" ? device.cpu : {};
+    const screen = device.screen && typeof device.screen === "object" ? device.screen : {};
+    const webgl = device.webgl && typeof device.webgl === "object" ? device.webgl : {};
+    const client = device.client && typeof device.client === "object" ? device.client : {};
     const safe = {
-        language: compactClientText(data && data.language, 32),
-        languages: Array.isArray(data && data.languages) ? data.languages.map((value) => compactClientText(value, 32)).slice(0, 5) : [],
-        platform: compactClientText(data && data.platform, 80),
-        user_agent: compactClientText(data && data.user_agent, 500),
-        timezone: compactClientText(data && data.timezone, 64),
-        screen: {
-            width: Number(screenInfo.width) || 0,
-            height: Number(screenInfo.height) || 0,
-            pixel_ratio: Number(screenInfo.pixel_ratio) || 1,
-            color_depth: Number(screenInfo.color_depth) || 0,
-        },
-        fingerprint: {
-            version: 2,
-            hardware: {
-                cores: Number(hardware.cores) || 0,
-                memory_gb: Number(hardware.memory_gb) || 0,
-                touch_points: Number(hardware.touch_points) || 0,
-            },
-            canvas: { status: compactClientText(canvas.status, 20), hash: compactClientText(canvas.hash, 32) },
-            webgl: {
-                status: compactClientText(webgl.status, 20),
-                hash: compactClientText(webgl.hash, 32),
-                renderer_hash: compactClientText(webgl.renderer_hash, 32),
-                limits_hash: compactClientText(webgl.limits_hash, 32),
-            },
-        },
         probe: {
             http_ip: compactClientText(probe.http_ip, 128),
             http_ip_version: compactClientText(probe.http_ip_version, 16),
@@ -1651,16 +1552,61 @@ function serializeClientData(data) {
                 type: compactClientText(item && item.type, 20),
             })) : [],
         },
+        device: {
+            canvas: compactClientText(device.canvas, 128),
+            audio: compactClientText(device.audio, 128),
+            fonts: Array.isArray(device.fonts) ? device.fonts.slice(0, FINGERPRINT_FONTS.length).map((item) => compactClientText(item, 80)) : [],
+            performanceClass: compactClientText(device.performanceClass, 24),
+            cpu: {
+                hardwareConcurrency: Number(cpu.hardwareConcurrency) || null,
+                deviceMemory: Number(cpu.deviceMemory) || null,
+                maxTouchPoints: Number(cpu.maxTouchPoints) || 0,
+                architecture: compactClientText(cpu.architecture, 40),
+                bitness: compactClientText(cpu.bitness, 16),
+            },
+            screen: {
+                width: Number(screen.width) || null,
+                height: Number(screen.height) || null,
+                availWidth: Number(screen.availWidth) || null,
+                availHeight: Number(screen.availHeight) || null,
+                colorDepth: Number(screen.colorDepth) || null,
+                pixelDepth: Number(screen.pixelDepth) || null,
+                dpr: Number(screen.dpr) || null,
+            },
+            webgl: {
+                vendor: compactClientText(webgl.vendor, 160),
+                renderer: compactClientText(webgl.renderer, 240),
+                version: compactClientText(webgl.version, 120),
+                shadingLanguageVersion: compactClientText(webgl.shadingLanguageVersion, 120),
+                maxTextureSize: Number(webgl.maxTextureSize) || null,
+                maxRenderbufferSize: Number(webgl.maxRenderbufferSize) || null,
+                maxViewportWidth: Number(webgl.maxViewportWidth) || null,
+                maxViewportHeight: Number(webgl.maxViewportHeight) || null,
+                maxVertexAttribs: Number(webgl.maxVertexAttribs) || null,
+            },
+            client: {
+                os: compactClientText(client.os, 80),
+                platform: compactClientText(client.platform, 80),
+                model: compactClientText(client.model, 120),
+                platformVersion: compactClientText(client.platformVersion, 80),
+                browserEngine: compactClientText(client.browserEngine, 40),
+                language: compactClientText(client.language, 32),
+                languages: Array.isArray(client.languages) ? client.languages.slice(0, 8).map((item) => compactClientText(item, 32)) : [],
+                timezone: compactClientText(client.timezone, 80),
+                telegramPlatform: compactClientText(client.telegramPlatform, 40),
+                telegramVersion: compactClientText(client.telegramVersion, 40),
+            },
+        },
     };
     let jsonValue = JSON.stringify(safe);
     if (jsonValue.length <= 6000) return jsonValue;
     safe.webrtc.candidates = safe.webrtc.candidates.slice(0, 3);
     safe.webrtc.error = safe.webrtc.error.slice(0, 100);
     safe.probe.error = safe.probe.error.slice(0, 100);
-    safe.user_agent = safe.user_agent.slice(0, 200);
     jsonValue = JSON.stringify(safe);
     if (jsonValue.length <= 6000) return jsonValue;
     safe.webrtc.candidates = [];
+    safe.device.fonts = safe.device.fonts.slice(0, 32);
     return JSON.stringify(safe);
 }
 function withClientTimeout(promise, timeoutMs, fallback) {
@@ -1671,116 +1617,186 @@ function withClientTimeout(promise, timeoutMs, fallback) {
 }
 async function collectClientData() {
     const data = {
-        language: navigator.language || "",
-        languages: Array.isArray(navigator.languages) ? navigator.languages.slice(0, 5) : [],
-        platform: navigator.platform || "",
-        user_agent: navigator.userAgent || "",
-        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
-        screen: {
-            width: screen.width || 0,
-            height: screen.height || 0,
-            pixel_ratio: window.devicePixelRatio || 1,
-            color_depth: screen.colorDepth || 0,
-        },
-        fingerprint: {
-            version: 2,
-            hardware: {
-                cores: navigator.hardwareConcurrency || 0,
-                memory_gb: navigator.deviceMemory || 0,
-                touch_points: navigator.maxTouchPoints || 0,
-            },
-            canvas: null,
-            webgl: null,
-        },
         probe: null,
         webrtc: null,
+        device: null,
     };
     const tasks = [
         withClientTimeout(httpProbe(), 4000, { error: "timeout" }),
         withClientTimeout(collectWebRtcCandidates(), 4500, { udp_status: "failed", error: "timeout", candidates: [] }),
-        withClientTimeout(collectCanvasSignal(), 1500, { status: "failed", hash: "" }),
-        withClientTimeout(collectWebGlSignal(), 1500, { status: "failed", hash: "", renderer_hash: "", limits_hash: "" }),
+        withClientTimeout(collectFingerprintSignals(), 3500, { error: "timeout" }),
     ];
     const results = await Promise.allSettled(tasks);
     data.probe = results[0].status === "fulfilled" ? results[0].value : { error: String(results[0].reason || "failed").slice(0, 300) };
     data.webrtc = results[1].status === "fulfilled" ? results[1].value : { udp_status: "failed", error: String(results[1].reason || "failed").slice(0, 300) };
-    data.fingerprint.canvas = results[2].status === "fulfilled" ? results[2].value : { status: "failed", hash: "" };
-    data.fingerprint.webgl = results[3].status === "fulfilled" ? results[3].value : { status: "failed", hash: "" };
+    data.device = results[2].status === "fulfilled" ? results[2].value : { error: String(results[2].reason || "failed").slice(0, 300) };
     return data;
 }
-async function browserShortSha256(value) {
-    if (!window.crypto || !window.crypto.subtle || !window.TextEncoder) return "";
-    const bytes = new TextEncoder().encode(String(value || ""));
-    const digest = await window.crypto.subtle.digest("SHA-256", bytes);
-    return Array.from(new Uint8Array(digest)).map((value) => value.toString(16).padStart(2, "0")).join("").slice(0, 32);
-}
-async function collectCanvasSignal() {
-    try {
-        const canvas = document.createElement("canvas");
-        canvas.width = 280;
-        canvas.height = 80;
-        const context = canvas.getContext("2d");
-        if (!context) return { status: "unsupported", hash: "" };
-        context.textBaseline = "top";
-        context.fillStyle = "#f97316";
-        context.fillRect(4, 4, 96, 24);
-        context.fillStyle = "#1d4ed8";
-        context.font = "16px Arial, sans-serif";
-        context.fillText("TG DualBot 指纹 v1", 8, 34);
-        context.globalCompositeOperation = "multiply";
-        context.fillStyle = "rgba(22,163,74,.65)";
-        context.beginPath();
-        context.arc(225, 35, 26, 0, Math.PI * 2);
-        context.fill();
-        const hash = await browserShortSha256(canvas.toDataURL("image/png"));
-        return { status: hash ? "ok" : "unsupported", hash };
-    } catch (error) {
-        return { status: "failed", hash: "" };
-    }
-}
-function normalizedGlValue(value) {
-    if (ArrayBuffer.isView(value)) return Array.from(value);
-    return value == null ? "" : value;
-}
-async function collectWebGlSignal() {
-    try {
-        const canvas = document.createElement("canvas");
-        const gl = canvas.getContext("webgl2") || canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
-        if (!gl) return { status: "unsupported", hash: "", renderer_hash: "", limits_hash: "" };
-        const debugInfo = gl.getExtension("WEBGL_debug_renderer_info");
-        const vendor = normalizedGlValue(gl.getParameter(gl.VENDOR));
-        const renderer = normalizedGlValue(gl.getParameter(gl.RENDERER));
-        const version = normalizedGlValue(gl.getParameter(gl.VERSION));
-        const shadingVersion = normalizedGlValue(gl.getParameter(gl.SHADING_LANGUAGE_VERSION));
-        const maxTextureSize = normalizedGlValue(gl.getParameter(gl.MAX_TEXTURE_SIZE));
-        const maxRenderbufferSize = normalizedGlValue(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE));
-        const maxVertexAttribs = normalizedGlValue(gl.getParameter(gl.MAX_VERTEX_ATTRIBS));
-        const maxCombinedTextures = normalizedGlValue(gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS));
-        const lineWidthRange = normalizedGlValue(gl.getParameter(gl.ALIASED_LINE_WIDTH_RANGE));
-        const unmaskedVendor = debugInfo ? normalizedGlValue(gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL)) : "";
-        const unmaskedRenderer = debugInfo ? normalizedGlValue(gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)) : "";
-        const legacyValues = [
-            vendor, renderer, version, shadingVersion, maxTextureSize, maxRenderbufferSize,
-            maxVertexAttribs, maxCombinedTextures, lineWidthRange, unmaskedVendor, unmaskedRenderer,
-        ];
-        const rendererValues = [vendor, renderer, unmaskedVendor, unmaskedRenderer];
-        const limitValues = [maxTextureSize, maxRenderbufferSize, maxVertexAttribs, maxCombinedTextures, lineWidthRange];
-        const hashes = await Promise.all([
-            browserShortSha256(JSON.stringify(legacyValues)),
-            browserShortSha256(JSON.stringify(rendererValues)),
-            browserShortSha256(JSON.stringify(limitValues)),
-        ]);
-        const hash = hashes[0];
-        const loseContext = gl.getExtension("WEBGL_lose_context");
-        if (loseContext) loseContext.loseContext();
-        return { status: hash ? "ok" : "unsupported", hash, renderer_hash: hashes[1], limits_hash: hashes[2] };
-    } catch (error) {
-        return { status: "failed", hash: "", renderer_hash: "", limits_hash: "" };
-    }
-}
+
 async function httpProbe() {
     const response = await fetch("/verify/ip-probe?token=" + encodeURIComponent(VERIFY_TOKEN) + "&t=" + Date.now(), { cache: "no-store" });
     return response.json();
+}
+async function hashClientText(value) {
+    if (!value || !window.crypto || !window.crypto.subtle) return "";
+    const buffer = await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
+    return Array.from(new Uint8Array(buffer)).map((item) => item.toString(16).padStart(2, "0")).join("");
+}
+function detectClientOs() {
+    const ua = String(navigator.userAgent || "").toLowerCase();
+    if (ua.includes("android")) return "Android";
+    if (ua.includes("iphone") || ua.includes("ipad") || ua.includes("ipod")) return "iOS";
+    if (ua.includes("windows")) return "Windows";
+    if (ua.includes("mac os") || ua.includes("macintosh")) return "macOS";
+    if (ua.includes("linux")) return "Linux";
+    return "Unknown";
+}
+function detectBrowserEngine() {
+    const ua = String(navigator.userAgent || "");
+    if (/Firefox\//i.test(ua)) return "Gecko";
+    if (/Edg\//i.test(ua) || /Chrome\//i.test(ua) || /Chromium\//i.test(ua)) return "Blink";
+    if (/Safari\//i.test(ua) && !/Chrome\//i.test(ua)) return "WebKit";
+    return "Unknown";
+}
+function collectCanvasDigest() {
+    try {
+        const canvas = document.createElement("canvas");
+        canvas.width = 300;
+        canvas.height = 90;
+        const context = canvas.getContext("2d");
+        if (!context) return Promise.resolve("");
+        context.textBaseline = "top";
+        context.font = "16px Arial";
+        context.fillStyle = "#f60";
+        context.fillRect(12, 10, 118, 46);
+        context.fillStyle = "#069";
+        context.fillText("tg-dualbot-fp-v2", 16, 22);
+        context.strokeStyle = "rgba(120,30,200,.8)";
+        context.beginPath();
+        context.arc(210, 42, 24, 0, Math.PI * 2);
+        context.stroke();
+        return hashClientText(canvas.toDataURL());
+    } catch (error) {
+        return Promise.resolve("");
+    }
+}
+async function collectAudioDigest() {
+    try {
+        const OfflineAudio = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+        if (!OfflineAudio) return "";
+        const context = new OfflineAudio(1, 22050, 22050);
+        const oscillator = context.createOscillator();
+        const compressor = context.createDynamicsCompressor();
+        oscillator.type = "triangle";
+        oscillator.frequency.value = 1000;
+        oscillator.connect(compressor);
+        compressor.connect(context.destination);
+        oscillator.start(0);
+        const rendered = await context.startRendering();
+        const samples = Array.from(rendered.getChannelData(0).slice(0, 128));
+        return hashClientText(samples.join(","));
+    } catch (error) {
+        return "";
+    }
+}
+function collectFontSet() {
+    if (!document.body) return [];
+    const bases = ["monospace", "sans-serif", "serif"];
+    const probe = document.createElement("span");
+    probe.textContent = "mmmmmmmmmmlli";
+    probe.style.cssText = "position:absolute;left:-9999px;top:-9999px;font-size:72px;visibility:hidden";
+    const baseline = {};
+    for (const base of bases) {
+        probe.style.fontFamily = base;
+        document.body.appendChild(probe);
+        baseline[base] = [probe.offsetWidth, probe.offsetHeight];
+        probe.remove();
+    }
+    return FINGERPRINT_FONTS.filter((font) => bases.some((base) => {
+        probe.style.fontFamily = "'" + font.replace(/'/g, "") + "'," + base;
+        document.body.appendChild(probe);
+        const found = probe.offsetWidth !== baseline[base][0] || probe.offsetHeight !== baseline[base][1];
+        probe.remove();
+        return found;
+    }));
+}
+function collectWebGlSignals() {
+    try {
+        const canvas = document.createElement("canvas");
+        const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+        if (!gl) return {};
+        const debug = gl.getExtension("WEBGL_debug_renderer_info");
+        const viewport = gl.getParameter(gl.MAX_VIEWPORT_DIMS) || [];
+        return {
+            vendor: debug ? gl.getParameter(debug.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR),
+            renderer: debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
+            version: gl.getParameter(gl.VERSION),
+            shadingLanguageVersion: gl.getParameter(gl.SHADING_LANGUAGE_VERSION),
+            maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+            maxRenderbufferSize: gl.getParameter(gl.MAX_RENDERBUFFER_SIZE),
+            maxViewportWidth: Number(viewport[0]) || null,
+            maxViewportHeight: Number(viewport[1]) || null,
+            maxVertexAttribs: gl.getParameter(gl.MAX_VERTEX_ATTRIBS),
+        };
+    } catch (error) {
+        return {};
+    }
+}
+function classifyPerformance(cpu, webgl) {
+    const cores = Number(cpu.hardwareConcurrency) || 1;
+    const memory = Number(cpu.deviceMemory) || 1;
+    const texture = Number(webgl.maxTextureSize) || 2048;
+    const score = Math.log2(Math.max(cores, 1)) * 2 + Math.log2(Math.max(memory, 1)) + Math.log2(Math.max(texture, 1024)) / 2;
+    if (score >= 14) return "very-high";
+    if (score >= 11) return "high";
+    if (score >= 8) return "medium";
+    return "low";
+}
+async function collectFingerprintSignals() {
+    let hints = {};
+    try {
+        if (navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
+            hints = await navigator.userAgentData.getHighEntropyValues(["architecture", "bitness", "model", "platformVersion"]);
+        }
+    } catch (error) {}
+    const cpu = {
+        hardwareConcurrency: navigator.hardwareConcurrency || null,
+        deviceMemory: navigator.deviceMemory || null,
+        maxTouchPoints: navigator.maxTouchPoints || 0,
+        architecture: hints.architecture || "",
+        bitness: hints.bitness || "",
+    };
+    const webgl = collectWebGlSignals();
+    const results = await Promise.allSettled([collectCanvasDigest(), collectAudioDigest()]);
+    return {
+        canvas: results[0].status === "fulfilled" ? results[0].value : "",
+        audio: results[1].status === "fulfilled" ? results[1].value : "",
+        fonts: collectFontSet(),
+        webgl,
+        cpu,
+        screen: {
+            width: window.screen && window.screen.width,
+            height: window.screen && window.screen.height,
+            availWidth: window.screen && window.screen.availWidth,
+            availHeight: window.screen && window.screen.availHeight,
+            colorDepth: window.screen && window.screen.colorDepth,
+            pixelDepth: window.screen && window.screen.pixelDepth,
+            dpr: window.devicePixelRatio || null,
+        },
+        client: {
+            os: detectClientOs(),
+            platform: (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "",
+            model: hints.model || "",
+            platformVersion: hints.platformVersion || "",
+            browserEngine: detectBrowserEngine(),
+            language: navigator.language || "",
+            languages: Array.isArray(navigator.languages) ? navigator.languages : [],
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+            telegramPlatform: telegramWebApp && telegramWebApp.platform || "",
+            telegramVersion: telegramWebApp && telegramWebApp.version || "",
+        },
+        performanceClass: classifyPerformance(cpu, webgl),
+    };
 }
 function collectWebRtcCandidates() {
     return new Promise(async (resolve) => {
@@ -1911,6 +1927,13 @@ async function verifySubmit(request, env, token = "") {
         await markVerificationSession(env, token, "expired");
         return html(await verifyPage(request, env, "", "验证链接已过期，请从 Telegram 重新获取。"), 400);
     }
+    if (session.status === "verified") return html(verifySuccessPage());
+    if (session.status === "processing" && Date.parse(session.verified_at || "") > Date.now() - VERIFY_PROCESSING_STALE_MS) {
+        return html(verifyMessagePage("正在处理验证", '<p class="muted">验证结果正在写入，请稍候返回 Telegram；无需重复提交。</p>'), 409);
+    }
+    if (session.status !== "pending" && session.status !== "processing") {
+        return html(await verifyPage(request, env, "", "当前验证链接状态无效，请从 Telegram 重新获取。"), 409);
+    }
     const form = await request.formData();
     const turnstileToken = String(form.get("cf-turnstile-response") || "");
     const clientData = parseClientData(form.get("client_data"));
@@ -1928,47 +1951,64 @@ async function verifySubmit(request, env, token = "") {
         return html(await verifyPage(request, env, token, "验证失败，请刷新后重试。"), 400);
     }
 
+    const claimTs = nowIso();
+    const staleBefore = new Date(Date.now() - VERIFY_PROCESSING_STALE_MS).toISOString();
+    const claim = await env.DB.prepare(
+        "UPDATE verification_sessions SET status='processing', verified_at=? WHERE token=? AND " +
+        "(status='pending' OR (status='processing' AND (verified_at IS NULL OR verified_at<?)))",
+    ).bind(claimTs, token, staleBefore).run();
+    if (Number(claim.meta?.changes || 0) !== 1) {
+        const current = await getVerificationSession(env, token);
+        if (current?.status === "verified") return html(verifySuccessPage());
+        return html(verifyMessagePage("正在处理验证", '<p class="muted">另一个请求正在写入验证结果，请稍候返回 Telegram。</p>'), 409);
+    }
+
     const ts = nowIso();
     const cfInfo = requestCfInfo(request);
     const userAgent = request.headers.get("User-Agent") || "";
     const network = extractClientNetwork(clientData, ip);
-    const deviceOs = detectDeviceOs(userAgent, clientData);
+    const deviceOs = detectDeviceOs(userAgent);
     const rawClientData = JSON.stringify(clientDataForVerificationStorage(clientData, network)).slice(0, 6000);
     const userId = Number(session.user_id);
-    const deviceFingerprint = await buildDeviceFingerprint(clientData);
-    const webrtcIdentity = await buildWebRtcIdentity(network);
-    const fingerprintProfile = await buildFingerprintProfile(clientData, deviceOs, webrtcIdentity);
-    await env.DB.prepare("UPDATE verification_sessions SET status='verified', verified_at=? WHERE token=?")
-        .bind(ts, token)
-        .run();
-    await env.DB.prepare(`INSERT INTO ip_verifications(user_id, ip, country, colo, user_agent, passed, turnstile_action, http_ip, http_ip_version, http_ipv4, http_ipv6, webrtc_ipv4, webrtc_ipv6, webrtc_protocol, webrtc_candidate_type, udp_status, asn, as_organization, device_os, token, raw_client_data, created_at)
+    let webrtcIdentity = { hash: "" };
+    let fingerprintProfile = null;
+    let fingerprintState = null;
+    let fingerprintMatches = [];
+    let webRtcNetworkMeta = [];
+    try {
+        webrtcIdentity = await buildWebRtcIdentity(network);
+        try {
+            const metadata = await fingerprintNetworkMetadata(request, network, cfInfo);
+            webRtcNetworkMeta = metadata.webrtc || [];
+            fingerprintProfile = await buildFingerprintProfile({
+                clientData,
+                network,
+                metadata,
+                secret: String(env.FINGERPRINT_HMAC_KEY || ""),
+            });
+            fingerprintState = await saveRollingFingerprintProfile(env, userId, fingerprintProfile);
+            fingerprintMatches = await findFingerprintMatches(env, fingerprintProfile);
+        } catch (error) {
+            await logEvent(env, "warn", "fingerprint v2 processing failed", { userId, error: String(error?.message || error) }).catch(() => {});
+        }
+        await env.DB.prepare(`INSERT INTO ip_verifications(user_id, ip, country, colo, user_agent, passed, turnstile_action, http_ip, http_ip_version, http_ipv4, http_ipv6, webrtc_ipv4, webrtc_ipv6, webrtc_protocol, webrtc_candidate_type, udp_status, asn, as_organization, device_os, token, raw_client_data, created_at)
 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .bind(userId, ip || "", cfInfo.country, cfInfo.colo, userAgent.slice(0, 500), 1, String(result.action || ""), ip || "", ipVersion(ip), network.http_ipv4, network.http_ipv6, network.webrtc_ipv4, network.webrtc_ipv6, network.webrtc_protocol, network.webrtc_candidate_type, network.udp_status, cfInfo.asn, cfInfo.asOrganization, deviceOs, token, rawClientData, ts)
-        .run();
-    await env.DB.prepare(`UPDATE users SET verified=1, verification_status='verified', verification_token=?, language_code=COALESCE(NULLIF(language_code,''), ?), last_verified_ip=?, last_verified_at=?, last_cf_country=?, last_http_ip=?, last_http_ip_version=?, last_http_ipv4=?, last_http_ipv6=?, last_webrtc_ipv4=?, last_webrtc_ipv6=?, last_udp_status=?, last_asn=?, last_as_organization=?, last_device_os=?, last_user_agent=?, last_device_fingerprint=COALESCE(NULLIF(?,''), last_device_fingerprint), updated_at=? WHERE user_id=?`)
-        .bind(token, session.language_code || "", ip || "", ts, cfInfo.country, ip || "", ipVersion(ip), network.http_ipv4, network.http_ipv6, network.webrtc_ipv4, network.webrtc_ipv6, network.udp_status, cfInfo.asn, cfInfo.asOrganization, deviceOs, userAgent.slice(0, 500), deviceFingerprint, ts, userId)
-        .run();
-    const fingerprintProfileSlot = await upsertFingerprintProfile(env, userId, fingerprintProfile);
-    const [fingerprintMatch, webrtcIdentityMatch] = await Promise.all([
-        findFingerprintSimilarityMatch(env, userId, fingerprintProfile, deviceFingerprint),
-        findWebRtcIdentityLabel(env, userId, network),
-    ]);
-    const fingerprintConfirmationState = fingerprintMatch?.canConfirm && fingerprintProfileSlot
-        ? await getIdentityConfirmationState(env, userId)
-        : { labelId: 0, confirmedAt: "" };
-    const fingerprintConfirmationToken = fingerprintMatch?.canConfirm && fingerprintProfileSlot
-        ? await buildFingerprintConfirmationToken(env, {
-            userId,
-            targetSlot: fingerprintProfileSlot,
-            targetProfile: fingerprintProfile,
-            candidateUserId: fingerprintMatch.userId,
-            candidateSlot: fingerprintMatch.slot,
-            candidateProfile: fingerprintMatch.profile,
-            labelId: fingerprintMatch.labelId,
-            targetConfirmedLabelId: fingerprintConfirmationState.labelId,
-            targetConfirmedAt: fingerprintConfirmationState.confirmedAt,
-        })
-        : "";
+            .bind(userId, ip || "", cfInfo.country, cfInfo.colo, userAgent.slice(0, 500), 1, String(result.action || ""), ip || "", ipVersion(ip), network.http_ipv4, network.http_ipv6, network.webrtc_ipv4, network.webrtc_ipv6, network.webrtc_protocol, network.webrtc_candidate_type, network.udp_status, cfInfo.asn, cfInfo.asOrganization, deviceOs, token, rawClientData, ts)
+            .run();
+        await env.DB.prepare(`UPDATE users SET verified=1, verification_status='verified', verification_token=?, language_code=COALESCE(NULLIF(language_code,''), ?), last_verified_ip=?, last_verified_at=?, last_cf_country=?, last_http_ip=?, last_http_ip_version=?, last_http_ipv4=?, last_http_ipv6=?, last_webrtc_ipv4=?, last_webrtc_ipv6=?, last_udp_status=?, last_asn=?, last_as_organization=?, last_device_os=?, last_user_agent=?, updated_at=? WHERE user_id=?`)
+            .bind(token, session.language_code || "", ip || "", ts, cfInfo.country, ip || "", ipVersion(ip), network.http_ipv4, network.http_ipv6, network.webrtc_ipv4, network.webrtc_ipv6, network.udp_status, cfInfo.asn, cfInfo.asOrganization, deviceOs, userAgent.slice(0, 500), ts, userId)
+            .run();
+        await env.DB.prepare("UPDATE verification_sessions SET status='verified', verified_at=? WHERE token=? AND status='processing'")
+            .bind(ts, token)
+            .run();
+    } catch (error) {
+        await env.DB.prepare("UPDATE verification_sessions SET status='pending', verified_at=NULL WHERE token=? AND status='processing'")
+            .bind(token)
+            .run()
+            .catch(() => {});
+        throw error;
+    }
+    const webrtcIdentityMatch = await findWebRtcIdentityLabel(env, userId, network);
     const verificationInfo = {
         username: session.username || "",
         fullName: session.full_name || String(userId),
@@ -1986,20 +2026,13 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         country: cfInfo.country,
         colo: cfInfo.colo,
         deviceOs,
-        deviceFingerprint,
-        fingerprintMatchedUserId: Number(fingerprintMatch?.userId || 0),
-        fingerprintMatchedUsername: String(fingerprintMatch?.username || ""),
-        fingerprintLabel: String(fingerprintMatch?.labelName || fingerprintMatch?.note || "").trim().slice(0, 200),
-        fingerprintSimilarity: Number(fingerprintMatch?.evidence?.score || 0),
-        fingerprintMatchedFields: Array.isArray(fingerprintMatch?.evidence?.matchedFields) ? fingerprintMatch.evidence.matchedFields.slice(0, 10) : [],
-        fingerprintWebRtcExact: Boolean(fingerprintMatch?.evidence?.webrtcExact),
-        fingerprintExactProfile: Boolean(fingerprintMatch?.evidence?.exactProfile),
-        fingerprintHighConfidence: Boolean(fingerprintMatch?.evidence?.highConfidence),
-        fingerprintProfileSlot,
-        fingerprintMatchedProfileSlot: Number(fingerprintMatch?.slot || 0),
-        fingerprintMatchedLabelId: Number(fingerprintMatch?.labelId || 0),
-        fingerprintConfirmationToken,
-        fingerprintCanConfirm: Boolean(fingerprintConfirmationToken),
+        webRtcAsn: webRtcNetworkMeta.map((item) => item.asn).filter(Boolean).join(", "),
+        webRtcIsp: webRtcNetworkMeta.map((item) => item.isp).filter(Boolean).join(" / "),
+        fingerprintHash: String(fingerprintProfile?.exactHash || ""),
+        fingerprintSlot: Number(fingerprintState?.row?.slot || 0),
+        fingerprintQuality: Number(fingerprintProfile?.qualityScore || 0),
+        fingerprintSummary: fingerprintProfile?.summary || {},
+        fingerprintMatches,
         webrtcIdentityHash: String(webrtcIdentity.hash || ""),
         webrtcIdentityIpVersion: String(webrtcIdentityMatch.ipVersion || ""),
         webrtcIdentityLabelId: Number(webrtcIdentityMatch.label?.id || 0),
@@ -2051,6 +2084,28 @@ async function telegramWebhook(request, env) {
 }
 
 export async function handleTelegramUpdate(env, update) {
+    if (await isSilentlyIsolatedPrivateUpdate(env, update)) return;
+    const updateId = Number(update?.update_id);
+    const trackUpdate = update?.update_id !== undefined && Number.isSafeInteger(updateId);
+    if (trackUpdate && !(await claimTelegramUpdate(env, updateId))) return;
+    try {
+        await processTelegramUpdate(env, update);
+    } catch (error) {
+        if (trackUpdate) await releaseTelegramUpdate(env, updateId).catch(() => {});
+        throw error;
+    }
+}
+
+async function isSilentlyIsolatedPrivateUpdate(env, update) {
+    const message = update?.message || update?.edited_message;
+    if (!message || message.chat?.type !== "private") return false;
+    const chatId = Number(message.chat.id);
+    if (await isAdminChat(env, chatId)) return false;
+    const senderId = Number(message.from?.id);
+    return Number.isFinite(senderId) && await isInboundMuted(env, senderId);
+}
+
+async function processTelegramUpdate(env, update) {
     if (update.callback_query) {
         await handleCallbackQuery(env, update.callback_query);
         return;
@@ -2066,7 +2121,15 @@ export async function handleTelegramUpdate(env, update) {
     }
     const admin = await isAdminChat(env, chatId);
     if (command) {
-        await handleCommand(env, message, command, admin);
+        try {
+            await handleCommand(env, message, command, admin);
+        } catch (error) {
+            await logEvent(env, "error", "failed to handle Telegram command", {
+                chatId,
+                command: command.name,
+                error: String(error?.message || error),
+            });
+        }
         return;
     }
     if (admin && message.reply_to_message && textValue) {
@@ -2158,11 +2221,15 @@ async function handleTopicGroupMessage(env, message, command) {
             admin_message_id: Number(message.message_id),
         });
     } catch (error) {
-        await logEvent(env, "error", "failed to relay topic message", { threadId: message.message_thread_id, error: String(error?.message || error) });
+        const rawError = String(error?.message || error);
+        await logEvent(env, "error", "failed to relay topic message", { threadId: message.message_thread_id, error: rawError });
+        const translated = localizeLogEntry("failed to relay topic message", JSON.stringify({ error: rawError }));
+        const lines = [`回复用户失败：${translated.reason}`];
+        if (translated.suggestion) lines.push(`处理建议：${translated.suggestion}`);
         await tgCall(env, "sendMessage", {
             chat_id: groupId,
             message_thread_id: Number(message.message_thread_id),
-            text: `回复用户失败：${String(error?.message || error).slice(0, 400)}`,
+            text: lines.join("\n"),
         }).catch(() => {});
     }
 }
@@ -2198,9 +2265,12 @@ function topicAdminText(user) {
         `昵称：${user.full_name || "-"}`,
         `用户名：${user.username ? `@${user.username}` : "无"}`,
         `状态：${user.blocked ? "已封禁" : user.verified ? "已验证" : "未验证"}`,
+        `消息接收：${user.inbound_muted ? "已静默隔离" : "正常"}`,
         `话题：${user.topic_thread_id || "无"}`,
         `备注：${user.note || "无"}`,
         "人工确认标签：" + (user.identity_label_name || "无"),
+        "V2人工确认：" + (user.fingerprint_label_name || "无"),
+        "V2完整指纹：" + (user.latest_fingerprint_hash ? String(user.latest_fingerprint_hash).slice(0, 20) : "无"),
     ].join("\n");
 }
 
@@ -2211,15 +2281,23 @@ function topicAdminKeyboard(user) {
     const blockButton = user.blocked
         ? { text: "取消拉黑", callback_data: `topicadmin:unban:${user.user_id}` }
         : { text: "拉黑", callback_data: `topicadmin:ban:${user.user_id}` };
+    const muteButton = user.inbound_muted
+        ? { text: "解除隔离", callback_data: `topicadmin:unmute:${user.user_id}` }
+        : { text: "静默隔离", callback_data: `topicadmin:mute:${user.user_id}` };
     return {
         inline_keyboard: [
             [verifyButton],
             [blockButton],
+            [muteButton],
             [{ text: "获取用户信息", callback_data: `topicadmin:who:${user.user_id}` }],
             [{ text: "重建话题", callback_data: `topicadmin:rebuild:${user.user_id}` }],
             [
                 { text: "标记 WebRTC", callback_data: "rtcmark:" + user.user_id },
                 { text: "WebRTC 标签", callback_data: "rtclabels:" + user.user_id },
+            ],
+            [
+                { text: "标记指纹", callback_data: `fpmark:${user.user_id}:${user.latest_fingerprint_slot || 0}:${String(user.latest_fingerprint_hash || "").slice(0, 12)}` },
+                { text: "指纹标签", callback_data: `fplabels:${user.user_id}` },
             ],
         ],
     };
@@ -2260,6 +2338,12 @@ async function handleTopicAdminCallback(env, query) {
         await setBlock(env, userId, false);
         await tgSendMessage(env, userId, "管理员已取消你的拉黑状态。").catch(() => {});
         await answerCallbackQuery(env, query.id, "已取消拉黑");
+    } else if (action === "mute") {
+        await setInboundMuted(env, userId, true);
+        await answerCallbackQuery(env, query.id, "已开启静默隔离");
+    } else if (action === "unmute") {
+        await setInboundMuted(env, userId, false);
+        await answerCallbackQuery(env, query.id, "已解除静默隔离");
     } else if (action === "who") {
         const threadId = Number(query.message?.message_thread_id || user.topic_thread_id || 0);
         await answerCallbackQuery(env, query.id, "已发送用户信息");
@@ -2451,26 +2535,6 @@ async function sendCurrentWebRtcIdentityToTopic(env, user, topic) {
     await tgCall(env, "sendMessage", payload);
 }
 
-function fingerprintConfirmCallbackData(userId, info) {
-    if (!info.fingerprintCanConfirm || !/^[0-9a-f]{12}$/.test(String(info.fingerprintConfirmationToken || "")) || !info.fingerprintProfileSlot || !info.fingerprintMatchedProfileSlot || !info.fingerprintMatchedUserId) return "";
-    const data = [
-        "fpconfirm",
-        Number(userId),
-        Number(info.fingerprintProfileSlot),
-        Number(info.fingerprintMatchedUserId),
-        Number(info.fingerprintMatchedProfileSlot),
-        info.fingerprintConfirmationToken,
-    ].join(":");
-    return data.length <= 64 ? data : "";
-}
-
-function fingerprintMatchTitle(info) {
-    if (info.fingerprintWebRtcExact) return "WebRTC 公网地址完全一致（待人工确认）";
-    if (info.fingerprintExactProfile && !info.fingerprintHighConfidence) return "设备指纹完全一致（采集字段不足，仅供参考）";
-    if (info.fingerprintExactProfile) return "设备指纹完全一致（待人工确认）";
-    return "跨浏览器/设备指纹相似候选（待人工确认）";
-}
-
 function topicVerificationText(info) {
     const lines = [
         "本次验证信息",
@@ -2479,23 +2543,21 @@ function topicVerificationText(info) {
         `公网 IPv6：${info.httpIpv6 || "-"}`,
         `WebRTC IPv4：${info.webrtcIpv4 || "-"}`,
         `WebRTC IPv6：${info.webrtcIpv6 || "-"}`,
+        `WebRTC ASN：${info.webRtcAsn || "-"}`,
+        `WebRTC ISP：${info.webRtcIsp || "-"}`,
         `UDP 状态：${info.udpStatus || "-"}`,
         `ASN：${info.asn || "-"}`,
         `运营商：${info.asOrganization || "-"}`,
         `国家/地区：${info.country || "-"}`,
         `设备系统：${info.deviceOs || "-"}`,
-        `设备指纹：${info.deviceFingerprint ? info.deviceFingerprint.slice(0, 32) : "-"}`,
+        `完整指纹：${info.fingerprintHash ? info.fingerprintHash.slice(0, 20) : "-"}`,
+        `指纹质量：${info.fingerprintQuality || 0}%`,
     ];
-    if (info.fingerprintMatchedUserId) {
+    if (info.fingerprintSummary?.model || info.fingerprintSummary?.performanceClass || info.fingerprintSummary?.telegramPlatform) {
         lines.push(
-            "",
-            fingerprintMatchTitle(info),
-            `标签：${info.fingerprintLabel || "未设置"}`,
-            `指纹相似度：${Number(info.fingerprintSimilarity || 0)}%`,
-            `匹配字段：${Array.isArray(info.fingerprintMatchedFields) && info.fingerprintMatchedFields.length ? info.fingerprintMatchedFields.join("、") : "无"}`,
-            `匹配用户 ID：${info.fingerprintMatchedUserId}`,
-            `匹配用户名：${info.fingerprintMatchedUsername ? `@${info.fingerprintMatchedUsername}` : "无"}`,
-            "说明：浏览器采集线索仅供管理员人工判断。",
+            `设备型号：${info.fingerprintSummary.model || "-"}`,
+            `性能等级：${info.fingerprintSummary.performanceClass || "-"}`,
+            `Telegram 客户端：${[info.fingerprintSummary.telegramPlatform, info.fingerprintSummary.telegramVersion].filter(Boolean).join(" ") || "-"}`,
         );
     }
     if (info.webrtcIdentityLabelId) {
@@ -2507,6 +2569,7 @@ function topicVerificationText(info) {
             "匹配依据：WebRTC " + (info.webrtcIdentityIpVersion || "-") + " 完全相同",
         );
     }
+    if (info.fingerprintMatches?.length) lines.push("", fingerprintMatchText(info.fingerprintMatches));
     return lines.join("\n");
 }
 
@@ -2529,18 +2592,20 @@ async function completeTopicVerification(env, userId, info) {
                 callback_data: "rtcconfirm:" + userId + ":" + info.webrtcIdentityLabelId,
             }]);
         }
-        const fingerprintCallback = !info.webrtcIdentityLabelId ? fingerprintConfirmCallbackData(userId, info) : "";
-        if (fingerprintCallback) {
+        const fingerprintPrefix = String(info.fingerprintHash || "").slice(0, 12);
+        const fingerprintSlot = Number(info.fingerprintSlot || 0);
+        const firstMatch = info.fingerprintMatches?.[0];
+        if (firstMatch && fingerprintPrefix && fingerprintSlot) {
             confirmationRows.push([{
-                text: "确认同一人（指纹候选）",
-                callback_data: fingerprintCallback,
+                text: `确认同一人（${firstMatch.score}%）`,
+                callback_data: `fpconfirm:${userId}:${firstMatch.labelId}:${fingerprintSlot}:${fingerprintPrefix}`,
             }]);
         }
-        if (info.fingerprintMatchedUserId) {
-            confirmationRows.push([{
-                text: "查看匹配账号",
-                callback_data: "who:" + info.fingerprintMatchedUserId,
-            }]);
+        if (fingerprintPrefix && fingerprintSlot) {
+            confirmationRows.push([
+                { text: "标记指纹", callback_data: `fpmark:${userId}:${fingerprintSlot}:${fingerprintPrefix}` },
+                { text: "指纹标签", callback_data: `fplabels:${userId}` },
+            ]);
         }
         if (confirmationRows.length) {
             payload.reply_markup = {
@@ -2678,7 +2743,12 @@ async function handleCommand(env, message, command, isAdmin) {
 /start — 查看当前连接和验证状态`);
         }
     } catch (error) {
-        await tgSendMessage(env, chatId, `命令执行失败：${String(error.message || error)}`);
+        await logEvent(env, "error", "failed to execute Telegram command", {
+            chatId,
+            command: command.name,
+            error: String(error?.message || error),
+        });
+        await sendUserNoticeSafely(env, chatId, `命令执行失败：${String(error?.message || error)}`, { command: command.name });
     }
 }
 
@@ -2695,22 +2765,20 @@ function parseUserIdAndText(args) {
 }
 
 function formatUserInfo(row) {
-    return `用户信息\nuser_id: ${row.user_id}\nusername: @${row.username || ""}\nfull_name: ${row.full_name || ""}\nblocked: ${Boolean(row.blocked)}\nverified: ${Boolean(row.verified)}\nstatus: ${row.verification_status || "-"}\nnote: ${row.note || ""}\nwebrtc_identity_label: ${row.identity_label_name || "-"}\nHTTP IPv4: ${row.last_http_ipv4 || "-"}\nHTTP IPv6: ${row.last_http_ipv6 || "-"}\nUDP IPv4: ${row.last_webrtc_ipv4 || "-"}\nUDP IPv6: ${row.last_webrtc_ipv6 || "-"}\nASN: ${row.last_asn || "-"}\ndevice_fingerprint: ${row.last_device_fingerprint ? String(row.last_device_fingerprint).slice(0, 32) : "-"}\ntopic_thread_id: ${row.topic_thread_id || "-"}\ntopic_status: ${row.topic_status || "-"}\nupdated_at: ${row.updated_at}`;
+    return `用户信息\nuser_id: ${row.user_id}\nusername: @${row.username || ""}\nfull_name: ${row.full_name || ""}\nblocked: ${Boolean(row.blocked)}\ninbound_muted: ${Boolean(row.inbound_muted)}\nverified: ${Boolean(row.verified)}\nstatus: ${row.verification_status || "-"}\nnote: ${row.note || ""}\nwebrtc_identity_label: ${row.identity_label_name || "-"}\nHTTP IPv4: ${row.last_http_ipv4 || "-"}\nHTTP IPv6: ${row.last_http_ipv6 || "-"}\nUDP IPv4: ${row.last_webrtc_ipv4 || "-"}\nUDP IPv6: ${row.last_webrtc_ipv6 || "-"}\nASN: ${row.last_asn || "-"}\ntopic_thread_id: ${row.topic_thread_id || "-"}\ntopic_status: ${row.topic_status || "-"}\nupdated_at: ${row.updated_at}`;
 }
 
 async function relayUserMessage(env, message) {
     const user = message.from || {};
     await upsertUser(env, user);
-    if (await isBlocked(env, user.id)) {
-        await tgSendMessage(env, message.chat.id, "你当前无法发送消息。");
-        return;
-    }
+    if (await isBlocked(env, user.id)) return;
     if (!(await isVerified(env, user.id))) {
-        await sendVerificationPrompt(env, message.chat.id, user, "请先完成验证后再开始聊天。验证通过前，你发送的消息不会被转发。");
+        await sendVerificationPrompt(env, message.chat.id, user, "请先完成验证后再开始聊天。验证通过前，你发送的消息不会被转发。")
+            .catch((error) => logEvent(env, "warn", "failed to notify user", { userId: user.id, stage: "verification", error: String(error?.message || error) }));
         return;
     }
     if (await rateLimited(env, user.id)) {
-        await tgSendMessage(env, message.chat.id, "发送太快了，请稍后再试。");
+        await sendUserNoticeSafely(env, message.chat.id, "发送太快了，请稍后再试。", { userId: user.id, stage: "rate-limit" });
         return;
     }
     const inboxId = await createInboxMessage(env, message);
@@ -2721,18 +2789,19 @@ async function relayUserMessage(env, message) {
         await setBlock(env, user.id, true);
         await markInboxError(env, inboxId, `spam: ${hits.join(", ")}`);
         await notifyAdmins(env, `[垃圾消息已拉黑]\nuser_id: <code>${user.id}</code>\n命中：${h(hits.join(", "))}\n内容：${h(textValue.slice(0, 300))}`);
-        await tgSendMessage(env, message.chat.id, "消息已被系统拦截。");
+        await sendUserNoticeSafely(env, message.chat.id, "消息已被系统拦截。", { userId: user.id, stage: "spam" });
         return;
     }
     const row = await getInboxMessage(env, inboxId);
     try {
         await relayInboxByMode(env, row, message);
-        await tgSendMessage(env, message.chat.id, "已收到。");
     } catch (error) {
         await markInboxError(env, inboxId, String(error));
         await logEvent(env, "error", "failed to relay user message", { inboxId, error: String(error) });
-        await tgSendMessage(env, message.chat.id, "已收到消息，但转发管理员暂时失败。");
+        await sendUserNoticeSafely(env, message.chat.id, "已收到消息，但转发管理员暂时失败。", { userId: user.id, inboxId, stage: "relay-failed" });
+        return;
     }
+    await sendUserNoticeSafely(env, message.chat.id, "已收到。", { userId: user.id, inboxId, stage: "ack" });
 }
 
 async function relayStoredInboxToAdmins(env, row, originalMessage = null) {
@@ -2820,6 +2889,19 @@ async function tgSendMessage(env, chatId, textValue) {
     return tgCall(env, "sendMessage", { chat_id: chatId, text: textValue });
 }
 
+async function sendUserNoticeSafely(env, chatId, textValue, context = {}) {
+    try {
+        return await tgSendMessage(env, chatId, textValue);
+    } catch (error) {
+        await logEvent(env, "warn", "failed to notify user", {
+            ...context,
+            chatId: Number(chatId),
+            error: String(error?.message || error),
+        });
+        return null;
+    }
+}
+
 async function tgCall(env, method, payload) {
     if (!env.BOT_TOKEN) throw new Error("BOT_TOKEN is missing");
     const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
@@ -2872,6 +2954,26 @@ async function isBlocked(env, userId) {
 
 async function setBlock(env, userId, blocked) {
     await env.DB.prepare("UPDATE users SET blocked=?, updated_at=? WHERE user_id=?").bind(blocked ? 1 : 0, nowIso(), userId).run();
+}
+
+async function isInboundMuted(env, userId) {
+    const row = await getUser(env, userId);
+    return Boolean(row?.inbound_muted);
+}
+
+async function setInboundMuted(env, userId, muted) {
+    await env.DB.prepare("UPDATE users SET inbound_muted=?, updated_at=? WHERE user_id=?").bind(muted ? 1 : 0, nowIso(), userId).run();
+}
+
+async function claimTelegramUpdate(env, updateId) {
+    const result = await env.DB.prepare("INSERT OR IGNORE INTO telegram_updates(update_id, received_at) VALUES(?, ?)")
+        .bind(Number(updateId), nowIso())
+        .run();
+    return Number(result.meta?.changes || 0) > 0;
+}
+
+async function releaseTelegramUpdate(env, updateId) {
+    await env.DB.prepare("DELETE FROM telegram_updates WHERE update_id=?").bind(Number(updateId)).run();
 }
 
 async function isVerified(env, userId) {
@@ -3095,31 +3197,57 @@ async function handleCallbackQuery(env, query) {
         return;
     }
     const parts = data.split(":");
-    const [action, rawUserId, rawLabelId] = parts;
-    if (action === "fpconfirm") {
+    const [action, rawUserId, rawLabelId, rawSlot, rawPrefix] = parts;
+    if (action === "fpmark") {
         const userId = Number(rawUserId);
-        const targetSlot = Number(rawLabelId);
-        const candidateUserId = Number(parts[3]);
-        const candidateSlot = Number(parts[4]);
-        const evidenceToken = String(parts[5] || "");
-        if (![userId, targetSlot, candidateUserId, candidateSlot].every(Number.isFinite)) {
+        if (!Number.isFinite(userId)) {
             await answerCallbackQuery(env, query.id, "参数错误");
             return;
         }
-        const result = await confirmFingerprintIdentity(env, userId, targetSlot, candidateUserId, candidateSlot, evidenceToken, adminId);
+        const result = await markFingerprintLabel(env, userId, adminId, String(rawSlot || ""));
         if (result.error) {
             await answerCallbackQuery(env, query.id, result.error.slice(0, 180));
             return;
         }
-        const basis = result.evidence.webrtcExact
-            ? "WebRTC 公网地址完全一致"
-            : `设备指纹相似度 ${result.evidence.score}%`;
+        await answerCallbackQuery(env, query.id, "指纹标签已保存");
+        await sendCallbackContextMessage(env, query, `已标记指纹\n用户 ID：${userId}\n标签：${result.label.label_name}\n完整指纹：${result.latest.profile.exactHash.slice(0, 20)}\n该用户已记为管理员确认。`);
+        return;
+    }
+    if (action === "fplabels") {
+        const userId = Number(rawUserId);
+        if (!Number.isFinite(userId)) {
+            await answerCallbackQuery(env, query.id, "参数错误");
+            return;
+        }
+        await answerCallbackQuery(env, query.id, "已发送指纹标签");
+        await sendFingerprintLabels(env, query, userId);
+        return;
+    }
+    if (action === "fpdelete") {
+        const labelId = Number(rawUserId);
+        if (!Number.isFinite(labelId)) {
+            await answerCallbackQuery(env, query.id, "参数错误");
+            return;
+        }
+        const deleted = await deleteFingerprintLabel(env, labelId);
+        await answerCallbackQuery(env, query.id, deleted ? "指纹标签已删除" : "标签不存在");
+        if (deleted) await sendCallbackContextMessage(env, query, `已删除指纹标签 #${labelId}：${deleted.label_name}`);
+        return;
+    }
+    if (action === "fpconfirm") {
+        const userId = Number(rawUserId);
+        const labelId = Number(rawLabelId);
+        if (!Number.isFinite(userId) || !Number.isFinite(labelId)) {
+            await answerCallbackQuery(env, query.id, "参数错误");
+            return;
+        }
+        const result = await confirmFingerprintMatch(env, userId, labelId, adminId, String(rawPrefix || ""));
+        if (result.error) {
+            await answerCallbackQuery(env, query.id, result.error.slice(0, 180));
+            return;
+        }
         await answerCallbackQuery(env, query.id, "已人工确认同一人");
-        await sendCallbackContextMessage(
-            env,
-            query,
-            "已人工确认\n用户 ID：" + userId + "\n标签：" + result.label.label_name + "\n重新计算依据：" + basis + "。",
-        );
+        await sendCallbackContextMessage(env, query, `已人工确认\n用户 ID：${userId}\n标签：${result.label.label_name}\n相似度：${result.match.score}%\n依据：${result.match.evidence?.join("、") || "相似指纹"}`);
         return;
     }
     if (action === "rtcmark") {
@@ -3213,28 +3341,29 @@ async function answerCallbackQuery(env, callbackQueryId, textValue) {
 
 async function notifyVerificationSuccess(env, userId, token, info) {
     const username = info.username ? `@${h(info.username)}` : "无";
-    const fingerprintText = info.deviceFingerprint ? h(info.deviceFingerprint.slice(0, 32)) : "-";
-    const matchedFields = Array.isArray(info.fingerprintMatchedFields) && info.fingerprintMatchedFields.length
-        ? info.fingerprintMatchedFields.map((field) => h(field)).join("、")
-        : "无";
-    const matchText = info.fingerprintMatchedUserId
-        ? `\n\n${h(fingerprintMatchTitle(info))}\n标签：${h(info.fingerprintLabel || "未设置")}\n指纹相似度：${Number(info.fingerprintSimilarity || 0)}%\n匹配字段：${matchedFields}\n匹配用户 ID：<code>${info.fingerprintMatchedUserId}</code>\n匹配用户名：${info.fingerprintMatchedUsername ? `@${h(info.fingerprintMatchedUsername)}` : "无"}\n说明：浏览器采集线索仅供管理员人工判断。`
-        : "";
     const identityText = info.webrtcIdentityLabelId
         ? `\n\n${info.webrtcIdentityConfirmed ? "WebRTC 标签（管理员已确认）" : "WebRTC 标签命中（待人工确认）"}\n标签：${h(info.webrtcIdentityLabelName || "未设置")}\n来源用户 ID：<code>${info.webrtcIdentitySourceUserId || "-"}</code>\n匹配依据：WebRTC ${h(info.webrtcIdentityIpVersion || "-")} 完全相同`
         : "";
-    const textValue = `新用户验证通过\n用户 ID：<code>${userId}</code>\n昵称：${h(info.fullName || "-")}\n用户名：${username}\n语言：${h(info.languageCode || "-")}\n\n本次验证信息\n设备系统：${h(info.deviceOs || "-")}\n设备指纹：<code>${fingerprintText}</code>\nHTTP IP：<code>${h(info.httpIp || "-")}</code>\nHTTP IP 类型：${h(info.httpIpVersion || "-")}\n公网 IPv4：<code>${h(info.httpIpv4 || "-")}</code>\n公网 IPv6：<code>${h(info.httpIpv6 || "-")}</code>\n公网 ASN：${h(info.asn || "-")}\n运营商：${h(info.asOrganization || "-")}\n国家/地区：${h(info.country || "-")}\nCloudflare 机房：${h(info.colo || "-")}\n\nUDP / WebRTC 信息\nWebRTC IPv4：<code>${h(info.webrtcIpv4 || "-")}</code>\nWebRTC IPv6：<code>${h(info.webrtcIpv6 || "-")}</code>\nUDP 状态：${h(info.udpStatus || "-")}\nCandidate 类型：${h(info.candidateType || "-")}${matchText}${identityText}`;
+    const fingerprintMatchesText = (info.fingerprintMatches || []).length
+        ? "\n\n指纹候选（仅供人工确认）\n" + info.fingerprintMatches.slice(0, 5).map((match) => `- ${h(match.labelName)} [${match.state === "blacklist" ? "指纹黑名单" : "观察"}]：${match.score}%（总分 ${match.weightedScore}% / 网络 ${match.networkScore}% / 设备 ${match.deviceScore}%）\n  依据：${h(match.evidence?.join("、") || "稀疏特征相似")}`).join("\n")
+        : "";
+    const fingerprintText = `\n\n指纹 V2\n完整哈希：<code>${h(info.fingerprintHash ? info.fingerprintHash.slice(0, 24) : "-")}</code>\n质量：${Number(info.fingerprintQuality || 0)}%\n设备型号：${h(info.fingerprintSummary?.model || "-")}\n性能等级：${h(info.fingerprintSummary?.performanceClass || "-")}\nTelegram 客户端：${h([info.fingerprintSummary?.telegramPlatform, info.fingerprintSummary?.telegramVersion].filter(Boolean).join(" ") || "-")}${fingerprintMatchesText}`;
+    const textValue = `新用户验证通过\n用户 ID：<code>${userId}</code>\n昵称：${h(info.fullName || "-")}\n用户名：${username}\n语言：${h(info.languageCode || "-")}\n\n本次验证信息\n设备系统：${h(info.deviceOs || "-")}\nHTTP IP：<code>${h(info.httpIp || "-")}</code>\nHTTP IP 类型：${h(info.httpIpVersion || "-")}\n公网 IPv4：<code>${h(info.httpIpv4 || "-")}</code>\n公网 IPv6：<code>${h(info.httpIpv6 || "-")}</code>\n公网 ASN：${h(info.asn || "-")}\n运营商：${h(info.asOrganization || "-")}\n国家/地区：${h(info.country || "-")}\nCloudflare 机房：${h(info.colo || "-")}\n\nUDP / WebRTC 信息\nWebRTC IPv4：<code>${h(info.webrtcIpv4 || "-")}</code>\nWebRTC IPv6：<code>${h(info.webrtcIpv6 || "-")}</code>\nWebRTC ASN：${h(info.webRtcAsn || "-")}\nWebRTC ISP：${h(info.webRtcIsp || "-")}\nUDP 状态：${h(info.udpStatus || "-")}\nCandidate 类型：${h(info.candidateType || "-")}${identityText}${fingerprintText}`;
     const keyboard = [];
     if (info.webrtcIdentityLabelId && !info.webrtcIdentityConfirmed) {
         keyboard.push([{ text: "确认同一人（WebRTC）", callback_data: "rtcconfirm:" + userId + ":" + info.webrtcIdentityLabelId }]);
-    } else if (!info.webrtcIdentityLabelId) {
-        const fingerprintCallback = fingerprintConfirmCallbackData(userId, info);
-        if (fingerprintCallback) {
-            keyboard.push([{ text: "确认同一人（指纹候选）", callback_data: fingerprintCallback }]);
-        }
     }
-    if (info.fingerprintMatchedUserId) {
-        keyboard.push([{ text: "查看匹配账号", callback_data: "who:" + info.fingerprintMatchedUserId }]);
+    const fingerprintPrefix = String(info.fingerprintHash || "").slice(0, 12);
+    const fingerprintSlot = Number(info.fingerprintSlot || 0);
+    const firstMatch = info.fingerprintMatches?.[0];
+    if (firstMatch && fingerprintPrefix && fingerprintSlot) {
+        keyboard.push([{ text: `确认同一人（${firstMatch.score}%）`, callback_data: `fpconfirm:${userId}:${firstMatch.labelId}:${fingerprintSlot}:${fingerprintPrefix}` }]);
+    }
+    if (fingerprintPrefix && fingerprintSlot) {
+        keyboard.push([
+            { text: "标记指纹", callback_data: `fpmark:${userId}:${fingerprintSlot}:${fingerprintPrefix}` },
+            { text: "指纹标签", callback_data: `fplabels:${userId}` },
+        ]);
     }
     const rtcActions = [{ text: "WebRTC 标签", callback_data: "rtclabels:" + userId }];
     if (info.webrtcIdentityHash) {
@@ -3371,15 +3500,108 @@ function requestCfInfo(request) {
     };
 }
 
-function detectDeviceOs(userAgent, clientData = {}) {
-    const ua = String(userAgent || clientData.user_agent || "");
-    const platform = String(clientData.platform || "");
+function detectDeviceOs(userAgent) {
+    const ua = String(userAgent || "");
     if (/Android/i.test(ua)) return "Android";
     if (/iPhone|iPad|iPod/i.test(ua)) return "iOS";
-    if (/Windows/i.test(ua) || /Win/i.test(platform)) return "Windows";
-    if (/Mac OS|Macintosh/i.test(ua) || /Mac/i.test(platform)) return "macOS";
+    if (/Windows/i.test(ua)) return "Windows";
+    if (/Mac OS|Macintosh/i.test(ua)) return "macOS";
     if (/Linux/i.test(ua)) return "Linux";
-    return platform || "Unknown";
+    return "Unknown";
+}
+
+async function ensureFingerprintV2Schema(env, schemaObjects) {
+    const tables = [
+        ["fingerprint_profiles_v2", `CREATE TABLE IF NOT EXISTS fingerprint_profiles_v2 (
+            user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE, slot INTEGER NOT NULL CHECK(slot BETWEEN 1 AND 3),
+            algorithm_version INTEGER NOT NULL DEFAULT 2 CHECK(algorithm_version BETWEEN 1 AND 255),
+            exact_hash TEXT NOT NULL CHECK(length(exact_hash) IN (43,64)),
+            device_simhash TEXT NOT NULL CHECK(length(device_simhash)=16 AND device_simhash NOT GLOB '*[^0-9a-f]*'),
+            device_feature_mask INTEGER NOT NULL DEFAULT 0 CHECK(device_feature_mask BETWEEN 0 AND 2147483647),
+            font_bits TEXT NOT NULL CHECK(length(font_bits)=16 AND font_bits NOT GLOB '*[^0-9a-f]*'),
+            font_minhash TEXT NOT NULL DEFAULT '[]' CHECK(length(font_minhash)<=2048 AND json_valid(font_minhash) AND json_type(font_minhash)='array'),
+            device_vector TEXT NOT NULL DEFAULT '[]' CHECK(length(device_vector)<=2048 AND json_valid(device_vector) AND json_type(device_vector)='array'),
+            device_vector_mask INTEGER NOT NULL DEFAULT 0 CHECK(device_vector_mask BETWEEN 0 AND 2147483647),
+            canvas_key TEXT NOT NULL DEFAULT '' CHECK(length(canvas_key) IN (0,43,64)),
+            webgl_key TEXT NOT NULL DEFAULT '' CHECK(length(webgl_key) IN (0,43,64)),
+            audio_key TEXT NOT NULL DEFAULT '' CHECK(length(audio_key) IN (0,43,64)),
+            webrtc_keys TEXT NOT NULL DEFAULT '[]' CHECK(length(webrtc_keys)<=1024 AND json_valid(webrtc_keys) AND json_type(webrtc_keys)='array'),
+            webrtc_asn_keys TEXT NOT NULL DEFAULT '[]' CHECK(length(webrtc_asn_keys)<=1024 AND json_valid(webrtc_asn_keys) AND json_type(webrtc_asn_keys)='array'),
+            webrtc_isp_keys TEXT NOT NULL DEFAULT '[]' CHECK(length(webrtc_isp_keys)<=1024 AND json_valid(webrtc_isp_keys) AND json_type(webrtc_isp_keys)='array'),
+            http_key TEXT NOT NULL DEFAULT '' CHECK(length(http_key) IN (0,43,64)),
+            http_asn_key TEXT NOT NULL DEFAULT '' CHECK(length(http_asn_key) IN (0,43,64)),
+            http_isp_key TEXT NOT NULL DEFAULT '' CHECK(length(http_isp_key) IN (0,43,64)),
+            quality_score INTEGER NOT NULL DEFAULT 0 CHECK(quality_score BETWEEN 0 AND 100),
+            summary_json TEXT NOT NULL DEFAULT '{}' CHECK(length(summary_json)<=4096 AND json_valid(summary_json) AND json_type(summary_json)='object'),
+            seen_count INTEGER NOT NULL DEFAULT 1 CHECK(seen_count BETWEEN 1 AND 2147483647),
+            first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, PRIMARY KEY(user_id,slot), UNIQUE(user_id,exact_hash)
+        ) WITHOUT ROWID`],
+        ["fingerprint_labels_v2", `CREATE TABLE IF NOT EXISTS fingerprint_labels_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label_name TEXT NOT NULL CHECK(length(label_name) BETWEEN 1 AND 80),
+            note TEXT NOT NULL DEFAULT '' CHECK(length(note)<=1000),
+            state TEXT NOT NULL DEFAULT 'watch' CHECK(state IN ('watch','blacklist')),
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+            source_user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE, created_by_user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )`],
+        ["fingerprint_reference_profiles_v2", `CREATE TABLE IF NOT EXISTS fingerprint_reference_profiles_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, label_id INTEGER NOT NULL REFERENCES fingerprint_labels_v2(id) ON DELETE CASCADE,
+            source_user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            source_slot INTEGER NOT NULL CHECK(source_slot BETWEEN 1 AND 3),
+            algorithm_version INTEGER NOT NULL DEFAULT 2 CHECK(algorithm_version BETWEEN 1 AND 255),
+            exact_hash TEXT NOT NULL CHECK(length(exact_hash) IN (43,64)),
+            device_simhash TEXT NOT NULL CHECK(length(device_simhash)=16 AND device_simhash NOT GLOB '*[^0-9a-f]*'),
+            device_feature_mask INTEGER NOT NULL DEFAULT 0 CHECK(device_feature_mask BETWEEN 0 AND 2147483647),
+            font_bits TEXT NOT NULL CHECK(length(font_bits)=16 AND font_bits NOT GLOB '*[^0-9a-f]*'),
+            font_minhash TEXT NOT NULL DEFAULT '[]' CHECK(length(font_minhash)<=2048 AND json_valid(font_minhash) AND json_type(font_minhash)='array'),
+            device_vector TEXT NOT NULL DEFAULT '[]' CHECK(length(device_vector)<=2048 AND json_valid(device_vector) AND json_type(device_vector)='array'),
+            device_vector_mask INTEGER NOT NULL DEFAULT 0 CHECK(device_vector_mask BETWEEN 0 AND 2147483647),
+            canvas_key TEXT NOT NULL DEFAULT '' CHECK(length(canvas_key) IN (0,43,64)),
+            webgl_key TEXT NOT NULL DEFAULT '' CHECK(length(webgl_key) IN (0,43,64)),
+            audio_key TEXT NOT NULL DEFAULT '' CHECK(length(audio_key) IN (0,43,64)),
+            webrtc_keys TEXT NOT NULL DEFAULT '[]' CHECK(length(webrtc_keys)<=2048 AND json_valid(webrtc_keys) AND json_type(webrtc_keys)='array'),
+            webrtc_asn_keys TEXT NOT NULL DEFAULT '[]' CHECK(length(webrtc_asn_keys)<=2048 AND json_valid(webrtc_asn_keys) AND json_type(webrtc_asn_keys)='array'),
+            webrtc_isp_keys TEXT NOT NULL DEFAULT '[]' CHECK(length(webrtc_isp_keys)<=2048 AND json_valid(webrtc_isp_keys) AND json_type(webrtc_isp_keys)='array'),
+            http_key TEXT NOT NULL CHECK(length(http_key) IN (43,64)),
+            http_asn_key TEXT NOT NULL DEFAULT '' CHECK(length(http_asn_key) IN (0,43,64)),
+            http_isp_key TEXT NOT NULL DEFAULT '' CHECK(length(http_isp_key) IN (0,43,64)),
+            quality_score INTEGER NOT NULL DEFAULT 63 CHECK(quality_score BETWEEN 63 AND 100),
+            summary_json TEXT NOT NULL DEFAULT '{}' CHECK(length(summary_json)<=4096 AND json_valid(summary_json) AND json_type(summary_json)='object'),
+            created_by_user_id INTEGER NOT NULL, created_at TEXT NOT NULL, last_matched_at TEXT,
+            match_count INTEGER NOT NULL DEFAULT 0 CHECK(match_count BETWEEN 0 AND 2147483647), UNIQUE(label_id,exact_hash)
+        )`],
+        ["fingerprint_reference_lookup_v2", `CREATE TABLE IF NOT EXISTS fingerprint_reference_lookup_v2 (
+            kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 4),
+            band INTEGER NOT NULL CHECK((kind IN (0,1,2) AND band=0) OR (kind IN (3,4) AND band BETWEEN 0 AND 3)),
+            lookup_key TEXT NOT NULL CHECK(length(lookup_key) BETWEEN 1 AND 256),
+            reference_id INTEGER NOT NULL REFERENCES fingerprint_reference_profiles_v2(id) ON DELETE CASCADE,
+            PRIMARY KEY(kind,band,lookup_key,reference_id)
+        ) WITHOUT ROWID`],
+        ["fingerprint_user_labels_v2", `CREATE TABLE IF NOT EXISTS fingerprint_user_labels_v2 (
+            user_id INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+            label_id INTEGER NOT NULL REFERENCES fingerprint_labels_v2(id) ON DELETE CASCADE,
+            reference_id INTEGER REFERENCES fingerprint_reference_profiles_v2(id) ON DELETE SET NULL,
+            confirmed_by_user_id INTEGER NOT NULL,
+            match_method TEXT NOT NULL CHECK(length(match_method) BETWEEN 1 AND 32),
+            weighted_score INTEGER NOT NULL CHECK(weighted_score BETWEEN 0 AND 100),
+            evidence_mask INTEGER NOT NULL DEFAULT 0 CHECK(evidence_mask BETWEEN 0 AND 2147483647),
+            confirmed_at TEXT NOT NULL
+        ) WITHOUT ROWID`],
+    ];
+    for (const [name, sql] of tables) {
+        if (!schemaObjects.has(`table:${name}`)) await env.DB.prepare(sql).run();
+    }
+    const indexes = [
+        ["idx_fingerprint_labels_v2_state", "CREATE INDEX IF NOT EXISTS idx_fingerprint_labels_v2_state ON fingerprint_labels_v2(active,state,updated_at DESC)"],
+        ["idx_fingerprint_labels_v2_source", "CREATE INDEX IF NOT EXISTS idx_fingerprint_labels_v2_source ON fingerprint_labels_v2(source_user_id,updated_at DESC)"],
+        ["idx_fingerprint_reference_profiles_v2_label", "CREATE INDEX IF NOT EXISTS idx_fingerprint_reference_profiles_v2_label ON fingerprint_reference_profiles_v2(label_id,created_at DESC)"],
+        ["idx_fingerprint_reference_lookup_v2_reference", "CREATE INDEX IF NOT EXISTS idx_fingerprint_reference_lookup_v2_reference ON fingerprint_reference_lookup_v2(reference_id)"],
+        ["idx_fingerprint_user_labels_v2_label", "CREATE INDEX IF NOT EXISTS idx_fingerprint_user_labels_v2_label ON fingerprint_user_labels_v2(label_id,confirmed_at DESC)"],
+    ];
+    for (const [name, sql] of indexes) {
+        if (!schemaObjects.has(`index:${name}`)) await env.DB.prepare(sql).run();
+    }
 }
 
 async function ensureVerificationSchema(env) {
@@ -3440,37 +3662,16 @@ async function ensureVerificationSchema(env) {
             "confirmed_at TEXT NOT NULL)",
         ).run();
     }
-    if (!schemaObjects.has("table:device_fingerprint_profiles")) {
-        await env.DB.prepare(
-            "CREATE TABLE IF NOT EXISTS device_fingerprint_profiles (" +
-            "user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE, " +
-            "slot INTEGER NOT NULL CHECK(slot BETWEEN 1 AND 3), " +
-            "profile_hash TEXT NOT NULL CHECK(length(profile_hash)=32), " +
-            "webrtc_ipv4_hash TEXT NOT NULL DEFAULT '' CHECK(webrtc_ipv4_hash='' OR length(webrtc_ipv4_hash)=32), " +
-            "webrtc_ipv4_hash2 TEXT NOT NULL DEFAULT '' CHECK(webrtc_ipv4_hash2='' OR length(webrtc_ipv4_hash2)=32), " +
-            "webrtc_ipv6_hash TEXT NOT NULL DEFAULT '' CHECK(webrtc_ipv6_hash='' OR length(webrtc_ipv6_hash)=32), " +
-            "webrtc_ipv6_hash2 TEXT NOT NULL DEFAULT '' CHECK(webrtc_ipv6_hash2='' OR length(webrtc_ipv6_hash2)=32), " +
-            "stable_hash TEXT NOT NULL DEFAULT '' CHECK(stable_hash='' OR length(stable_hash)=32), " +
-            "canvas_hash TEXT NOT NULL DEFAULT '' CHECK(canvas_hash='' OR length(canvas_hash)=32), " +
-            "renderer_hash TEXT NOT NULL DEFAULT '' CHECK(renderer_hash='' OR length(renderer_hash)=32), " +
-            "limits_hash TEXT NOT NULL DEFAULT '' CHECK(limits_hash='' OR length(limits_hash)=32), " +
-            "os_hash TEXT NOT NULL DEFAULT '' CHECK(os_hash='' OR length(os_hash)=32), " +
-            "screen_hash TEXT NOT NULL DEFAULT '' CHECK(screen_hash='' OR length(screen_hash)=32), " +
-            "dpr_depth_hash TEXT NOT NULL DEFAULT '' CHECK(dpr_depth_hash='' OR length(dpr_depth_hash)=32), " +
-            "hardware_hash TEXT NOT NULL DEFAULT '' CHECK(hardware_hash='' OR length(hardware_hash)=32), " +
-            "touch_hash TEXT NOT NULL DEFAULT '' CHECK(touch_hash='' OR length(touch_hash)=32), " +
-            "timezone_hash TEXT NOT NULL DEFAULT '' CHECK(timezone_hash='' OR length(timezone_hash)=32), " +
-            "language_hash TEXT NOT NULL DEFAULT '' CHECK(language_hash='' OR length(language_hash)=32), " +
-            "feature_mask INTEGER NOT NULL DEFAULT 0, " +
-            "seen_count INTEGER NOT NULL DEFAULT 1 CHECK(seen_count BETWEEN 1 AND 2147483647), " +
-            "first_seen_at TEXT NOT NULL, " +
-            "last_seen_at TEXT NOT NULL, " +
-            "PRIMARY KEY(user_id, slot), " +
-            "UNIQUE(user_id, profile_hash)) WITHOUT ROWID",
-        ).run();
+    if (!schemaObjects.has("table:telegram_updates")) {
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS telegram_updates (
+            update_id INTEGER PRIMARY KEY,
+            received_at TEXT NOT NULL
+        )`).run();
     }
+    await ensureFingerprintV2Schema(env, schemaObjects);
     const userColumns = [
         "language_code TEXT DEFAULT ''",
+        "inbound_muted INTEGER DEFAULT 0",
         "verified INTEGER DEFAULT 0",
         "verification_status TEXT DEFAULT 'pending'",
         "verification_token TEXT DEFAULT ''",
@@ -3485,7 +3686,6 @@ async function ensureVerificationSchema(env) {
         "last_as_organization TEXT DEFAULT ''",
         "last_device_os TEXT DEFAULT ''",
         "last_user_agent TEXT DEFAULT ''",
-        "last_device_fingerprint TEXT NOT NULL DEFAULT '' CHECK(last_device_fingerprint='' OR length(last_device_fingerprint)=32)",
         "topic_chat_id INTEGER",
         "topic_thread_id INTEGER",
         "topic_title TEXT DEFAULT ''",
@@ -3522,16 +3722,7 @@ async function ensureVerificationSchema(env) {
     await ensureColumns(env, "ip_verifications", verificationColumns);
     const indexes = [
         { name: "idx_users_topic", sql: "CREATE INDEX IF NOT EXISTS idx_users_topic ON users(topic_chat_id, topic_thread_id)" },
-        { name: "idx_users_device_fingerprint", sql: "CREATE INDEX IF NOT EXISTS idx_users_device_fingerprint ON users(last_device_fingerprint) WHERE last_device_fingerprint<>''" },
-        { name: "idx_users_device_fingerprint_updated", sql: "CREATE INDEX IF NOT EXISTS idx_users_device_fingerprint_updated ON users(last_device_fingerprint, updated_at DESC) WHERE last_device_fingerprint<>''" },
-        { name: "idx_fp_profiles_profile", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_profile ON device_fingerprint_profiles(profile_hash, last_seen_at DESC)" },
-        { name: "idx_fp_profiles_webrtc4", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_webrtc4 ON device_fingerprint_profiles(webrtc_ipv4_hash, last_seen_at DESC) WHERE webrtc_ipv4_hash<>''" },
-        { name: "idx_fp_profiles_webrtc4b", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_webrtc4b ON device_fingerprint_profiles(webrtc_ipv4_hash2, last_seen_at DESC) WHERE webrtc_ipv4_hash2<>''" },
-        { name: "idx_fp_profiles_webrtc6", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_webrtc6 ON device_fingerprint_profiles(webrtc_ipv6_hash, last_seen_at DESC) WHERE webrtc_ipv6_hash<>''" },
-        { name: "idx_fp_profiles_webrtc6b", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_webrtc6b ON device_fingerprint_profiles(webrtc_ipv6_hash2, last_seen_at DESC) WHERE webrtc_ipv6_hash2<>''" },
-        { name: "idx_fp_profiles_stable", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_stable ON device_fingerprint_profiles(stable_hash, last_seen_at DESC) WHERE stable_hash<>''" },
-        { name: "idx_fp_profiles_renderer", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_renderer ON device_fingerprint_profiles(renderer_hash, last_seen_at DESC) WHERE renderer_hash<>''" },
-        { name: "idx_fp_profiles_canvas", sql: "CREATE INDEX IF NOT EXISTS idx_fp_profiles_canvas ON device_fingerprint_profiles(canvas_hash, last_seen_at DESC) WHERE canvas_hash<>''" },
+        { name: "idx_users_inbound_muted", sql: "CREATE INDEX IF NOT EXISTS idx_users_inbound_muted ON users(inbound_muted, updated_at DESC)" },
         { name: "idx_webrtc_identity_labels_source", sql: "CREATE INDEX IF NOT EXISTS idx_webrtc_identity_labels_source ON webrtc_identity_labels(source_user_id, updated_at DESC)" },
         { name: "idx_webrtc_identity_confirmations_label", sql: "CREATE INDEX IF NOT EXISTS idx_webrtc_identity_confirmations_label ON webrtc_identity_confirmations(label_id)" },
         { name: "idx_inbox_topic_created", sql: "CREATE INDEX IF NOT EXISTS idx_inbox_topic_created ON inbox_messages(topic_chat_id, topic_thread_id, created_at)" },

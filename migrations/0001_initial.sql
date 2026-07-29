@@ -24,7 +24,6 @@ CREATE TABLE IF NOT EXISTS users (
     last_as_organization TEXT DEFAULT '',
     last_device_os TEXT DEFAULT '',
     last_user_agent TEXT DEFAULT '',
-    last_device_fingerprint TEXT NOT NULL DEFAULT '' CHECK(last_device_fingerprint='' OR length(last_device_fingerprint)=32),
     topic_chat_id INTEGER,
     topic_thread_id INTEGER,
     topic_title TEXT DEFAULT '',
@@ -167,47 +166,105 @@ CREATE TABLE IF NOT EXISTS webrtc_identity_confirmations (
     confirmed_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS device_fingerprint_profiles (
+CREATE TABLE IF NOT EXISTS fingerprint_profiles_v2 (
     user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
     slot INTEGER NOT NULL CHECK(slot BETWEEN 1 AND 3),
-    profile_hash TEXT NOT NULL CHECK(length(profile_hash)=32),
-    webrtc_ipv4_hash TEXT NOT NULL DEFAULT '' CHECK(webrtc_ipv4_hash='' OR length(webrtc_ipv4_hash)=32),
-    webrtc_ipv4_hash2 TEXT NOT NULL DEFAULT '' CHECK(webrtc_ipv4_hash2='' OR length(webrtc_ipv4_hash2)=32),
-    webrtc_ipv6_hash TEXT NOT NULL DEFAULT '' CHECK(webrtc_ipv6_hash='' OR length(webrtc_ipv6_hash)=32),
-    webrtc_ipv6_hash2 TEXT NOT NULL DEFAULT '' CHECK(webrtc_ipv6_hash2='' OR length(webrtc_ipv6_hash2)=32),
-    stable_hash TEXT NOT NULL DEFAULT '' CHECK(stable_hash='' OR length(stable_hash)=32),
-    canvas_hash TEXT NOT NULL DEFAULT '' CHECK(canvas_hash='' OR length(canvas_hash)=32),
-    renderer_hash TEXT NOT NULL DEFAULT '' CHECK(renderer_hash='' OR length(renderer_hash)=32),
-    limits_hash TEXT NOT NULL DEFAULT '' CHECK(limits_hash='' OR length(limits_hash)=32),
-    os_hash TEXT NOT NULL DEFAULT '' CHECK(os_hash='' OR length(os_hash)=32),
-    screen_hash TEXT NOT NULL DEFAULT '' CHECK(screen_hash='' OR length(screen_hash)=32),
-    dpr_depth_hash TEXT NOT NULL DEFAULT '' CHECK(dpr_depth_hash='' OR length(dpr_depth_hash)=32),
-    hardware_hash TEXT NOT NULL DEFAULT '' CHECK(hardware_hash='' OR length(hardware_hash)=32),
-    touch_hash TEXT NOT NULL DEFAULT '' CHECK(touch_hash='' OR length(touch_hash)=32),
-    timezone_hash TEXT NOT NULL DEFAULT '' CHECK(timezone_hash='' OR length(timezone_hash)=32),
-    language_hash TEXT NOT NULL DEFAULT '' CHECK(language_hash='' OR length(language_hash)=32),
-    feature_mask INTEGER NOT NULL DEFAULT 0,
+    algorithm_version INTEGER NOT NULL DEFAULT 2 CHECK(algorithm_version BETWEEN 1 AND 255),
+    exact_hash TEXT NOT NULL CHECK(length(exact_hash) IN (43,64)),
+    device_simhash TEXT NOT NULL CHECK(length(device_simhash)=16 AND device_simhash NOT GLOB '*[^0-9a-f]*'),
+    device_feature_mask INTEGER NOT NULL DEFAULT 0 CHECK(device_feature_mask BETWEEN 0 AND 2147483647),
+    font_bits TEXT NOT NULL CHECK(length(font_bits)=16 AND font_bits NOT GLOB '*[^0-9a-f]*'),
+    font_minhash TEXT NOT NULL DEFAULT '[]' CHECK(length(font_minhash)<=2048 AND json_valid(font_minhash) AND json_type(font_minhash)='array'),
+    device_vector TEXT NOT NULL DEFAULT '[]' CHECK(length(device_vector)<=2048 AND json_valid(device_vector) AND json_type(device_vector)='array'),
+    device_vector_mask INTEGER NOT NULL DEFAULT 0 CHECK(device_vector_mask BETWEEN 0 AND 2147483647),
+    canvas_key TEXT NOT NULL DEFAULT '' CHECK(length(canvas_key) IN (0,43,64)),
+    webgl_key TEXT NOT NULL DEFAULT '' CHECK(length(webgl_key) IN (0,43,64)),
+    audio_key TEXT NOT NULL DEFAULT '' CHECK(length(audio_key) IN (0,43,64)),
+    webrtc_keys TEXT NOT NULL DEFAULT '[]' CHECK(length(webrtc_keys)<=1024 AND json_valid(webrtc_keys) AND json_type(webrtc_keys)='array'),
+    webrtc_asn_keys TEXT NOT NULL DEFAULT '[]' CHECK(length(webrtc_asn_keys)<=1024 AND json_valid(webrtc_asn_keys) AND json_type(webrtc_asn_keys)='array'),
+    webrtc_isp_keys TEXT NOT NULL DEFAULT '[]' CHECK(length(webrtc_isp_keys)<=1024 AND json_valid(webrtc_isp_keys) AND json_type(webrtc_isp_keys)='array'),
+    http_key TEXT NOT NULL DEFAULT '' CHECK(length(http_key) IN (0,43,64)),
+    http_asn_key TEXT NOT NULL DEFAULT '' CHECK(length(http_asn_key) IN (0,43,64)),
+    http_isp_key TEXT NOT NULL DEFAULT '' CHECK(length(http_isp_key) IN (0,43,64)),
+    quality_score INTEGER NOT NULL DEFAULT 0 CHECK(quality_score BETWEEN 0 AND 100),
+    summary_json TEXT NOT NULL DEFAULT '{}' CHECK(length(summary_json)<=4096 AND json_valid(summary_json) AND json_type(summary_json)='object'),
     seen_count INTEGER NOT NULL DEFAULT 1 CHECK(seen_count BETWEEN 1 AND 2147483647),
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
     PRIMARY KEY(user_id, slot),
-    UNIQUE(user_id, profile_hash)
+    UNIQUE(user_id, exact_hash)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS fingerprint_labels_v2 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label_name TEXT NOT NULL CHECK(length(label_name) BETWEEN 1 AND 80),
+    note TEXT NOT NULL DEFAULT '' CHECK(length(note)<=1000),
+    state TEXT NOT NULL DEFAULT 'watch' CHECK(state IN ('watch','blacklist')),
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    source_user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    created_by_user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fingerprint_reference_profiles_v2 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label_id INTEGER NOT NULL REFERENCES fingerprint_labels_v2(id) ON DELETE CASCADE,
+    source_user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    source_slot INTEGER NOT NULL CHECK(source_slot BETWEEN 1 AND 3),
+    algorithm_version INTEGER NOT NULL DEFAULT 2 CHECK(algorithm_version BETWEEN 1 AND 255),
+    exact_hash TEXT NOT NULL CHECK(length(exact_hash) IN (43,64)),
+    device_simhash TEXT NOT NULL CHECK(length(device_simhash)=16 AND device_simhash NOT GLOB '*[^0-9a-f]*'),
+    device_feature_mask INTEGER NOT NULL DEFAULT 0 CHECK(device_feature_mask BETWEEN 0 AND 2147483647),
+    font_bits TEXT NOT NULL CHECK(length(font_bits)=16 AND font_bits NOT GLOB '*[^0-9a-f]*'),
+    font_minhash TEXT NOT NULL DEFAULT '[]' CHECK(length(font_minhash)<=2048 AND json_valid(font_minhash) AND json_type(font_minhash)='array'),
+    device_vector TEXT NOT NULL DEFAULT '[]' CHECK(length(device_vector)<=2048 AND json_valid(device_vector) AND json_type(device_vector)='array'),
+    device_vector_mask INTEGER NOT NULL DEFAULT 0 CHECK(device_vector_mask BETWEEN 0 AND 2147483647),
+    canvas_key TEXT NOT NULL DEFAULT '' CHECK(length(canvas_key) IN (0,43,64)),
+    webgl_key TEXT NOT NULL DEFAULT '' CHECK(length(webgl_key) IN (0,43,64)),
+    audio_key TEXT NOT NULL DEFAULT '' CHECK(length(audio_key) IN (0,43,64)),
+    webrtc_keys TEXT NOT NULL DEFAULT '[]' CHECK(length(webrtc_keys)<=2048 AND json_valid(webrtc_keys) AND json_type(webrtc_keys)='array'),
+    webrtc_asn_keys TEXT NOT NULL DEFAULT '[]' CHECK(length(webrtc_asn_keys)<=2048 AND json_valid(webrtc_asn_keys) AND json_type(webrtc_asn_keys)='array'),
+    webrtc_isp_keys TEXT NOT NULL DEFAULT '[]' CHECK(length(webrtc_isp_keys)<=2048 AND json_valid(webrtc_isp_keys) AND json_type(webrtc_isp_keys)='array'),
+    http_key TEXT NOT NULL CHECK(length(http_key) IN (43,64)),
+    http_asn_key TEXT NOT NULL DEFAULT '' CHECK(length(http_asn_key) IN (0,43,64)),
+    http_isp_key TEXT NOT NULL DEFAULT '' CHECK(length(http_isp_key) IN (0,43,64)),
+    quality_score INTEGER NOT NULL DEFAULT 63 CHECK(quality_score BETWEEN 63 AND 100),
+    summary_json TEXT NOT NULL DEFAULT '{}' CHECK(length(summary_json)<=4096 AND json_valid(summary_json) AND json_type(summary_json)='object'),
+    created_by_user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    last_matched_at TEXT,
+    match_count INTEGER NOT NULL DEFAULT 0 CHECK(match_count BETWEEN 0 AND 2147483647),
+    UNIQUE(label_id, exact_hash)
+);
+
+-- kind: 0=exact, 1=WebRTC, 2=HTTP, 3=SimHash band, 4=MinHash band.
+CREATE TABLE IF NOT EXISTS fingerprint_reference_lookup_v2 (
+    kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 4),
+    band INTEGER NOT NULL CHECK(
+        (kind IN (0,1,2) AND band=0)
+        OR (kind IN (3,4) AND band BETWEEN 0 AND 3)
+    ),
+    lookup_key TEXT NOT NULL CHECK(length(lookup_key) BETWEEN 1 AND 256),
+    reference_id INTEGER NOT NULL REFERENCES fingerprint_reference_profiles_v2(id) ON DELETE CASCADE,
+    PRIMARY KEY(kind, band, lookup_key, reference_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS fingerprint_user_labels_v2 (
+    user_id INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+    label_id INTEGER NOT NULL REFERENCES fingerprint_labels_v2(id) ON DELETE CASCADE,
+    reference_id INTEGER REFERENCES fingerprint_reference_profiles_v2(id) ON DELETE SET NULL,
+    confirmed_by_user_id INTEGER NOT NULL,
+    match_method TEXT NOT NULL CHECK(length(match_method) BETWEEN 1 AND 32),
+    weighted_score INTEGER NOT NULL CHECK(weighted_score BETWEEN 0 AND 100),
+    evidence_mask INTEGER NOT NULL DEFAULT 0 CHECK(evidence_mask BETWEEN 0 AND 2147483647),
+    confirmed_at TEXT NOT NULL
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_rate_events_user_ts ON rate_events(user_id, ts);
 CREATE INDEX IF NOT EXISTS idx_inbox_user_created ON inbox_messages(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_inbox_created ON inbox_messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_users_topic ON users(topic_chat_id, topic_thread_id);
-CREATE INDEX IF NOT EXISTS idx_users_device_fingerprint ON users(last_device_fingerprint) WHERE last_device_fingerprint<>'';
-CREATE INDEX IF NOT EXISTS idx_users_device_fingerprint_updated ON users(last_device_fingerprint, updated_at DESC) WHERE last_device_fingerprint<>'';
-CREATE INDEX IF NOT EXISTS idx_fp_profiles_profile ON device_fingerprint_profiles(profile_hash, last_seen_at DESC);
-CREATE INDEX IF NOT EXISTS idx_fp_profiles_webrtc4 ON device_fingerprint_profiles(webrtc_ipv4_hash, last_seen_at DESC) WHERE webrtc_ipv4_hash<>'';
-CREATE INDEX IF NOT EXISTS idx_fp_profiles_webrtc4b ON device_fingerprint_profiles(webrtc_ipv4_hash2, last_seen_at DESC) WHERE webrtc_ipv4_hash2<>'';
-CREATE INDEX IF NOT EXISTS idx_fp_profiles_webrtc6 ON device_fingerprint_profiles(webrtc_ipv6_hash, last_seen_at DESC) WHERE webrtc_ipv6_hash<>'';
-CREATE INDEX IF NOT EXISTS idx_fp_profiles_webrtc6b ON device_fingerprint_profiles(webrtc_ipv6_hash2, last_seen_at DESC) WHERE webrtc_ipv6_hash2<>'';
-CREATE INDEX IF NOT EXISTS idx_fp_profiles_stable ON device_fingerprint_profiles(stable_hash, last_seen_at DESC) WHERE stable_hash<>'';
-CREATE INDEX IF NOT EXISTS idx_fp_profiles_renderer ON device_fingerprint_profiles(renderer_hash, last_seen_at DESC) WHERE renderer_hash<>'';
-CREATE INDEX IF NOT EXISTS idx_fp_profiles_canvas ON device_fingerprint_profiles(canvas_hash, last_seen_at DESC) WHERE canvas_hash<>'';
 CREATE INDEX IF NOT EXISTS idx_webrtc_identity_labels_source ON webrtc_identity_labels(source_user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_webrtc_identity_confirmations_label ON webrtc_identity_confirmations(label_id);
 CREATE INDEX IF NOT EXISTS idx_inbox_topic_created ON inbox_messages(topic_chat_id, topic_thread_id, created_at);
@@ -215,3 +272,8 @@ CREATE INDEX IF NOT EXISTS idx_ip_verifications_user_created ON ip_verifications
 CREATE INDEX IF NOT EXISTS idx_ip_verifications_created ON ip_verifications(created_at);
 CREATE INDEX IF NOT EXISTS idx_verification_sessions_user_created ON verification_sessions(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_verification_sessions_status ON verification_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_labels_v2_state ON fingerprint_labels_v2(active, state, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_labels_v2_source ON fingerprint_labels_v2(source_user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_reference_profiles_v2_label ON fingerprint_reference_profiles_v2(label_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_reference_lookup_v2_reference ON fingerprint_reference_lookup_v2(reference_id);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_user_labels_v2_label ON fingerprint_user_labels_v2(label_id, confirmed_at DESC);
