@@ -2040,8 +2040,8 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         webrtcIdentitySourceUserId: Number(webrtcIdentityMatch.label?.source_user_id || 0),
         webrtcIdentityConfirmed: Boolean(webrtcIdentityMatch.label?.confirmed),
     };
-    await completeTopicVerification(env, userId, verificationInfo);
-    await notifyVerificationSuccess(env, userId, token, verificationInfo);
+    const topicVerificationDelivered = await completeTopicVerification(env, userId, verificationInfo);
+    await notifyVerificationSuccess(env, userId, token, verificationInfo, topicVerificationDelivered);
     await tgSendMessage(env, userId, "验证已通过，现在可以回到 Telegram 继续聊天。").catch(() => {});
     return html(verifySuccessPage());
 }
@@ -2573,12 +2573,13 @@ function topicVerificationText(info) {
     return lines.join("\n");
 }
 
+// 返回值表示验证详情是否已经送进话题；未送达时由 notifyVerificationSuccess 走私聊兜底。
 async function completeTopicVerification(env, userId, info) {
-    if (!(await topicEnabled(env))) return;
-    if ((await topicCreatePolicy(env)) !== "after_verify") return;
+    if (!(await topicEnabled(env))) return false;
+    if ((await topicCreatePolicy(env)) !== "after_verify") return false;
     try {
         const topic = await ensureUserTopic(env, userId, { reason: "verify" });
-        if (!topic) return;
+        if (!topic) return false;
         const payload = {
             chat_id: topic.chatId,
             message_thread_id: topic.threadId,
@@ -2613,8 +2614,10 @@ async function completeTopicVerification(env, userId, info) {
             };
         }
         await tgCall(env, "sendMessage", payload);
+        return true;
     } catch (error) {
         await logEvent(env, "error", "failed to complete topic verification", { userId, error: String(error?.message || error) });
+        return false;
     }
 }
 
@@ -2788,7 +2791,13 @@ async function relayUserMessage(env, message) {
     if (hits.length && autoBlock !== "false") {
         await setBlock(env, user.id, true);
         await markInboxError(env, inboxId, `spam: ${hits.join(", ")}`);
-        await notifyAdmins(env, `[垃圾消息已拉黑]\nuser_id: <code>${user.id}</code>\n命中：${h(hits.join(", "))}\n内容：${h(textValue.slice(0, 300))}`);
+        const spamNotice = `[垃圾消息已拉黑]\nuser_id: <code>${user.id}</code>\n命中：${h(hits.join(", "))}\n内容：${h(textValue.slice(0, 300))}`;
+        await notifyAdmins(env, spamNotice);
+        // 纯 topic 模式下 notifyAdmins 会跳过，改往该用户已有话题补一条，避免自动拉黑无人知情。
+        if (!(await webRelayEnabled(env))) {
+            const posted = await postToExistingUserTopic(env, Number(user.id), `[垃圾消息已拉黑]\nuser_id: ${user.id}\n命中：${hits.join(", ")}\n内容：${textValue.slice(0, 300)}`);
+            if (!posted) await notifyAdmins(env, spamNotice, {}, { force: true });
+        }
         await sendUserNoticeSafely(env, message.chat.id, "消息已被系统拦截。", { userId: user.id, stage: "spam" });
         return;
     }
@@ -2801,7 +2810,7 @@ async function relayUserMessage(env, message) {
         await sendUserNoticeSafely(env, message.chat.id, "已收到消息，但转发管理员暂时失败。", { userId: user.id, inboxId, stage: "relay-failed" });
         return;
     }
-    await sendUserNoticeSafely(env, message.chat.id, "已收到。", { userId: user.id, inboxId, stage: "ack" });
+    // 转发成功后不再给用户发送自动回执，全部回复由管理员真人发出。
 }
 
 async function relayStoredInboxToAdmins(env, row, originalMessage = null) {
@@ -2873,8 +2882,8 @@ async function sendTextToUser(env, userId, textValue, source) {
     return sent.result;
 }
 
-async function notifyAdmins(env, textValue, extraPayload = {}) {
-    if (!(await webRelayEnabled(env))) return;
+async function notifyAdmins(env, textValue, extraPayload = {}, options = {}) {
+    if (!options.force && !(await webRelayEnabled(env))) return;
     const ids = await adminChatIds(env);
     for (const id of ids) {
         try {
@@ -2882,6 +2891,27 @@ async function notifyAdmins(env, textValue, extraPayload = {}) {
         } catch (error) {
             await logEvent(env, "error", "failed to notify admin", { id, error: String(error) });
         }
+    }
+}
+
+// 只往已经存在的话题发通知；不创建、不重建、不解绑任何话题，也不写入消息记录表。
+async function postToExistingUserTopic(env, userId, textValue) {
+    if (!(await topicEnabled(env))) return false;
+    const user = await getUser(env, userId);
+    const chatId = Number(user?.topic_chat_id || 0);
+    const threadId = Number(user?.topic_thread_id || 0);
+    if (!chatId || !threadId) return false;
+    try {
+        await tgCall(env, "sendMessage", {
+            chat_id: chatId,
+            message_thread_id: threadId,
+            text: String(textValue || "").slice(0, 3900),
+            disable_web_page_preview: true,
+        });
+        return true;
+    } catch (error) {
+        await logEvent(env, "warn", "failed to post notice to user topic", { userId, error: String(error?.message || error) });
+        return false;
     }
 }
 
@@ -3339,7 +3369,7 @@ async function answerCallbackQuery(env, callbackQueryId, textValue) {
     await tgCall(env, "answerCallbackQuery", { callback_query_id: callbackQueryId, text: textValue || "OK" });
 }
 
-async function notifyVerificationSuccess(env, userId, token, info) {
+async function notifyVerificationSuccess(env, userId, token, info, topicDelivered = false) {
     const username = info.username ? `@${h(info.username)}` : "无";
     const identityText = info.webrtcIdentityLabelId
         ? `\n\n${info.webrtcIdentityConfirmed ? "WebRTC 标签（管理员已确认）" : "WebRTC 标签命中（待人工确认）"}\n标签：${h(info.webrtcIdentityLabelName || "未设置")}\n来源用户 ID：<code>${info.webrtcIdentitySourceUserId || "-"}</code>\n匹配依据：WebRTC ${h(info.webrtcIdentityIpVersion || "-")} 完全相同`
@@ -3375,11 +3405,13 @@ async function notifyVerificationSuccess(env, userId, token, info) {
         [{ text: "拉黑", callback_data: `block:${userId}` }],
         [{ text: "获取用户名", callback_data: `who:${userId}` }],
     );
-    await notifyAdmins(env, textValue, {
-        reply_markup: {
-            inline_keyboard: keyboard,
-        },
-    });
+    const replyMarkup = { reply_markup: { inline_keyboard: keyboard } };
+    await notifyAdmins(env, textValue, replyMarkup);
+    // 纯 topic 模式下 notifyAdmins 会跳过；若验证详情也没能进话题（例如 first_message 策略下
+    // 话题尚未创建），就强制走管理员私聊，保证这次验证的网络与指纹信息不会无声丢失。
+    if (!topicDelivered && !(await webRelayEnabled(env))) {
+        await notifyAdmins(env, textValue, replyMarkup, { force: true });
+    }
 }
 
 function parseClientData(value) {

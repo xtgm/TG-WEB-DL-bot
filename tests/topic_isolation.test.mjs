@@ -388,7 +388,8 @@ try {
 assert.equal(inboxInsertCount, 1);
 assert.equal(inboundCalls.filter((call) => call.method === "copyMessage").length, 1);
 assert.equal(inboundCalls.filter((call) => call.method === "sendMessage" && Number(call.payload.chat_id) === 777).length, 1);
-assert.equal(inboundCalls.filter((call) => call.method === "sendMessage" && Number(call.payload.chat_id) === 24680).length, 1);
-assert.equal(inboundLogs.some((entry) => entry.message === "failed to notify user" && /bot was blocked by the user/.test(entry.data)), true);
+// 转发成功后不再给用户发送自动回执，所以用户侧应当收到 0 条机器人消息。
+assert.equal(inboundCalls.filter((call) => call.method === "sendMessage" && Number(call.payload.chat_id) === 24680).length, 0);
+assert.equal(inboundLogs.some((entry) => entry.message === "failed to notify user"), false);
 
 console.log("topic and inbound isolation tests passed");

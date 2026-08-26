@@ -239,16 +239,16 @@ export async function buildFingerprintProfile({ clientData = {}, network = {}, m
     const keyedHash = await createKeyedHasher(secret);
     const exactHash = await keyedHash(`fingerprint-exact-v${FINGERPRINT_ALGORITHM_VERSION}`, stableFingerprintJson({ version: FINGERPRINT_ALGORITHM_VERSION, net, device }));
     const [httpKey, httpAsnKey, httpIspKey, canvasKey, webglKey, audioKey] = await Promise.all([
-        net.http.ip ? keyedHash(secret, "fingerprint-http-ip-v1", net.http.ip) : "",
-        net.http.asn ? keyedHash(secret, "fingerprint-http-asn-v1", net.http.asn) : "",
-        net.http.isp ? keyedHash(secret, "fingerprint-http-isp-v1", net.http.isp) : "",
-        device.canvas ? keyedHash(secret, "fingerprint-canvas-v1", device.canvas) : "",
-        device.webgl.vendor || device.webgl.renderer ? keyedHash(secret, "fingerprint-webgl-v1", stableFingerprintJson(device.webgl)) : "",
-        device.audio ? keyedHash(secret, "fingerprint-audio-v1", device.audio) : "",
+        net.http.ip ? keyedHash("fingerprint-http-ip-v1", net.http.ip) : "",
+        net.http.asn ? keyedHash("fingerprint-http-asn-v1", net.http.asn) : "",
+        net.http.isp ? keyedHash("fingerprint-http-isp-v1", net.http.isp) : "",
+        device.canvas ? keyedHash("fingerprint-canvas-v1", device.canvas) : "",
+        device.webgl.vendor || device.webgl.renderer ? keyedHash("fingerprint-webgl-v1", stableFingerprintJson(device.webgl)) : "",
+        device.audio ? keyedHash("fingerprint-audio-v1", device.audio) : "",
     ]);
-    const webrtcKeys = await Promise.all(net.webrtc.map((item) => keyedHash(secret, "fingerprint-webrtc-ip-v1", item.ip)));
-    const webrtcAsnKeys = await Promise.all(net.webrtc.filter((item) => item.asn).map((item) => keyedHash(secret, "fingerprint-webrtc-asn-v1", item.asn)));
-    const webrtcIspKeys = await Promise.all(net.webrtc.filter((item) => item.isp).map((item) => keyedHash(secret, "fingerprint-webrtc-isp-v1", item.isp)));
+    const webrtcKeys = await Promise.all(net.webrtc.map((item) => keyedHash("fingerprint-webrtc-ip-v1", item.ip)));
+    const webrtcAsnKeys = await Promise.all(net.webrtc.filter((item) => item.asn).map((item) => keyedHash("fingerprint-webrtc-asn-v1", item.asn)));
+    const webrtcIspKeys = await Promise.all(net.webrtc.filter((item) => item.isp).map((item) => keyedHash("fingerprint-webrtc-isp-v1", item.isp)));
     const quality = [net.http.ip, net.webrtc.length, device.canvas, device.webgl.renderer || device.webgl.vendor, device.audio,
         device.fonts.length >= 4, pop32(tokens.mask) >= 4, pop32(vector.mask) >= 6].filter(Boolean).length;
     return {
