@@ -93,6 +93,7 @@ export async function handleRequest(request, env, ctx) {
     if (path === "/" && method === "GET") return dashboard(request, env);
     if (path === "/inbox" && method === "GET") return inboxPage(request, env);
     if (path === "/users" && method === "GET") return usersPage(request, env);
+    if (path === "/moderation" && method === "GET") return moderationPage(request, env);
     if (path === "/rules" && method === "GET") return rulesPage(request, env);
     if (path === "/rules" && method === "POST") return rulesSave(request, env);
     if (path === "/verifications" && method === "GET") return verificationsPage(request, env);
@@ -115,6 +116,24 @@ export async function handleRequest(request, env, ctx) {
 
     match = path.match(/^\/users\/(-?\d+)\/unblock$/);
     if (match && method === "POST") return userBlockSet(request, env, Number(match[1]), false);
+
+    match = path.match(/^\/users\/(-?\d+)\/mute$/);
+    if (match && method === "POST") return userMuteSet(request, env, Number(match[1]), true);
+
+    match = path.match(/^\/users\/(-?\d+)\/unmute$/);
+    if (match && method === "POST") return userMuteSet(request, env, Number(match[1]), false);
+
+    match = path.match(/^\/moderation\/(-?\d+)\/block$/);
+    if (match && method === "POST") return userBlockSet(request, env, Number(match[1]), true);
+
+    match = path.match(/^\/moderation\/(-?\d+)\/unblock$/);
+    if (match && method === "POST") return userBlockSet(request, env, Number(match[1]), false);
+
+    match = path.match(/^\/moderation\/(-?\d+)\/mute$/);
+    if (match && method === "POST") return userMuteSet(request, env, Number(match[1]), true);
+
+    match = path.match(/^\/moderation\/(-?\d+)\/unmute$/);
+    if (match && method === "POST") return userMuteSet(request, env, Number(match[1]), false);
 
     match = path.match(/^\/users\/(-?\d+)\/unverify$/);
     if (match && method === "POST") return userVerifyCancel(request, env, Number(match[1]));
@@ -178,13 +197,14 @@ function h(value) {
         .replaceAll("'", "&#39;");
 }
 
+// 无论有无值都输出同一套两行结构（日期行 + 时间行），保证同列各行高度一致。
 function tableTime(value) {
     const raw = String(value || "").trim();
-    if (!raw) return '<span class="table-time muted">-</span>';
+    if (!raw) return '<time class="table-time muted"><span>-</span><small>-</small></time>';
     const separator = raw.indexOf("T");
     const date = separator > 0 ? raw.slice(0, separator) : raw;
-    const time = separator > 0 ? raw.slice(separator + 1) : "";
-    return `<time class="table-time" datetime="${h(raw)}"><span>${h(date)}</span>${time ? `<small>${h(time)}</small>` : ""}</time>`;
+    const time = separator > 0 ? raw.slice(separator + 1) : "-";
+    return `<time class="table-time" datetime="${h(raw)}"><span>${h(date)}</span><small>${h(time)}</small></time>`;
 }
 
 function nowIso() {
@@ -956,37 +976,81 @@ function layout(title, body) {
 nav{display:grid;gap:5px}nav a{display:flex;align-items:center;min-height:44px;color:#dbe7f8;text-decoration:none;padding:10px 12px;border:1px solid transparent;border-radius:10px;font-weight:800;transition:background .16s,border-color .16s,transform .16s}nav a:hover{background:var(--nav-soft);border-color:rgba(148,163,184,.16);transform:translateX(2px)}nav a:focus-visible{background:var(--nav-soft);border-color:#fbbf24;outline:3px solid #fbbf24;outline-offset:2px}nav a:last-child{margin-top:12px;color:#fecaca;border-top:1px solid rgba(148,163,184,.14);border-radius:0;padding-top:18px}
 main{min-width:0;width:100%;max-width:1540px;margin-inline:auto;padding:clamp(18px,2.4vw,34px)}.top{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:20px}.top h1{margin:0;font-size:clamp(25px,3vw,32px);letter-spacing:-.035em}.top>.badge{background:#e8eef7;color:#344054}
 .card{min-width:0;max-width:100%;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:clamp(15px,1.7vw,22px);margin:16px 0;box-shadow:var(--shadow)}.card h2{margin:0 0 8px;font-size:19px;letter-spacing:-.015em}.card p:last-child{margin-bottom:0}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.grid>.card{margin:0}.metrics-grid{grid-template-columns:repeat(5,minmax(0,1fr));margin-bottom:16px}.metric-card{position:relative;overflow:hidden;min-height:116px}.metric-card::after{content:"";position:absolute;right:-22px;bottom:-34px;width:92px;height:92px;border-radius:999px;background:var(--blue-soft)}.metric{position:relative;z-index:1;margin-top:12px;font-size:31px;font-weight:950;letter-spacing:-.04em}.muted,small{color:var(--muted);line-height:1.6}
-.toolbar{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap}.toolbar h2,.toolbar p{margin-top:0}.actions,.row-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row-actions{margin-top:10px}.row-actions form{display:inline-flex;margin:0}.note-form{display:grid;grid-template-columns:minmax(150px,1fr) auto;gap:8px;align-items:center}
-.btn,button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;border:1px solid transparent;border-radius:9px;background:#e8edf4;color:#1e293b;padding:8px 12px;font:inherit;font-weight:850;line-height:1.2;text-decoration:none;white-space:nowrap;cursor:pointer;touch-action:manipulation;transition:transform .15s,box-shadow .15s,background .15s}.btn:hover,button:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(15,23,42,.1)}.btn:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible,summary:focus-visible,.table-wrap:focus-visible{outline:3px solid #2563eb;outline-offset:2px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.grid>.card{margin:0}.metrics-grid{grid-template-columns:repeat(5,minmax(0,1fr));margin-bottom:16px}.metric-card{position:relative;overflow:hidden;min-height:110px}.metric-card::after{content:"";position:absolute;right:-22px;bottom:-34px;width:92px;height:92px;border-radius:999px;background:var(--blue-soft)}.metric{position:relative;z-index:1;margin-top:10px;font-size:29px;font-weight:950;letter-spacing:-.04em;line-height:1.1}.muted,small{color:var(--muted);line-height:1.6}
+.toolbar{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap}.toolbar h2,.toolbar p{margin-top:0}.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.row-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px;align-items:stretch}.row-actions form{display:flex;margin:0;min-width:0}.row-actions form>button,.row-actions>.btn,.row-actions>button{width:100%;min-width:0}
+.note-form{display:grid;grid-template-columns:minmax(0,1fr) 96px;gap:8px;align-items:center}.note-form input{min-width:0}
+.btn,button{display:inline-flex;align-items:center;justify-content:center;min-height:38px;height:38px;border:1px solid transparent;border-radius:9px;background:#e8edf4;color:#1e293b;padding:0 10px;font:inherit;font-size:13px;font-weight:850;line-height:1;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;touch-action:manipulation;transition:transform .15s,box-shadow .15s,background .15s}.btn:hover,button:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(15,23,42,.1)}.btn:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible,summary:focus-visible,.table-wrap:focus-visible{outline:3px solid #2563eb;outline-offset:2px}
 .btn.primary,button.primary{background:var(--blue);color:#fff}.btn.danger,button.danger{background:var(--red);color:#fff}.btn.ok,button.ok{background:var(--green);color:#fff}
-input,textarea,select{width:100%;min-height:42px;border:1px solid #cbd5e1;border-radius:9px;background:#fff;color:var(--ink);padding:9px 11px;font:inherit;transition:border-color .16s,box-shadow .16s}input:focus,textarea:focus,select:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.12)}textarea{min-height:120px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}input[readonly]{background:#f8fafc;color:#475569}input[type="checkbox"]{width:18px;min-height:18px;height:18px;margin:0;accent-color:var(--blue)}
+button.ghost,button:disabled{background:#f1f5f9;color:#94a3b8;border-color:#e2e8f0;cursor:not-allowed}button.ghost:hover,button:disabled:hover{transform:none;box-shadow:none}
+input,textarea,select{width:100%;min-height:38px;border:1px solid #cbd5e1;border-radius:9px;background:#fff;color:var(--ink);padding:8px 10px;font:inherit;font-size:13px;transition:border-color .16s,box-shadow .16s}input:focus,textarea:focus,select:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.12)}textarea{min-height:120px;font-size:14px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}input[readonly]{background:#f8fafc;color:#475569}input[type="checkbox"]{width:18px;min-height:18px;height:18px;margin:0;accent-color:var(--blue)}
 label{display:block;margin:11px 0 6px;font-weight:850}.check-row{display:flex;align-items:center;gap:9px;min-height:42px;margin:11px 0 6px;padding:9px 11px;border:1px solid var(--line);border-radius:9px;background:#f8fafc;font-weight:800}
-.table-wrap{display:block;width:100%;max-width:100%;min-width:0;contain:inline-size;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:11px;background:#fff;-webkit-overflow-scrolling:touch}.table-wrap table{min-width:var(--table-min,760px)}table{width:100%;border-collapse:separate;border-spacing:0;background:#fff;font-size:14px}thead th{position:sticky;top:0;z-index:1;background:#f6f8fb;color:#475467;font-size:12px;font-weight:900;letter-spacing:.02em}th,td{border-bottom:1px solid #e6ebf2;text-align:left;padding:12px;vertical-align:top;overflow-wrap:anywhere;word-break:break-word}tbody tr:last-child td{border-bottom:0}tbody tr:hover{background:#fbfdff}td .actions{min-width:max-content}.logs-table td:nth-child(2){min-width:460px}.kv{display:grid;grid-template-columns:minmax(110px,auto) minmax(0,1fr);gap:8px 14px}.kv dt{color:var(--muted);font-weight:850}.kv dd{min-width:0;margin:0}
-.table-identity{display:grid;gap:3px;min-width:0}.table-identity>b{line-height:1.35}.table-meta{display:grid;gap:1px;min-width:0;color:var(--muted);font-size:12px;line-height:1.45}.table-id{white-space:nowrap;overflow-wrap:normal;word-break:normal;font-variant-numeric:tabular-nums}.table-username{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;overflow-wrap:normal;word-break:normal}.table-lines{line-height:1.55}.table-time{display:grid;gap:1px;margin-top:5px;color:var(--muted);font-size:11px;line-height:1.35;white-space:nowrap;overflow-wrap:normal;word-break:normal;font-variant-numeric:tabular-nums}.table-time small{display:block;font-size:11px;line-height:1.35}.ua-text{display:block;margin-top:5px;color:var(--muted);font-size:12px;line-height:1.55;overflow-wrap:anywhere;word-break:break-word}
-.users-table{table-layout:fixed}.users-table th:nth-child(1){width:160px}.users-table th:nth-child(2){width:145px}.users-table th:nth-child(3){width:220px}.users-table th:nth-child(4){width:250px}.users-table th:nth-child(5){width:170px}.users-table th:nth-child(6){width:140px}.users-table th:nth-child(7){width:395px}.users-table td,.users-table td:last-child{min-width:0}.users-table .note-form{grid-template-columns:minmax(170px,1fr) auto}.users-table .row-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;align-items:stretch}.users-table .row-actions form{display:flex}.users-table .row-actions form,.users-table .row-actions>.btn,.users-table .row-actions button{width:100%}
-.verifications-table{table-layout:fixed}.verifications-table th:nth-child(1){width:74px}.verifications-table th:nth-child(2){width:160px}.verifications-table th:nth-child(3){width:230px}.verifications-table th:nth-child(4){width:210px}.verifications-table th:nth-child(6){width:170px}.verifications-table td:nth-child(1),.verifications-table td:nth-child(6){overflow-wrap:normal;word-break:normal}.verifications-table td:nth-child(5) small{display:block;margin-top:5px;line-height:1.55}
-.badge{display:inline-flex;align-items:center;border-radius:999px;background:#e8edf4;color:#1f2937;padding:4px 9px;font-size:12px;font-weight:900;white-space:nowrap}.badge.red{background:#fee2e2;color:#991b1b}.badge.green{background:#dcfce7;color:#166534}.badge.warn{background:#fef3c7;color:#92400e}
-pre{max-width:100%;max-height:min(360px,60dvh);white-space:pre-wrap;overflow:auto;overflow-wrap:anywhere;background:#0d1729;color:#e5edf8;border-radius:10px;padding:13px;line-height:1.55}.msg{background:#eff6ff;border:1px solid #bfdbfe;border-radius:9px;padding:10px 12px;color:#1e3a8a;font-weight:750;line-height:1.55}details summary{display:flex;align-items:center;min-height:48px;cursor:pointer;font-weight:800}code{overflow-wrap:anywhere;color:#1d4ed8}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-@media(max-width:1180px){.metrics-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.table-wrap{display:block;width:100%;max-width:100%;min-width:0;contain:inline-size;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:11px;background:#fff;-webkit-overflow-scrolling:touch}.table-wrap table{min-width:var(--table-min,760px)}
+table{width:100%;border-collapse:separate;border-spacing:0;background:#fff;font-size:13px;line-height:1.5}
+thead th{position:sticky;top:0;z-index:1;height:38px;padding:0 12px;background:#f6f8fb;color:#475467;font-size:12px;font-weight:900;letter-spacing:.02em;white-space:nowrap;vertical-align:middle}
+th,td{border-bottom:1px solid #e6ebf2;text-align:left;vertical-align:top;overflow-wrap:anywhere;word-break:break-word}
+td{padding:12px;min-width:0}tbody tr:last-child td{border-bottom:0}tbody tr:hover{background:#fbfdff}
+/* 表格内统一的排版原子类：短标签一律不折行，长文本一律限行，保证每行高度可预期。 */
+.cell{display:grid;gap:3px;min-width:0}
+.cell-lines{display:grid;gap:2px;min-width:0;line-height:1.55}
+.cell-lines>span{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;overflow-wrap:normal;word-break:normal}
+.cell-lines>span.wrap{white-space:normal;overflow-wrap:anywhere;word-break:break-word;text-overflow:clip}
+.nowrap{white-space:nowrap;overflow-wrap:normal;word-break:normal}
+.num{white-space:nowrap;overflow-wrap:normal;word-break:normal;font-variant-numeric:tabular-nums}
+.clamp{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere;word-break:break-word}
+.clamp-1{-webkit-line-clamp:1}.clamp-2{-webkit-line-clamp:2}.clamp-3{-webkit-line-clamp:3}.clamp-4{-webkit-line-clamp:4}
+.kv{display:grid;grid-template-columns:minmax(110px,auto) minmax(0,1fr);gap:8px 14px}.kv dt{color:var(--muted);font-weight:850}.kv dd{min-width:0;margin:0}
+.table-identity{display:grid;gap:3px;min-width:0}.table-identity>b{display:block;min-width:0;line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.table-meta{display:grid;gap:1px;min-width:0;color:var(--muted);font-size:12px;line-height:1.45}.table-meta>span{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.table-id{white-space:nowrap;overflow-wrap:normal;word-break:normal;font-variant-numeric:tabular-nums}
+.table-username{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;overflow-wrap:normal;word-break:normal}
+.table-lines{line-height:1.55}
+.table-time{display:grid;gap:1px;margin-top:5px;color:var(--muted);font-size:11px;line-height:1.35;white-space:nowrap;overflow-wrap:normal;word-break:normal;font-variant-numeric:tabular-nums}.table-time small{display:block;font-size:11px;line-height:1.35}
+.ua-text{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden;margin-top:5px;color:var(--muted);font-size:12px;line-height:1.5;overflow-wrap:anywhere;word-break:break-word}
+/* 各表固定列宽：table-layout:fixed + 明确宽度，保证每列对齐、行高一致、不横向溢出。 */
+.users-table{table-layout:fixed}
+.users-table th:nth-child(1){width:150px}.users-table th:nth-child(2){width:118px}.users-table th:nth-child(3){width:208px}
+.users-table th:nth-child(4){width:238px}.users-table th:nth-child(5){width:158px}.users-table th:nth-child(6){width:110px}.users-table th:nth-child(7){width:412px}
+.inbox-table{table-layout:fixed}
+.inbox-table th:nth-child(1){width:96px}.inbox-table th:nth-child(2){width:172px}.inbox-table th:nth-child(3){width:150px}.inbox-table th:nth-child(5){width:112px}
+.verifications-table{table-layout:fixed}
+.verifications-table th:nth-child(1){width:76px}.verifications-table th:nth-child(2){width:162px}.verifications-table th:nth-child(3){width:230px}
+.verifications-table th:nth-child(4){width:192px}.verifications-table th:nth-child(6){width:132px}
+.logs-table{table-layout:fixed}.logs-table th:nth-child(1){width:96px}.logs-table th:nth-child(3){width:132px}
+.moderation-table{table-layout:fixed}
+.moderation-table th:nth-child(1){width:180px}.moderation-table th:nth-child(2){width:128px}.moderation-table th:nth-child(4){width:132px}.moderation-table th:nth-child(5){width:280px}
+.secrets-table{table-layout:fixed}.secrets-table th:nth-child(1){width:230px}.secrets-table th:nth-child(2){width:110px}
+.fingerprints-table{table-layout:fixed}.fingerprints-table th:nth-child(1){width:80px}.fingerprints-table th:nth-child(3){width:130px}.fingerprints-table th:nth-child(4){width:110px}.fingerprints-table th:nth-child(5){width:130px}.fingerprints-table th:nth-child(6){width:110px}
+.verifications-table td:nth-child(1),.verifications-table td:nth-child(6){overflow-wrap:normal;word-break:normal}
+.badge{display:inline-flex;align-items:center;justify-content:center;min-height:22px;border-radius:999px;background:#e8edf4;color:#1f2937;padding:3px 9px;font-size:12px;font-weight:900;white-space:nowrap}.badge.red{background:#fee2e2;color:#991b1b}.badge.green{background:#dcfce7;color:#166534}.badge.warn{background:#fef3c7;color:#92400e}
+pre{max-width:100%;max-height:min(360px,60dvh);white-space:pre-wrap;overflow:auto;overflow-wrap:anywhere;background:#0d1729;color:#e5edf8;border-radius:10px;padding:13px;font-size:12px;line-height:1.55}
+.msg{background:#eff6ff;border:1px solid #bfdbfe;border-radius:9px;padding:10px 12px;color:#1e3a8a;font-weight:750;line-height:1.55}
+.log-body{display:grid;gap:8px;min-width:0}.log-body>b{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.log-hint{min-height:44px;display:flex;align-items:center;background:#eff6ff;border:1px solid #bfdbfe;border-radius:9px;padding:9px 12px;color:#1e3a8a;font-size:12px;font-weight:750;line-height:1.5}.log-hint.empty{background:#f8fafc;border-color:var(--line);color:var(--muted);font-weight:700}
+details summary{display:flex;align-items:center;min-height:34px;cursor:pointer;font-weight:800;font-size:12px}
+code{overflow-wrap:anywhere;color:#1d4ed8}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media(max-width:1180px){.metrics-grid{grid-template-columns:repeat(3,minmax(0,1fr))!important}}
+/* 窄屏统一改为卡片式：所有表格都带 responsive-wrap + responsive-table，新增表格自动继承。 */
 @media (max-width:1430px){
-.users-wrap,.verifications-wrap,.responsive-wrap{border:0;background:transparent;overflow:visible}
-.users-wrap .users-table,.verifications-wrap .verifications-table,.responsive-wrap .responsive-table{display:block!important;min-width:0!important;table-layout:auto;background:transparent}
-.users-wrap .users-table thead,.verifications-wrap .verifications-table thead,.responsive-wrap .responsive-table thead{display:none}
-.users-wrap .users-table tbody,.verifications-wrap .verifications-table tbody,.responsive-wrap .responsive-table tbody{display:grid;gap:12px}
-.users-wrap .users-table tr,.verifications-wrap .verifications-table tr,.responsive-wrap .responsive-table tr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow:hidden;border:1px solid var(--line);border-radius:12px;background:#fff;box-shadow:0 8px 22px rgba(15,23,42,.05)}
-.users-wrap .users-table td,.verifications-wrap .verifications-table td,.responsive-wrap .responsive-table td{display:block;min-width:0!important;width:auto;padding:12px 14px;border:0;border-bottom:1px solid #edf1f6}
-.users-wrap .users-table td::before,.verifications-wrap .verifications-table td::before,.responsive-wrap .responsive-table td::before{content:attr(data-label);display:block;margin-bottom:5px;color:#667085;font-size:11px;font-weight:900;letter-spacing:.04em}
-.users-wrap .users-table td:first-child,.users-wrap .users-table td:nth-child(6),.users-wrap .users-table td:last-child,.verifications-wrap .verifications-table td:nth-child(5),.verifications-wrap .verifications-table td:last-child,.responsive-wrap .responsive-table td[data-span="full"],.responsive-wrap .responsive-table td:last-child{grid-column:1/-1}
-.users-wrap .users-table td:last-child,.verifications-wrap .verifications-table td:last-child,.responsive-wrap .responsive-table td:last-child{border-bottom:0}
-.users-wrap .users-table tbody tr:hover,.verifications-wrap .verifications-table tbody tr:hover,.responsive-wrap .responsive-table tbody tr:hover{background:#fff}
+.responsive-wrap{border:0;background:transparent;overflow:visible}
+.responsive-wrap .responsive-table{display:block!important;min-width:0!important;table-layout:auto;background:transparent}
+.responsive-wrap .responsive-table thead{display:none}
+.responsive-wrap .responsive-table tbody{display:grid;gap:12px}
+.responsive-wrap .responsive-table tr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow:hidden;border:1px solid var(--line);border-radius:12px;background:#fff;box-shadow:0 8px 22px rgba(15,23,42,.05)}
+.responsive-wrap .responsive-table td{display:block;min-width:0!important;width:auto;padding:12px 14px;border:0;border-bottom:1px solid #edf1f6}
+.responsive-wrap .responsive-table td::before{content:attr(data-label);display:block;margin-bottom:5px;color:#667085;font-size:11px;font-weight:900;letter-spacing:.04em}
+.responsive-wrap .responsive-table td[data-span="full"],.responsive-wrap .responsive-table td:last-child{grid-column:1/-1}
+.responsive-wrap .responsive-table td:last-child{border-bottom:0}
+.responsive-wrap .responsive-table tbody tr:hover{background:#fff}
+.cell-lines>span,.table-identity>b,.table-meta>span{white-space:normal;overflow:visible;text-overflow:clip}
+.clamp{-webkit-line-clamp:unset;display:block;overflow:visible}
 }
-@media(max-width:960px),(max-height:500px) and (orientation:landscape){body{font-size:16px}.shell{grid-template-columns:1fr}.side{position:sticky;top:0;z-index:20;height:auto;max-height:none;padding:max(12px,env(safe-area-inset-top)) max(14px,env(safe-area-inset-right)) 12px max(14px,env(safe-area-inset-left))}.brand{margin-bottom:10px}.brand-mark{width:36px;height:36px}nav{display:flex;gap:8px;overflow-x:auto;overscroll-behavior-x:contain;padding:2px 32px 4px 0;scrollbar-width:thin;-webkit-overflow-scrolling:touch}nav::after{content:"更多 →";display:flex;align-items:center;flex:0 0 auto;color:#93a4bf;font-size:12px;font-weight:800;padding:0 4px}nav a{flex:0 0 auto;min-height:48px;padding:9px 12px}nav a:last-child{margin:0;border-top:1px solid rgba(248,113,113,.25);border-radius:9px;padding-top:9px}main{padding:16px max(16px,env(safe-area-inset-right)) max(16px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left))}.top{align-items:flex-start;margin-bottom:12px}.top h1{font-size:25px}.card{padding:15px;margin:12px 0}.note-form,.users-table .note-form{grid-template-columns:1fr}.btn,button,input,textarea,select,.check-row{min-height:48px}.btn,button,input,textarea,select{font-size:16px}.table-wrap{border-radius:9px}}
-@media(max-width:560px){.metrics-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric-card{min-height:104px}.metric{font-size:27px}.top>.badge{display:none}.grid{grid-template-columns:1fr}.users-wrap .users-table tr,.verifications-wrap .verifications-table tr,.responsive-wrap .responsive-table tr{grid-template-columns:1fr}.users-wrap .users-table td,.verifications-wrap .verifications-table td,.responsive-wrap .responsive-table td{grid-column:1/-1}.users-table .row-actions{grid-template-columns:repeat(2,minmax(0,1fr))}.users-table .row-actions form,.users-table .row-actions button{width:100%}}
-@media(max-width:420px){.metrics-grid{grid-template-columns:1fr}.actions{display:grid;grid-template-columns:1fr}.actions>*,.actions form,.actions button,.actions .btn{width:100%}.users-table .row-actions{grid-template-columns:1fr}.kv{grid-template-columns:1fr;gap:4px}.kv dd{margin-bottom:8px}}
+@media(max-width:960px),(max-height:500px) and (orientation:landscape){body{font-size:16px}.shell{grid-template-columns:1fr}.side{position:sticky;top:0;z-index:20;height:auto;max-height:none;padding:max(12px,env(safe-area-inset-top)) max(14px,env(safe-area-inset-right)) 12px max(14px,env(safe-area-inset-left))}.brand{margin-bottom:10px}.brand-mark{width:36px;height:36px}nav{display:flex;gap:8px;overflow-x:auto;overscroll-behavior-x:contain;padding:2px 32px 4px 0;scrollbar-width:thin;-webkit-overflow-scrolling:touch}nav::after{content:"更多 →";display:flex;align-items:center;flex:0 0 auto;color:#93a4bf;font-size:12px;font-weight:800;padding:0 4px}nav a{flex:0 0 auto;min-height:48px;padding:9px 12px}nav a:last-child{margin:0;border-top:1px solid rgba(248,113,113,.25);border-radius:9px;padding-top:9px}main{padding:16px max(16px,env(safe-area-inset-right)) max(16px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left))}.top{align-items:flex-start;margin-bottom:12px}.top h1{font-size:25px}.card{padding:15px;margin:12px 0}.note-form{grid-template-columns:1fr}table{font-size:15px}.btn,button{min-height:46px;height:46px;font-size:15px}input,textarea,select,.check-row{min-height:46px;font-size:15px}.table-wrap{border-radius:9px}}
+@media(max-width:560px){.metrics-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:10px}.metric-card{min-height:100px}.metric{font-size:26px}.top>.badge{display:none}.grid{grid-template-columns:1fr}.responsive-wrap .responsive-table tr{grid-template-columns:1fr}.responsive-wrap .responsive-table td{grid-column:1/-1}.row-actions{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:420px){.metrics-grid{grid-template-columns:1fr!important}.actions{display:grid;grid-template-columns:1fr}.actions>*,.actions form,.actions button,.actions .btn{width:100%}.row-actions{grid-template-columns:1fr}.kv{grid-template-columns:1fr;gap:4px}.kv dd{margin-bottom:8px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
 </style></head><body><div class="shell"><aside class="side"><div class="brand"><span class="brand-mark">TG</span><span>TG DualBot<small>Cloudflare 控制台</small></span></div><nav aria-label="后台主导航">
-<a href="/">总览</a><a href="/inbox">收件箱</a><a href="/users">用户管理</a><a href="/rules">广告拦截</a><a href="/verifications">CF 验证记录</a><a href="/settings">设置</a><a href="/logs">日志</a><a href="/logout">退出</a>
+<a href="/">总览</a><a href="/inbox">收件箱</a><a href="/users">用户管理</a><a href="/moderation">名单管理</a><a href="/rules">广告拦截</a><a href="/verifications">CF 验证记录</a><a href="/settings">设置</a><a href="/logs">日志</a><a href="/logout">退出</a>
 </nav></aside><main><div class="top"><h1>${h(title)}</h1><span class="badge">Worker + D1</span></div>${body}</main></div></body></html>`;
 }
 
@@ -994,22 +1058,60 @@ async function dashboard(request, env) {
     await ensureVerificationSchema(env);
     const stats = await Promise.all([
         scalar(env, "SELECT COUNT(*) FROM users"),
-        scalar(env, "SELECT COUNT(*) FROM users WHERE blocked=1"),
         scalar(env, "SELECT COUNT(*) FROM users WHERE verified=1"),
+        scalar(env, "SELECT COUNT(*) FROM users WHERE blocked=1"),
+        scalar(env, "SELECT COUNT(*) FROM users WHERE inbound_muted=1"),
         scalar(env, "SELECT COUNT(*) FROM inbox_messages"),
         scalar(env, "SELECT COUNT(*) FROM ip_verifications WHERE passed=1"),
     ]);
     const base = publicBaseUrl(env, request);
-    const body = `<div class="grid metrics-grid">
-<div class="card metric-card"><div class="muted">用户数</div><div class="metric">${stats[0]}</div></div>
-<div class="card metric-card"><div class="muted">封禁用户</div><div class="metric">${stats[1]}</div></div>
-<div class="card metric-card"><div class="muted">已验证用户</div><div class="metric">${stats[2]}</div></div>
-<div class="card metric-card"><div class="muted">消息记录</div><div class="metric">${stats[3]}</div></div>
-<div class="card metric-card"><div class="muted">CF 验证通过</div><div class="metric">${stats[4]}</div></div>
+    const mode = await controlMode(env);
+    const modeText = mode === "web" ? "仅 Web 后台" : mode === "topic" ? "仅 Telegram 话题" : "Web 后台 + Telegram 话题";
+    const body = `<div class="grid metrics-grid" style="grid-template-columns:repeat(6,minmax(0,1fr))">
+<div class="card metric-card"><div class="muted">用户总数</div><div class="metric">${stats[0]}</div></div>
+<div class="card metric-card"><div class="muted">已验证</div><div class="metric">${stats[1]}</div></div>
+<div class="card metric-card"><div class="muted">已封禁</div><div class="metric">${stats[2]}</div></div>
+<div class="card metric-card"><div class="muted">已隔离</div><div class="metric">${stats[3]}</div></div>
+<div class="card metric-card"><div class="muted">消息记录</div><div class="metric">${stats[4]}</div></div>
+<div class="card metric-card"><div class="muted">验证通过</div><div class="metric">${stats[5]}</div></div>
 </div>
-<div class="card"><h2>项目状态</h2><p class="muted">当前版本提供 Telegram 私聊双向通信、验证后聊天门禁、管理员回复、收件箱、用户管理、备注、封禁、广告拦截、多管理员、Cloudflare Turnstile 验证、IPv4/IPv6/UDP WebRTC 记录，并同时支持 Workers 和 Pages Functions 部署。</p>
-<p><b>公开地址：</b><code>${h(base)}</code></p><p><b>验证入口：</b><code>${h(`${base}/verify/{token}`)}</code></p></div>`;
+<div class="card"><h2>项目状态</h2><p class="muted">当前版本提供 Telegram 私聊双向通信、验证后聊天门禁、管理员回复、收件箱、用户管理、名单管理、备注、封禁与静默隔离、广告拦截、多管理员、Cloudflare Turnstile 验证、IPv4/IPv6/UDP WebRTC 记录与 V2 设备指纹，并同时支持 Workers 和 Pages Functions 部署。</p>
+<dl class="kv"><dt>控制模式</dt><dd>${h(modeText)}</dd><dt>公开地址</dt><dd><code>${h(base)}</code></dd><dt>验证入口</dt><dd><code>${h(`${base}/verify/{token}`)}</code></dd></dl></div>
+<div class="card"><h2>四条通道共用同一份记录</h2><p class="muted">用户私聊入站、Telegram 话题内回复、管理员私聊 reply 回复、Web 后台回复都会写入同一张 <code>inbox_messages</code> 表，因此无论从哪一侧操作，收件箱与话题都能看到完整往来记录。</p>
+<div class="actions"><a class="btn primary" href="/inbox">查看收件箱</a><a class="btn" href="/users">用户管理</a><a class="btn" href="/moderation">名单管理</a><a class="btn" href="/logs">查看日志</a></div></div>`;
     return html(layout("总览", body));
+}
+
+const INBOX_SOURCE_LABELS = {
+    user: "用户私聊",
+    topic: "话题回复",
+    "web:inbox": "Web 后台",
+    "tg:reply": "管理员私聊",
+};
+
+function sourceText(value) {
+    const raw = String(value || "").trim();
+    return INBOX_SOURCE_LABELS[raw] || raw || "-";
+}
+
+// 统一的多行信息单元格：每条一行、超长省略号截断，不会把一行文字撑成三行。
+// 传入的所有条目都会渲染（包含空值行），行数固定才能让同列各行高度一致。
+function lineCell(lines, wrapLast = false) {
+    const html = lines.map((line, index) => (
+        `<span${wrapLast && index === lines.length - 1 ? ' class="wrap"' : ""}>${h(line)}</span>`
+    )).join("");
+    return `<div class="cell-lines">${html}</div>`;
+}
+
+// 统一的用户身份单元格：昵称一行、ID 一行、用户名一行（无用户名也占位），
+// 再跟上可选的附加行。行数在同一张表内恒定，保证行高一致。
+function identityCell(fullName, userId, username, extraLines = []) {
+    const lines = [
+        `<span class="table-id">${h(userId)}</span>`,
+        `<span class="table-username">${username ? `@${h(username)}` : "无用户名"}</span>`,
+    ];
+    for (const line of extraLines) lines.push(`<span>${line}</span>`);
+    return `<div class="table-identity"><b>${h(fullName || userId)}</b><div class="table-meta">${lines.join("")}</div></div>`;
 }
 
 async function inboxPage(request, env) {
@@ -1017,11 +1119,20 @@ async function inboxPage(request, env) {
     const bodyRows = (rows.results || []).map((r) => {
         const status = r.direction === "out" ? "已回复" : r.error?.startsWith("spam:") ? "已拦截" : r.forwarded ? "已转发" : "未转发";
         const cls = status === "未转发" || status === "已拦截" ? "red" : "green";
-        const flow = r.direction === "out" ? "管理员 -> 用户" : "用户 -> 管理员";
-        const retry = r.direction === "in" && !r.forwarded ? `<form method="post" action="/inbox/${r.id}/retry"><button>重试转发</button></form>` : "";
-        return `<tr><td data-label="ID / 状态"><span class="table-id">#${h(r.id)}</span><br><span class="badge ${cls}">${h(status)}</span></td><td data-label="用户"><div class="table-identity"><b>${h(r.full_name || r.user_id)}</b><div class="table-meta"><span class="table-id">${h(r.user_id)}</span>${r.username ? `<span class="table-username">@${h(r.username)}</span>` : ""}</div></div></td><td data-label="方向 / 来源"><div class="table-lines">${h(flow)}<br><small>${h(r.source || "-")}</small></div>${tableTime(r.created_at)}</td><td data-label="内容 / 错误" data-span="full">${h(r.text || "(非文本/媒体消息)")}${r.error ? `<br><small class="muted">${h(r.error)}</small>` : ""}</td><td data-label="操作"><div class="actions"><a class="btn primary" href="/inbox/${r.id}/reply">回复</a>${retry}</div></td></tr>`;
+        const flow = r.direction === "out" ? "管理员 → 用户" : "用户 → 管理员";
+        // 不可重试时渲染 disabled 占位，让每行都是「回复 + 重试转发」两个按钮，行高一致。
+        const retry = r.direction === "in" && !r.forwarded
+            ? `<form method="post" action="/inbox/${r.id}/retry"><button type="submit">重试转发</button></form>`
+            : '<button type="button" class="ghost" disabled title="仅未转发的入站消息可重试">重试转发</button>';
+        return `<tr>
+<td data-label="ID / 状态"><div class="cell"><span class="table-id">#${h(r.id)}</span><span class="badge ${cls}">${h(status)}</span></div></td>
+<td data-label="用户">${identityCell(r.full_name, r.user_id, r.username)}</td>
+<td data-label="方向 / 来源">${lineCell([flow, sourceText(r.source)])}${tableTime(r.created_at)}</td>
+<td data-label="内容 / 错误" data-span="full"><div class="clamp clamp-3">${h(r.text || "(非文本/媒体消息)")}</div><div class="clamp clamp-2 muted" style="margin-top:5px;font-size:12px">${h(r.error || "无错误")}</div></td>
+<td data-label="操作"><div class="row-actions" style="grid-template-columns:minmax(0,1fr);margin-top:0"><a class="btn primary" href="/inbox/${r.id}/reply">回复</a>${retry}</div></td>
+</tr>`;
     }).join("");
-    return html(layout("收件箱", `<div class="card"><div class="toolbar"><div><h2>双向消息记录</h2><p class="muted">用户入站消息、Telegram 管理员回复、Web 后台回复都会记录在这里。</p></div></div><div class="table-wrap responsive-wrap" style="--table-min:900px" tabindex="0" aria-label="双向消息记录，可横向滚动"><table class="responsive-table"><caption class="sr-only">双向消息记录</caption><thead><tr><th scope="col">ID/状态</th><th scope="col">用户</th><th scope="col">方向/来源</th><th scope="col">内容/错误</th><th scope="col">操作</th></tr></thead><tbody>${bodyRows}</tbody></table></div></div>`));
+    return html(layout("收件箱", `<div class="card"><div class="toolbar"><div><h2>双向消息记录</h2><p class="muted">用户入站消息、Telegram 话题回复、管理员私聊回复、Web 后台回复都会记录在这里，四条通道共用同一份记录。</p></div></div><div class="table-wrap responsive-wrap" style="--table-min:1040px" tabindex="0" aria-label="双向消息记录，可横向滚动"><table class="inbox-table responsive-table"><caption class="sr-only">双向消息记录</caption><thead><tr><th scope="col">ID / 状态</th><th scope="col">用户</th><th scope="col">方向 / 来源</th><th scope="col">内容 / 错误</th><th scope="col">操作</th></tr></thead><tbody>${bodyRows || '<tr><td data-span="full" colspan="5" class="muted">暂无消息记录。</td></tr>'}</tbody></table></div></div>`));
 }
 
 async function inboxReplyPage(request, env, id) {
@@ -1058,54 +1169,75 @@ async function retryInbox(request, env, id) {
     return redirect("/inbox", request);
 }
 
+// 操作列固定 9 个按钮（3 列 × 3 行），条件不满足时渲染 disabled 占位，
+// 保证每一行的按钮网格尺寸与行高完全一致。
+function userActionGrid(u) {
+    const id = u.user_id;
+    const blockPath = u.blocked ? "unblock" : "block";
+    const blockText = u.blocked ? "解封" : "封禁";
+    const blockClass = u.blocked ? "ok" : "danger";
+    const mutePath = u.inbound_muted ? "unmute" : "mute";
+    const muteText = u.inbound_muted ? "解除隔离" : "静默隔离";
+    const post = (path, text, cls = "", confirm = "") => (
+        `<form method="post" action="/users/${id}/${path}"${confirm ? ` onsubmit="return confirm('${confirm}')"` : ""}><button${cls ? ` class="${cls}"` : ""} type="submit">${text}</button></form>`
+    );
+    const disabled = (text) => `<button type="button" class="ghost" disabled title="当前不可用">${text}</button>`;
+    return [
+        post(blockPath, blockText, blockClass),
+        u.verified ? post("unverify", "取消验证") : disabled("取消验证"),
+        post(mutePath, muteText, u.inbound_muted ? "ok" : ""),
+        `<a class="btn" href="/users/${id}/fingerprints">指纹标签</a>`,
+        u.latest_fingerprint_hash ? post("fingerprints/mark", "标记指纹") : disabled("标记指纹"),
+        post("topic/create", "创建话题"),
+        post("topic/rebuild", "重建话题"),
+        u.topic_thread_id ? post("topic/unbind", "解绑话题") : disabled("解绑话题"),
+        post("delete", "删除用户", "danger", "确定要永久删除该用户及其全部消息和验证记录吗？此操作无法恢复。"),
+    ].join("");
+}
+
 async function usersPage(request, env) {
     await ensureVerificationSchema(env);
     const rows = await env.DB.prepare(USER_WITH_IDENTITY_SELECT + " ORDER BY u.updated_at DESC LIMIT 300").all();
     const bodyRows = (rows.results || []).map((u) => {
-        const status = u.blocked ? `<span class="badge red">封禁</span>` : u.verified ? `<span class="badge green">已验证</span>` : `<span class="badge red">未验证</span>`;
-        const actionPath = u.blocked ? "unblock" : "block";
-        const actionText = u.blocked ? "解封" : "封禁";
-        const actionClass = u.blocked ? "ok" : "danger";
-        const http = [
-            u.last_http_ipv4 ? `IPv4: ${h(u.last_http_ipv4)}` : "IPv4: -",
-            u.last_http_ipv6 ? `IPv6: ${h(u.last_http_ipv6)}` : "IPv6: -",
-            u.last_asn ? `ASN: ${h(u.last_asn)}` : "ASN: -",
-            u.last_as_organization ? h(u.last_as_organization) : "运营商: -",
-        ].join("<br>");
-        const udp = [
-            u.last_webrtc_ipv4 ? `UDP IPv4: ${h(u.last_webrtc_ipv4)}` : "UDP IPv4: -",
-            u.last_webrtc_ipv6 ? `UDP IPv6: ${h(u.last_webrtc_ipv6)}` : "UDP IPv6: -",
-            `UDP 状态: ${h(u.last_udp_status || "-")}`,
-            u.last_device_os ? `设备: ${h(u.last_device_os)}` : "设备: -",
-            u.identity_label_name ? "人工确认标签: " + h(u.identity_label_name) : "人工确认标签: -",
-            u.latest_fingerprint_hash ? `V2指纹: <code>${h(String(u.latest_fingerprint_hash).slice(0, 16))}</code>` : "V2指纹: -",
-            u.fingerprint_label_name ? `V2确认: ${h(u.fingerprint_label_name)} (${h(u.fingerprint_confirmed_score || 0)}%)` : "V2确认: -",
-        ].join("<br>");
-        const topic = [
-            u.topic_thread_id ? `话题 ID: ${h(u.topic_thread_id)}` : "话题 ID: -",
-            `状态: ${h(u.topic_status || "-")}`,
-            u.topic_title ? `标题: ${h(u.topic_title)}` : "标题: -",
-            u.topic_last_error ? `错误: ${h(u.topic_last_error)}` : "",
-        ].filter(Boolean).join("<br>");
-        const unverify = u.verified ? `<form method="post" action="/users/${u.user_id}/unverify"><button type="submit">取消验证</button></form>` : "";
-        const topicActions = `<form method="post" action="/users/${u.user_id}/topic/create"><button type="submit">创建话题</button></form><form method="post" action="/users/${u.user_id}/topic/rebuild"><button type="submit">重建话题</button></form><form method="post" action="/users/${u.user_id}/topic/unbind"><button type="submit">解除话题绑定</button></form>`;
-        const fingerprintActions = `<a class="btn" href="/users/${u.user_id}/fingerprints">指纹标签</a>${u.latest_fingerprint_hash ? `<form method="post" action="/users/${u.user_id}/fingerprints/mark"><button type="submit">标记指纹</button></form>` : ""}`;
-        const deleteAction = `<form method="post" action="/users/${u.user_id}/delete" onsubmit="return confirm('确定要永久删除该用户及其全部消息和验证记录吗？此操作无法恢复。')"><button class="danger" type="submit">删除用户</button></form>`;
-        const username = u.username ? `<span class="table-username">@${h(u.username)}</span>` : "";
+        const status = u.blocked
+            ? '<span class="badge red">已封禁</span>'
+            : u.verified ? '<span class="badge green">已验证</span>' : '<span class="badge warn">未验证</span>';
+        const mute = u.inbound_muted ? '<span class="badge warn">已隔离</span>' : "";
+        const http = lineCell([
+            `IPv4: ${u.last_http_ipv4 || "-"}`,
+            `IPv6: ${u.last_http_ipv6 || "-"}`,
+            `ASN: ${u.last_asn || "-"}`,
+            `运营商: ${u.last_as_organization || "-"}`,
+        ]);
+        const udp = lineCell([
+            `UDP IPv4: ${u.last_webrtc_ipv4 || "-"}`,
+            `UDP IPv6: ${u.last_webrtc_ipv6 || "-"}`,
+            `UDP 状态: ${u.last_udp_status || "-"}`,
+            `设备: ${u.last_device_os || "-"}`,
+            `WebRTC 标签: ${u.identity_label_name || "-"}`,
+            `V2 指纹: ${u.latest_fingerprint_hash ? String(u.latest_fingerprint_hash).slice(0, 16) : "-"}`,
+            `V2 确认: ${u.fingerprint_label_name ? `${u.fingerprint_label_name} ${u.fingerprint_confirmed_score || 0}%` : "-"}`,
+        ]);
+        const topic = lineCell([
+            `话题 ID: ${u.topic_thread_id || "-"}`,
+            `状态: ${u.topic_status || "-"}`,
+            `标题: ${u.topic_title || "-"}`,
+            `错误: ${u.topic_last_error || "无"}`,
+        ]);
         return `<tr>
-<td data-label="用户"><div class="table-identity"><b>${h(u.full_name || u.user_id)}</b><div class="table-meta"><span class="table-id">${h(u.user_id)}</span>${username}<span>语言: ${h(u.language_code || "-")}</span></div></div></td>
-<td data-label="状态">${status}<div class="table-meta"><span>${h(u.verification_status || "-")}</span></div>${tableTime(u.updated_at)}</td>
-<td data-label="公网 HTTP 信息"><div class="table-lines">${http}</div>${tableTime(u.last_verified_at)}</td>
-<td data-label="UDP / WebRTC / 指纹"><div class="table-lines">${udp}</div></td>
-<td data-label="话题"><div class="table-lines">${topic}</div></td>
-<td data-label="标签 / 备注">${h(u.note || "-")}</td>
+<td data-label="用户">${identityCell(u.full_name, u.user_id, u.username, [`语言: ${h(u.language_code || "-")}`])}</td>
+<td data-label="状态"><div class="cell">${status}${mute}<span class="table-meta"><span>${h(u.verification_status || "-")}</span></span></div>${tableTime(u.updated_at)}</td>
+<td data-label="公网 HTTP 信息">${http}${tableTime(u.last_verified_at)}</td>
+<td data-label="UDP / WebRTC / 指纹">${udp}</td>
+<td data-label="话题">${topic}</td>
+<td data-label="标签 / 备注"><div class="clamp clamp-4">${h(u.note || "-")}</div></td>
 <td data-label="操作">
-<form class="note-form" method="post" action="/users/${u.user_id}/note"><label class="sr-only" for="note-${u.user_id}">用户 ${u.user_id} 的标签或备注</label><input id="note-${u.user_id}" name="note" value="${h(u.note || "")}" placeholder="标签 / 备注"><button type="submit">保存备注</button></form>
-<div class="row-actions"><form method="post" action="/users/${u.user_id}/${actionPath}"><button class="${actionClass}" type="submit">${actionText}</button></form>${unverify}${fingerprintActions}${topicActions}${deleteAction}</div>
+<form class="note-form" method="post" action="/users/${u.user_id}/note"><label class="sr-only" for="note-${u.user_id}">用户 ${u.user_id} 的标签或备注</label><input id="note-${u.user_id}" name="note" value="${h(u.note || "")}" placeholder="标签 / 备注"><button type="submit">保存</button></form>
+<div class="row-actions">${userActionGrid(u)}</div>
 </td>
 </tr>`;
     }).join("");
-    return html(layout("用户管理", `<div class="card"><h2>用户管理</h2><p class="muted">展示已私聊过 Bot 的用户、验证状态、IPv4/IPv6、UDP WebRTC、设备系统、话题绑定、封禁状态和标签 / 备注。</p><div class="table-wrap users-wrap" style="--table-min:1480px" tabindex="0" aria-label="机器人用户管理，可横向滚动"><table class="users-table"><caption class="sr-only">机器人用户管理</caption><thead><tr><th scope="col">用户</th><th scope="col">状态</th><th scope="col">公网 HTTP 信息</th><th scope="col">UDP / WebRTC / 指纹</th><th scope="col">话题</th><th scope="col">标签 / 备注</th><th scope="col">操作</th></tr></thead><tbody>${bodyRows}</tbody></table></div></div>`));
+    return html(layout("用户管理", `<div class="card"><h2>用户管理</h2><p class="muted">展示已私聊过 Bot 的用户、验证状态、IPv4/IPv6、UDP WebRTC、设备系统、话题绑定、封禁与静默隔离状态和标签 / 备注。封禁与隔离的原因记录见「名单管理」页。</p><div class="table-wrap responsive-wrap" style="--table-min:1420px" tabindex="0" aria-label="机器人用户管理，可横向滚动"><table class="users-table responsive-table"><caption class="sr-only">机器人用户管理</caption><thead><tr><th scope="col">用户</th><th scope="col">状态</th><th scope="col">公网 HTTP 信息</th><th scope="col">UDP / WebRTC / 指纹</th><th scope="col">话题</th><th scope="col">标签 / 备注</th><th scope="col">操作</th></tr></thead><tbody>${bodyRows || '<tr><td data-span="full" colspan="7" class="muted">暂无用户记录。</td></tr>'}</tbody></table></div></div>`));
 }
 
 async function userNoteSave(request, env, userId) {
@@ -1117,8 +1249,27 @@ async function userNoteSave(request, env, userId) {
 }
 
 async function userBlockSet(request, env, userId, blocked) {
-    await setBlock(env, userId, blocked);
-    return redirect("/users", request);
+    await ensureVerificationSchema(env);
+    const fromModeration = new URL(request.url).pathname.startsWith("/moderation");
+    let reason = "";
+    if (blocked) {
+        const form = await request.formData().catch(() => null);
+        reason = String(form?.get("reason") || "").trim();
+    }
+    await setBlock(env, userId, blocked, reason || (blocked ? (fromModeration ? "名单管理页手动封禁" : "Web 用户管理页手动封禁") : ""));
+    return redirect(fromModeration ? "/moderation" : "/users", request);
+}
+
+async function userMuteSet(request, env, userId, muted) {
+    await ensureVerificationSchema(env);
+    const fromModeration = new URL(request.url).pathname.startsWith("/moderation");
+    let reason = "";
+    if (muted) {
+        const form = await request.formData().catch(() => null);
+        reason = String(form?.get("reason") || "").trim();
+    }
+    await setInboundMuted(env, userId, muted, reason || (muted ? (fromModeration ? "名单管理页手动隔离" : "Web 用户管理页手动隔离") : ""));
+    return redirect(fromModeration ? "/moderation" : "/users", request);
 }
 
 async function userVerifyCancel(request, env, userId) {
@@ -1144,10 +1295,10 @@ async function userFingerprintsPage(request, env, userId) {
     if (!user) return html(layout("用户不存在", `<div class="card"><p>找不到用户 ${h(userId)}。</p></div>`), 404);
     const current = latest?.profile;
     const currentText = current ? `<dl class="kv"><dt>完整指纹</dt><dd><code>${h(current.exactHash)}</code></dd><dt>档案槽位</dt><dd>${latest.row.slot}</dd><dt>质量</dt><dd>${current.qualityScore}%</dd><dt>设备</dt><dd>${h(current.summary?.model || "-")} / ${h(current.summary?.performanceClass || "-")}</dd></dl>` : `<p class="muted">当前还没有V2指纹，请让用户重新完成验证。</p>`;
-    const rows = (labels.results || []).map((row) => `<tr><td data-label="ID"><span class="table-id">#${h(row.id)}</span></td><td data-label="标签">${h(row.label_name)}</td><td data-label="状态">${row.state === "blacklist" ? '<span class="badge red">指纹黑名单</span>' : '<span class="badge green">观察</span>'}</td><td data-label="参考档案">${Number(row.reference_count || 0)}</td><td data-label="更新时间">${tableTime(row.updated_at)}</td><td data-label="操作"><form method="post" action="/fingerprint-labels/${row.id}/delete" onsubmit="return confirm('确定删除该指纹标签和全部参考档案吗？')"><button class="danger" type="submit">删除</button></form></td></tr>`).join("");
-    const mark = current ? `<form method="post" action="/users/${userId}/fingerprints/mark"><button class="primary" type="submit">使用当前备注标记指纹</button></form>` : "";
+    const rows = (labels.results || []).map((row) => `<tr><td data-label="ID"><span class="table-id">#${h(row.id)}</span></td><td data-label="标签"><div class="clamp clamp-2">${h(row.label_name)}</div></td><td data-label="状态">${row.state === "blacklist" ? '<span class="badge red">指纹黑名单</span>' : '<span class="badge green">观察</span>'}</td><td data-label="参考档案"><span class="num">${Number(row.reference_count || 0)}</span></td><td data-label="更新时间">${tableTime(row.updated_at)}</td><td data-label="操作"><div class="row-actions" style="grid-template-columns:minmax(0,1fr);margin-top:0"><form method="post" action="/fingerprint-labels/${row.id}/delete" onsubmit="return confirm('确定删除该指纹标签和全部参考档案吗？')"><button class="danger" type="submit">删除</button></form></div></td></tr>`).join("");
+    const mark = current ? `<div class="actions"><form method="post" action="/users/${userId}/fingerprints/mark"><button class="primary" type="submit">使用当前备注标记指纹</button></form><a class="btn" href="/users">返回用户管理</a></div>` : `<div class="actions"><a class="btn" href="/users">返回用户管理</a></div>`;
     const confirmedText = confirmed ? `${h(confirmed.label_name)} · ${confirmed.weighted_score}% · ${h(confirmed.match_method)} · ${h(confirmed.confirmed_at)}` : "无";
-    return html(layout("指纹标签", `<div class="card"><h2>${h(user.full_name || userId)} · 指纹V2</h2><p class="muted">完整哈希相同为100%；其余结果只作为人工候选，不会自动封禁。</p>${currentText}<p><b>当前人工确认：</b>${confirmedText}</p>${mark}</div><div class="card"><h2>直接标记的标签</h2><div class="table-wrap responsive-wrap" style="--table-min:760px" tabindex="0" aria-label="指纹标签列表，可横向滚动"><table class="responsive-table"><caption class="sr-only">直接标记的指纹标签</caption><thead><tr><th scope="col">ID</th><th scope="col">标签</th><th scope="col">状态</th><th scope="col">参考档案</th><th scope="col">更新时间</th><th scope="col">操作</th></tr></thead><tbody>${rows || '<tr><td data-label="状态" data-span="full" colspan="6">暂无标签</td></tr>'}</tbody></table></div></div>`));
+    return html(layout("指纹标签", `<div class="card"><h2>${h(user.full_name || userId)} · 指纹 V2</h2><p class="muted">完整哈希相同为 100%；其余结果只作为人工候选，不会自动封禁。</p>${currentText}<p><b>当前人工确认：</b>${confirmedText}</p>${mark}</div><div class="card"><h2>直接标记的标签</h2><div class="table-wrap responsive-wrap" style="--table-min:820px" tabindex="0" aria-label="指纹标签列表，可横向滚动"><table class="fingerprints-table responsive-table"><caption class="sr-only">直接标记的指纹标签</caption><thead><tr><th scope="col">ID</th><th scope="col">标签</th><th scope="col">状态</th><th scope="col">参考档案</th><th scope="col">更新时间</th><th scope="col">操作</th></tr></thead><tbody>${rows || '<tr><td data-span="full" colspan="6" class="muted">暂无标签。</td></tr>'}</tbody></table></div></div>`));
 }
 
 async function userFingerprintMark(request, env, userId) {
@@ -1204,6 +1355,67 @@ async function userDelete(request, env, userId) {
     return redirect("/users", request);
 }
 
+// 名单管理：集中查看封禁与静默隔离名单、原因、时间，并直接处理。
+async function moderationPage(request, env) {
+    await ensureVerificationSchema(env);
+    const [blockedRows, mutedRows] = await Promise.all([
+        env.DB.prepare(
+            "SELECT user_id, username, full_name, note, blocked, block_reason, blocked_at, inbound_muted, " +
+            "topic_thread_id, last_http_ipv4, last_http_ipv6, last_device_os, updated_at " +
+            "FROM users WHERE blocked=1 ORDER BY (CASE WHEN blocked_at='' THEN updated_at ELSE blocked_at END) DESC LIMIT 300",
+        ).all(),
+        env.DB.prepare(
+            "SELECT user_id, username, full_name, note, blocked, inbound_muted, mute_reason, muted_at, " +
+            "topic_thread_id, last_http_ipv4, last_http_ipv6, last_device_os, updated_at " +
+            "FROM users WHERE inbound_muted=1 ORDER BY (CASE WHEN muted_at='' THEN updated_at ELSE muted_at END) DESC LIMIT 300",
+        ).all(),
+    ]);
+
+    const buildRow = (u, kind) => {
+        const reason = kind === "block" ? u.block_reason : u.mute_reason;
+        const at = kind === "block" ? u.blocked_at : u.muted_at;
+        const badges = [
+            u.blocked ? '<span class="badge red">已封禁</span>' : "",
+            u.inbound_muted ? '<span class="badge warn">已隔离</span>' : "",
+        ].filter(Boolean).join("");
+        const releasePath = kind === "block" ? "unblock" : "unmute";
+        const releaseText = kind === "block" ? "解除封禁" : "解除隔离";
+        const other = kind === "block"
+            ? (u.inbound_muted
+                ? `<form method="post" action="/moderation/${u.user_id}/unmute"><button class="ok" type="submit">解除隔离</button></form>`
+                : `<form method="post" action="/moderation/${u.user_id}/mute"><button type="submit">追加隔离</button></form>`)
+            : (u.blocked
+                ? `<form method="post" action="/moderation/${u.user_id}/unblock"><button class="ok" type="submit">解除封禁</button></form>`
+                : `<form method="post" action="/moderation/${u.user_id}/block"><button class="danger" type="submit">追加封禁</button></form>`);
+        return `<tr>
+<td data-label="用户">${identityCell(u.full_name, u.user_id, u.username)}</td>
+<td data-label="状态"><div class="cell">${badges || '<span class="badge">正常</span>'}</div></td>
+<td data-label="${kind === "block" ? "封禁原因" : "隔离原因"}" data-span="full"><div class="clamp clamp-3">${h(reason || "未记录原因（可能是旧数据或在本次升级前处理）")}</div></td>
+<td data-label="时间">${tableTime(at || u.updated_at)}</td>
+<td data-label="操作"><div class="row-actions" style="grid-template-columns:repeat(2,minmax(0,1fr));margin-top:0"><form method="post" action="/moderation/${u.user_id}/${releasePath}"><button class="ok" type="submit">${releaseText}</button></form>${other}<a class="btn" href="/users">用户管理</a><a class="btn" href="/users/${u.user_id}/fingerprints">指纹标签</a></div></td>
+</tr>`;
+    };
+
+    const blockedBody = (blockedRows.results || []).map((u) => buildRow(u, "block")).join("");
+    const mutedBody = (mutedRows.results || []).map((u) => buildRow(u, "mute")).join("");
+    const table = (title, rows, kind) => `<div class="table-wrap responsive-wrap" style="--table-min:1080px" tabindex="0" aria-label="${h(title)}，可横向滚动"><table class="moderation-table responsive-table"><caption class="sr-only">${h(title)}</caption><thead><tr><th scope="col">用户</th><th scope="col">状态</th><th scope="col">${kind === "block" ? "封禁原因" : "隔离原因"}</th><th scope="col">时间</th><th scope="col">操作</th></tr></thead><tbody>${rows || `<tr><td data-span="full" colspan="5" class="muted">${kind === "block" ? "当前没有被封禁的用户。" : "当前没有被静默隔离的用户。"}</td></tr>`}</tbody></table></div>`;
+
+    const body = `<div class="grid metrics-grid" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+<div class="card metric-card"><div class="muted">封禁名单</div><div class="metric">${(blockedRows.results || []).length}</div></div>
+<div class="card metric-card"><div class="muted">静默隔离名单</div><div class="metric">${(mutedRows.results || []).length}</div></div>
+</div>
+<div class="card"><h2>两种处理方式的区别</h2>
+<dl class="kv">
+<dt>封禁</dt><dd>用户消息不再转发给管理员，机器人会明确告知用户「已被加入黑名单」。管理员在话题或后台仍能看到该用户的历史记录。适合处理广告号、骚扰账号。命中广告关键词时系统会自动封禁并写入命中的关键词作为原因。</dd>
+<dt>静默隔离</dt><dd>用户的私聊消息在进入系统之前就被丢弃，不写入消息记录、不回复任何提示、不占用去重记录。用户完全感知不到异常，会以为消息已经发出。适合处理脚本刷屏号，避免对方发现被处理后换号重来。</dd>
+<dt>两者可叠加</dt><dd>同一个用户可以同时处于封禁与隔离状态。隔离在最外层生效，此时封禁提示也不会发出。</dd>
+<dt>原因来源</dt><dd>原因由执行入口自动写入，包括 Web 后台手动操作、Telegram 话题管理按钮、验证通知按钮、<code>/block</code> 命令以及广告关键词自动拉黑。解除时原因与时间会一并清空。</dd>
+</dl></div>
+<div class="card"><h2>封禁名单</h2><p class="muted">消息不再转发，用户会收到明确提示。共 ${(blockedRows.results || []).length} 人。</p>${table("封禁名单", blockedBody, "block")}</div>
+<div class="card"><h2>静默隔离名单</h2><p class="muted">消息在入口处直接丢弃，用户无感知。共 ${(mutedRows.results || []).length} 人。</p>${table("静默隔离名单", mutedBody, "mute")}</div>`;
+    return html(layout("名单管理", body));
+}
+
 async function rulesPage(request, env) {
     const keywords = await getSpamKeywords(env);
     const autoBlock = await getSetting(env, "spam_auto_block", "true");
@@ -1229,33 +1441,33 @@ async function verificationsPage(request, env) {
     await ensureVerificationSchema(env);
     const rows = await env.DB.prepare("SELECT v.*, u.full_name, u.username FROM ip_verifications v LEFT JOIN users u ON u.user_id=v.user_id ORDER BY v.id DESC LIMIT 300").all();
     const bodyRows = (rows.results || []).map((r) => {
-        const http = [
-            `HTTP: ${h(r.http_ip || r.ip || "-")}`,
-            `类型: ${h(r.http_ip_version || "-")}`,
-            `IPv4: ${h(r.http_ipv4 || "-")}`,
-            `IPv6: ${h(r.http_ipv6 || "-")}`,
-            `ASN: ${h(r.asn || "-")}`,
-            h(r.as_organization || ""),
-        ].join("<br>");
-        const udp = [
-            `UDP IPv4: ${h(r.webrtc_ipv4 || "-")}`,
-            `UDP IPv6: ${h(r.webrtc_ipv6 || "-")}`,
-            `协议: ${h(r.webrtc_protocol || "-")}`,
-            `类型: ${h(r.webrtc_candidate_type || "-")}`,
-            `状态: ${h(r.udp_status || "-")}`,
-        ].join("<br>");
-        const username = r.username ? `<span class="table-username">@${h(r.username)}</span>` : "";
-        const user = r.user_id ? `<div class="table-identity"><b>${h(r.full_name || r.user_id)}</b><div class="table-meta"><span class="table-id">${h(r.user_id)}</span>${username}</div></div>` : '<span class="muted">-</span>';
+        const http = lineCell([
+            `HTTP: ${r.http_ip || r.ip || "-"}`,
+            `类型: ${r.http_ip_version || "-"}`,
+            `IPv4: ${r.http_ipv4 || "-"}`,
+            `IPv6: ${r.http_ipv6 || "-"}`,
+            `ASN: ${r.asn || "-"}`,
+            `运营商: ${r.as_organization || "-"}`,
+            `地区: ${[r.country, r.colo].filter(Boolean).join(" · ") || "-"}`,
+        ]);
+        const udp = lineCell([
+            `UDP IPv4: ${r.webrtc_ipv4 || "-"}`,
+            `UDP IPv6: ${r.webrtc_ipv6 || "-"}`,
+            `协议: ${r.webrtc_protocol || "-"}`,
+            `类型: ${r.webrtc_candidate_type || "-"}`,
+            `状态: ${r.udp_status || "-"}`,
+        ]);
+        const user = r.user_id ? identityCell(r.full_name, r.user_id, r.username) : '<span class="muted">-</span>';
         return `<tr>
-<td data-label="ID"><span class="table-id">#${h(r.id)}</span><br><span class="badge green">通过</span></td>
+<td data-label="ID"><div class="cell"><span class="table-id">#${h(r.id)}</span><span class="badge green">通过</span></div></td>
 <td data-label="用户">${user}</td>
-<td data-label="公网 HTTP"><div class="table-lines">${http}</div><small>${h(r.country || "-")} · ${h(r.colo || "-")}</small></td>
-<td data-label="UDP / WebRTC"><div class="table-lines">${udp}</div></td>
-<td data-label="设备 / User-Agent"><b>${h(r.device_os || "-")}</b><span class="ua-text">${h(r.user_agent || "-")}</span></td>
+<td data-label="公网 HTTP">${http}</td>
+<td data-label="UDP / WebRTC">${udp}</td>
+<td data-label="设备 / User-Agent" data-span="full"><div class="cell"><b>${h(r.device_os || "-")}</b><span class="ua-text">${h(r.user_agent || "-")}</span></div></td>
 <td data-label="时间">${tableTime(r.created_at)}</td>
 </tr>`;
     }).join("");
-    return html(layout("CF 验证记录", `<div class="card"><h2>CF 验证记录</h2><p class="muted">访客通过 Cloudflare Turnstile 后会记录 HTTP IPv4/IPv6、UDP WebRTC IPv4/IPv6、ASN、设备系统和 User-Agent。验证入口使用一次性 token 关联 Telegram 用户。</p><div class="table-wrap verifications-wrap" style="--table-min:1260px" tabindex="0" aria-label="Cloudflare 验证记录，可横向滚动"><table class="verifications-table"><caption class="sr-only">Cloudflare 验证记录</caption><thead><tr><th scope="col">ID</th><th scope="col">用户</th><th scope="col">公网 HTTP</th><th scope="col">UDP / WebRTC</th><th scope="col">设备/User-Agent</th><th scope="col">时间</th></tr></thead><tbody>${bodyRows}</tbody></table></div></div>`));
+    return html(layout("CF 验证记录", `<div class="card"><h2>CF 验证记录</h2><p class="muted">访客通过 Cloudflare Turnstile 后会记录 HTTP IPv4/IPv6、UDP WebRTC IPv4/IPv6、ASN、设备系统和 User-Agent。验证入口使用一次性 token 关联 Telegram 用户。</p><div class="table-wrap responsive-wrap" style="--table-min:1300px" tabindex="0" aria-label="Cloudflare 验证记录，可横向滚动"><table class="verifications-table responsive-table"><caption class="sr-only">Cloudflare 验证记录</caption><thead><tr><th scope="col">ID</th><th scope="col">用户</th><th scope="col">公网 HTTP</th><th scope="col">UDP / WebRTC</th><th scope="col">设备 / User-Agent</th><th scope="col">时间</th></tr></thead><tbody>${bodyRows || '<tr><td data-span="full" colspan="6" class="muted">暂无验证记录。</td></tr>'}</tbody></table></div></div>`));
 }
 
 async function settingsPage(request, env) {
@@ -1275,22 +1487,26 @@ async function settingsPage(request, env) {
 <div class="grid"><div><label for="public-base-url">公开地址</label><input id="public-base-url" value="${h(base)}" readonly></div><div><label for="verify-entry">验证入口</label><input id="verify-entry" value="${h(`${base}/verify/{token}`)}" readonly></div></div>
 <div class="actions"><button class="primary" type="submit">保存设置</button></div></form></div>
 <div class="card"><h2>Cloudflare Secrets 状态</h2>
-<div class="table-wrap responsive-wrap" style="--table-min:620px" tabindex="0" aria-label="Cloudflare Secrets 配置状态，可横向滚动"><table class="responsive-table"><caption class="sr-only">Cloudflare Secrets 配置状态</caption><thead><tr><th scope="col">名称</th><th scope="col">状态</th><th scope="col">说明</th></tr></thead><tbody>
-${secretRow("BOT_TOKEN", env.BOT_TOKEN, "Telegram Bot Token")}
-${secretRow("PANEL_PASSWORD", env.PANEL_PASSWORD, "后台登录密码")}
-${secretRow("PANEL_SECRET", env.PANEL_SECRET, "Cookie session secret")}
-${secretRow("TELEGRAM_SECRET_TOKEN", env.TELEGRAM_SECRET_TOKEN, "Telegram webhook secret token")}
-${secretRow("TURNSTILE_SECRET_KEY", env.TURNSTILE_SECRET_KEY, "Cloudflare Turnstile secret")}
-${secretRow("FINGERPRINT_HMAC_KEY", env.FINGERPRINT_HMAC_KEY, "V2指纹HMAC专用密钥；未配置时使用带域隔离的SHA-256")}
-${secretRow("TURNSTILE_SITE_KEY", env.TURNSTILE_SITE_KEY, "Cloudflare Turnstile site key，可放 vars")}
-${secretRow("CONTROL_MODE", mode, "web / topic / both")}
-${secretRow("TOPIC_GROUP_ID", groupId, "开启 Topics 的 Telegram 超级群 ID")}
+<div class="table-wrap responsive-wrap" style="--table-min:620px" tabindex="0" aria-label="Cloudflare Secrets 配置状态，可横向滚动"><table class="secrets-table responsive-table"><caption class="sr-only">Cloudflare Secrets 配置状态</caption><thead><tr><th scope="col">名称</th><th scope="col">状态</th><th scope="col">说明</th></tr></thead><tbody>
+${secretRow("BOT_TOKEN", env.BOT_TOKEN, "Telegram Bot Token，调用 Bot API 必需", true)}
+${secretRow("PANEL_PASSWORD", env.PANEL_PASSWORD, "Web 后台登录密码，未配置时使用默认值，务必设置", true)}
+${secretRow("PANEL_SECRET", env.PANEL_SECRET, "登录 Cookie 的签名密钥，修改后所有登录会话失效", true)}
+${secretRow("TELEGRAM_SECRET_TOKEN", env.TELEGRAM_SECRET_TOKEN, "Telegram Webhook 校验令牌，防止伪造 Webhook 请求", false)}
+${secretRow("TURNSTILE_SECRET_KEY", env.TURNSTILE_SECRET_KEY, "Cloudflare Turnstile 服务端密钥，验证门禁必需", true)}
+${secretRow("FINGERPRINT_HMAC_KEY", env.FINGERPRINT_HMAC_KEY, "V2 指纹派生密钥（可选）。配置后 IP、ASN、运营商、Canvas、WebGL、Audio 等特征改用 HMAC-SHA256 派生，D1 泄露也无法反推明文；未配置时退化为带域隔离前缀的 SHA-256，功能完全正常。一旦设置请勿更换，否则已有指纹参考档案会失效。", false)}
+${secretRow("TURNSTILE_SITE_KEY", env.TURNSTILE_SITE_KEY, "Cloudflare Turnstile 前端站点密钥，可放在 vars 中", true)}
+${secretRow("CONTROL_MODE", mode, "控制通道：web 仅后台、topic 仅话题、both 两者同时", false)}
+${secretRow("TOPIC_GROUP_ID", groupId, "已开启 Topics 的 Telegram 超级群 ID，话题模式必填", false)}
 </tbody></table></div></div>`;
     return html(layout("设置", body));
 }
 
-function secretRow(name, value, note) {
-    return `<tr><td data-label="名称"><code>${name}</code></td><td data-label="状态">${value ? '<span class="badge green">已配置</span>' : '<span class="badge red">未配置</span>'}</td><td data-label="说明">${h(note)}</td></tr>`;
+// required 为 true 时未配置显示红色「必填未配置」，为 false 时显示灰色「可选未配置」。
+function secretRow(name, value, note, required = false) {
+    const state = value
+        ? '<span class="badge green">已配置</span>'
+        : required ? '<span class="badge red">必填未配置</span>' : '<span class="badge">可选未配置</span>';
+    return `<tr><td data-label="名称"><code>${name}</code></td><td data-label="状态">${state}</td><td data-label="说明" data-span="full">${h(note)}</td></tr>`;
 }
 
 async function settingsSave(request, env) {
@@ -1456,12 +1672,17 @@ async function logsPage(request, env) {
         const levelText = level === "error" ? "错误" : level === "warn" ? "警告" : level === "info" ? "信息" : (r.level || "日志");
         const levelClass = level === "error" ? "red" : level === "warn" ? "warn" : "";
         const original = [translated.rawMessage, translated.rawData].filter(Boolean).join("\n");
+        // 无处理建议时也渲染同高度的占位块，让每行高度一致。
         const suggestion = translated.suggestion
-            ? `<div class="msg" style="margin-top:10px"><b>处理建议：</b>${h(translated.suggestion)}</div>`
-            : "";
-        return `<tr><td data-label="ID / 级别"><span class="table-id">#${h(r.id)}</span><br><span class="badge ${levelClass}">${h(levelText)}</span></td><td data-label="中文说明 / 原始日志" data-span="full"><b>${h(translated.title)}</b><div class="muted" style="margin-top:8px"><b>中文说明：</b>${h(translated.reason)}</div>${suggestion}<details style="margin-top:10px"><summary>查看原始日志</summary><pre>${h(original)}</pre></details></td><td data-label="时间">${tableTime(r.created_at)}</td></tr>`;
+            ? `<div class="log-hint"><b>处理建议：</b>${h(translated.suggestion)}</div>`
+            : '<div class="log-hint empty">这条日志没有对应的处理建议，请查看下方原始日志。</div>';
+        return `<tr>
+<td data-label="ID / 级别"><div class="cell"><span class="table-id">#${h(r.id)}</span><span class="badge ${levelClass}">${h(levelText)}</span></div></td>
+<td data-label="中文说明 / 原始日志" data-span="full"><div class="log-body"><b>${h(translated.title)}</b><div class="muted" style="font-size:12px"><b>中文说明：</b>${h(translated.reason)}</div>${suggestion}<details><summary>查看原始日志</summary><pre>${h(original)}</pre></details></div></td>
+<td data-label="时间">${tableTime(r.created_at)}</td>
+</tr>`;
     }).join("");
-    return html(layout("日志", `<div class="card"><h2>最近日志</h2><p class="muted">系统会在页面中翻译常见错误并给出处理建议；原始日志完整保留在“查看原始日志”中。</p><div class="table-wrap responsive-wrap" style="--table-min:780px" tabindex="0" aria-label="最近系统日志，可横向滚动"><table class="logs-table responsive-table"><caption class="sr-only">最近系统日志</caption><thead><tr><th scope="col">ID</th><th scope="col">中文说明 / 原始日志</th><th scope="col">时间</th></tr></thead><tbody>${bodyRows}</tbody></table></div></div>`));
+    return html(layout("日志", `<div class="card"><h2>最近日志</h2><p class="muted">系统会在页面中翻译常见错误并给出处理建议；原始日志完整保留在“查看原始日志”中。</p><div class="table-wrap responsive-wrap" style="--table-min:900px" tabindex="0" aria-label="最近系统日志，可横向滚动"><table class="logs-table responsive-table"><caption class="sr-only">最近系统日志</caption><thead><tr><th scope="col">ID / 级别</th><th scope="col">中文说明 / 原始日志</th><th scope="col">时间</th></tr></thead><tbody>${bodyRows || '<tr><td data-span="full" colspan="3" class="muted">暂无日志记录。</td></tr>'}</tbody></table></div></div>`));
 }
 
 async function verifyPage(request, env, token = "", error = "") {
@@ -2331,7 +2552,7 @@ async function handleTopicAdminCallback(env, query) {
         await tgSendMessage(env, userId, "管理员已取消你的验证状态，请重新完成验证后继续聊天。").catch(() => {});
         await answerCallbackQuery(env, query.id, "已取消验证");
     } else if (action === "ban") {
-        await setBlock(env, userId, true);
+        await setBlock(env, userId, true, `Telegram 话题按钮拉黑（管理员 ${adminId}）`);
         await tgSendMessage(env, userId, "管理员已将你加入黑名单，后续消息不会被转发。").catch(() => {});
         await answerCallbackQuery(env, query.id, "已拉黑");
     } else if (action === "unban") {
@@ -2339,7 +2560,7 @@ async function handleTopicAdminCallback(env, query) {
         await tgSendMessage(env, userId, "管理员已取消你的拉黑状态。").catch(() => {});
         await answerCallbackQuery(env, query.id, "已取消拉黑");
     } else if (action === "mute") {
-        await setInboundMuted(env, userId, true);
+        await setInboundMuted(env, userId, true, `Telegram 话题按钮隔离（管理员 ${adminId}）`);
         await answerCallbackQuery(env, query.id, "已开启静默隔离");
     } else if (action === "unmute") {
         await setInboundMuted(env, userId, false);
@@ -2697,7 +2918,8 @@ async function handleCommand(env, message, command, isAdmin) {
             await tgSendMessage(env, chatId, `已发送给用户 ${uid}，message_id=${sent.message_id}`);
         } else if (command.name === "block") {
             const uid = parseUserId(command.args);
-            await setBlock(env, uid, true);
+            const extra = String(command.args || "").trim().slice(String(uid).length).trim();
+            await setBlock(env, uid, true, extra || `Telegram /block 命令（管理员 ${chatId}）`);
             await tgSendMessage(env, chatId, `已封禁用户 ${uid}`);
         } else if (command.name === "unblock") {
             const uid = parseUserId(command.args);
@@ -2789,7 +3011,7 @@ async function relayUserMessage(env, message) {
     const hits = await spamHits(env, textValue);
     const autoBlock = await getSetting(env, "spam_auto_block", "true");
     if (hits.length && autoBlock !== "false") {
-        await setBlock(env, user.id, true);
+        await setBlock(env, user.id, true, `广告关键词自动拉黑：${hits.join("、")}`);
         await markInboxError(env, inboxId, `spam: ${hits.join(", ")}`);
         const spamNotice = `[垃圾消息已拉黑]\nuser_id: <code>${user.id}</code>\n命中：${h(hits.join(", "))}\n内容：${h(textValue.slice(0, 300))}`;
         await notifyAdmins(env, spamNotice);
@@ -2982,8 +3204,18 @@ async function isBlocked(env, userId) {
     return Boolean(row?.blocked);
 }
 
-async function setBlock(env, userId, blocked) {
-    await env.DB.prepare("UPDATE users SET blocked=?, updated_at=? WHERE user_id=?").bind(blocked ? 1 : 0, nowIso(), userId).run();
+// reason 只在置为封禁时写入；解封会一并清空原因和时间，避免旧原因残留误导。
+async function setBlock(env, userId, blocked, reason = "") {
+    const ts = nowIso();
+    if (blocked) {
+        await env.DB.prepare("UPDATE users SET blocked=1, block_reason=?, blocked_at=?, updated_at=? WHERE user_id=?")
+            .bind(String(reason || "").slice(0, 300), ts, ts, userId)
+            .run();
+        return;
+    }
+    await env.DB.prepare("UPDATE users SET blocked=0, block_reason='', blocked_at='', updated_at=? WHERE user_id=?")
+        .bind(ts, userId)
+        .run();
 }
 
 async function isInboundMuted(env, userId) {
@@ -2991,8 +3223,17 @@ async function isInboundMuted(env, userId) {
     return Boolean(row?.inbound_muted);
 }
 
-async function setInboundMuted(env, userId, muted) {
-    await env.DB.prepare("UPDATE users SET inbound_muted=?, updated_at=? WHERE user_id=?").bind(muted ? 1 : 0, nowIso(), userId).run();
+async function setInboundMuted(env, userId, muted, reason = "") {
+    const ts = nowIso();
+    if (muted) {
+        await env.DB.prepare("UPDATE users SET inbound_muted=1, mute_reason=?, muted_at=?, updated_at=? WHERE user_id=?")
+            .bind(String(reason || "").slice(0, 300), ts, ts, userId)
+            .run();
+        return;
+    }
+    await env.DB.prepare("UPDATE users SET inbound_muted=0, mute_reason='', muted_at='', updated_at=? WHERE user_id=?")
+        .bind(ts, userId)
+        .run();
 }
 
 async function claimTelegramUpdate(env, updateId) {
@@ -3350,7 +3591,7 @@ async function handleCallbackQuery(env, query) {
         return;
     }
     if (action === "block") {
-        await setBlock(env, userId, true);
+        await setBlock(env, userId, true, `Telegram 验证通知按钮拉黑（管理员 ${adminId}）`);
         await answerCallbackQuery(env, query.id, "已拉黑");
         await tgSendMessage(env, adminId, `已拉黑用户 ${userId}。`);
         return;
@@ -3704,6 +3945,10 @@ async function ensureVerificationSchema(env) {
     const userColumns = [
         "language_code TEXT DEFAULT ''",
         "inbound_muted INTEGER DEFAULT 0",
+        "block_reason TEXT DEFAULT ''",
+        "blocked_at TEXT DEFAULT ''",
+        "mute_reason TEXT DEFAULT ''",
+        "muted_at TEXT DEFAULT ''",
         "verified INTEGER DEFAULT 0",
         "verification_status TEXT DEFAULT 'pending'",
         "verification_token TEXT DEFAULT ''",
@@ -3755,6 +4000,7 @@ async function ensureVerificationSchema(env) {
     const indexes = [
         { name: "idx_users_topic", sql: "CREATE INDEX IF NOT EXISTS idx_users_topic ON users(topic_chat_id, topic_thread_id)" },
         { name: "idx_users_inbound_muted", sql: "CREATE INDEX IF NOT EXISTS idx_users_inbound_muted ON users(inbound_muted, updated_at DESC)" },
+        { name: "idx_users_blocked", sql: "CREATE INDEX IF NOT EXISTS idx_users_blocked ON users(blocked, updated_at DESC)" },
         { name: "idx_webrtc_identity_labels_source", sql: "CREATE INDEX IF NOT EXISTS idx_webrtc_identity_labels_source ON webrtc_identity_labels(source_user_id, updated_at DESC)" },
         { name: "idx_webrtc_identity_confirmations_label", sql: "CREATE INDEX IF NOT EXISTS idx_webrtc_identity_confirmations_label ON webrtc_identity_confirmations(label_id)" },
         { name: "idx_inbox_topic_created", sql: "CREATE INDEX IF NOT EXISTS idx_inbox_topic_created ON inbox_messages(topic_chat_id, topic_thread_id, created_at)" },

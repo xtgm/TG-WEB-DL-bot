@@ -18,6 +18,7 @@
     "db:upgrade:topics": "wrangler d1 execute tg-dualbot-db --file=./migrations/0003_topic_mode.sql --remote",
     "db:upgrade:webrtc-identity": "wrangler d1 execute tg-dualbot-db --file=./migrations/0005_webrtc_identity.sql --remote",
     "db:upgrade:fingerprint-v2": "wrangler d1 execute tg-dualbot-db --file=./migrations/0007_fingerprint_v2.sql --remote",
+    "db:upgrade:moderation": "wrangler d1 execute tg-dualbot-db --file=./migrations/0009_moderation_reason.sql --remote",
     "pages:deploy": "wrangler pages deploy public --project-name tg-dualbot-cloudflare"
   },
   "devDependencies": {

@@ -142,8 +142,14 @@ const callbackEnv = {
                     throw new Error("unexpected callback query: " + sql);
                 },
                 async run() {
-                    if (sql.includes("UPDATE users SET inbound_muted=?")) {
-                        callbackMuted = Number(bindings[0]);
+                    // 置为隔离时会写入原因与时间，解除隔离时会清空，两条语句都要接受。
+                    if (sql.includes("UPDATE users SET inbound_muted=1")) {
+                        callbackMuted = 1;
+                        callbackUpdates.push([...bindings]);
+                        return { meta: { changes: 1 } };
+                    }
+                    if (sql.includes("UPDATE users SET inbound_muted=0")) {
+                        callbackMuted = 0;
                         callbackUpdates.push([...bindings]);
                         return { meta: { changes: 1 } };
                     }

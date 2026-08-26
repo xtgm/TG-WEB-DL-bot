@@ -14,6 +14,7 @@
 | 项目定位 | [项目定位](#project-position) |
 | 功能总览 | [功能总览](#feature-overview) |
 | Web 面板功能 | [Web 面板功能](#web-panel) |
+| 名单管理 | [名单管理](#moderation) |
 | Telegram 功能 | [Telegram 功能](#telegram-features) |
 | Cloudflare 验证门禁 | [Cloudflare 验证门禁](#cloudflare-verification) |
 | Telegram 话题双通道 | [Telegram 话题双通道](#topic-mode) |
@@ -156,13 +157,14 @@ npm run db:apply
 
 | 表名 | 作用 |
 |---|---|
-| `users` | Telegram 用户资料、验证状态、封禁状态、IP/设备信息、话题绑定信息。 |
+| `users` | Telegram 用户资料、验证状态、封禁状态与原因、静默隔离状态与原因、IP/设备信息、话题绑定信息。 |
 | `message_map` | 管理员私聊回复和原用户消息之间的映射。 |
 | `inbox_messages` | 用户入站消息、管理员出站消息、Web/话题转发状态。 |
 | `spam_keywords` | 私聊广告拦截关键词。 |
 | `settings` | 后台保存的管理员 ID、欢迎语、控制模式等设置。 |
 | `event_logs` | 系统事件和错误日志。 |
 | `rate_events` | 用户消息限频记录。 |
+| `telegram_updates` | 已处理的 Telegram update_id，用于 Webhook 重发去重。 |
 | `ip_verifications` | Cloudflare Turnstile、HTTP IP、IPv4/IPv6、UDP WebRTC、ASN、设备记录。 |
 | `verification_sessions` | Telegram 用户一次性验证 token 和验证会话。 |
 | `webrtc_identity_labels` | 管理员手动标记的 WebRTC 精确哈希和标签；同一哈希全局唯一。 |
@@ -182,9 +184,11 @@ npm run db:upgrade:verification
 npm run db:upgrade:topics
 npm run db:upgrade:webrtc-identity
 npm run db:upgrade:fingerprint-v2
+npm run db:upgrade:moderation
 ```
 
 如果旧库已经运行过新版 Worker，运行时代码可能已经自动补齐字段；这时升级 SQL 遇到重复字段可以停止，不影响新版运行。
+`0009_moderation_reason.sql` 只新增封禁与隔离的原因、时间字段和一个索引，运行时也会自动补齐，可以不手工执行。
 
 <a id="workers-manual"></a>
 
@@ -309,14 +313,42 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 页面 | 路径 | 功能 |
 |---|---|---|
 | 登录 | `/login` | 输入后台用户名和密码，成功后写入 `tg_dualbot_session` Cookie。 |
-| 总览 | `/` | 显示用户数、封禁用户、已验证用户、消息记录、CF 验证通过数、公开地址和验证入口格式。 |
-| 收件箱 | `/inbox` | 显示用户入站消息、管理员出站回复、消息方向、来源、状态和错误；支持回复与重试。 |
-| 用户管理 | `/users` | 查看用户资料、备注标签、封禁、验证状态、HTTP IP、UDP WebRTC、ASN、设备系统和话题绑定；支持备注、封禁、解封、取消验证、创建话题、重建话题、解除话题绑定和完整删除用户数据。 |
-| 广告拦截 | `/rules` | 一行一个关键词；可开关命中后自动封禁。 |
-| CF 验证记录 | `/verifications` | 展示每次 Turnstile 通过后的 IP、UDP/WebRTC、ASN、设备系统、User-Agent 和时间。 |
-| 设置 | `/settings` | 保存管理员 Chat ID、欢迎语；查看公开地址、验证入口和 Secrets 配置状态。 |
-| 日志 | `/logs` | 查看最近事件，例如转发失败、通知失败、Turnstile 校验失败。 |
+| 总览 | `/` | 显示用户总数、已验证、已封禁、已隔离、消息记录、验证通过数，以及控制模式、公开地址和验证入口格式。 |
+| 收件箱 | `/inbox` | 显示用户入站消息、管理员出站回复、消息方向、来源（用户私聊 / 话题回复 / 管理员私聊 / Web 后台）、状态和错误；支持回复与重试。 |
+| 用户管理 | `/users` | 查看用户资料、备注标签、封禁与静默隔离状态、验证状态、HTTP IP、UDP WebRTC、V2 指纹、ASN、设备系统和话题绑定；操作区为固定 3×3 按钮网格，含封禁 / 解封、静默隔离 / 解除隔离、取消验证、指纹标签、标记指纹、创建话题、重建话题、解绑话题和删除用户。 |
+| 名单管理 | `/moderation` | 集中查看封禁名单与静默隔离名单，显示每条记录的原因、时间和当前状态，可直接解除或追加处理；页面顶部说明两种处理方式的区别与原因来源。 |
+| 广告拦截 | `/rules` | 一行一个关键词；可开关命中后自动封禁。自动封禁会把命中的关键词写入封禁原因。 |
+| CF 验证记录 | `/verifications` | 展示每次 Turnstile 通过后的 IP、UDP/WebRTC、ASN、运营商、地区、设备系统、User-Agent 和时间。 |
+| 设置 | `/settings` | 保存管理员 Chat ID、欢迎语、控制模式、话题群与话题策略；查看公开地址、验证入口和 Secrets 配置状态（区分必填与可选）。 |
+| 日志 | `/logs` | 查看最近事件并附中文说明与处理建议，例如转发失败、通知失败、Turnstile 校验失败。 |
 | 退出 | `/logout` | 清除后台 Cookie。 |
+
+<a id="moderation"></a>
+
+## 名单管理
+
+`/moderation` 集中管理两类处理名单，并把处理原因和时间一起记录下来。
+
+| 处理方式 | 用户侧感受 | 消息记录 | 适用场景 |
+|---|---|---|---|
+| 封禁 | 收到「已被加入黑名单」提示 | 历史记录保留，新消息不再转发 | 广告号、骚扰账号 |
+| 静默隔离 | 完全无感知，以为消息已发出 | 消息在入口丢弃，不写入记录 | 脚本刷屏号，避免对方换号重来 |
+
+两者可以叠加。隔离在最外层生效，此时封禁提示也不会发出。
+
+原因由执行入口自动写入，无需手工填写：
+
+| 入口 | 写入的原因 |
+|---|---|
+| 名单管理页按钮 | `名单管理页手动封禁` / `名单管理页手动隔离` |
+| 用户管理页按钮 | `Web 用户管理页手动封禁` / `Web 用户管理页手动隔离` |
+| Telegram 话题 `/admin` 按钮 | `Telegram 话题按钮拉黑（管理员 <ID>）` / `Telegram 话题按钮隔离（管理员 <ID>）` |
+| 验证通知的「拉黑」按钮 | `Telegram 验证通知按钮拉黑（管理员 <ID>）` |
+| `/block <用户ID> [原因]` | 命令里的原因文本，未填写时为 `Telegram /block 命令（管理员 <ID>）` |
+| 广告关键词自动拉黑 | `广告关键词自动拉黑：<命中的关键词>` |
+
+解除封禁或解除隔离时，对应的原因与时间会一并清空，不会留下过期信息。
+升级前已经处于封禁或隔离状态的用户没有原因记录，页面会显示「未记录原因」。
 
 <a id="telegram-features"></a>
 
@@ -490,13 +522,23 @@ Telegram 群要求：
 | `/inbox/{id}/retry` | POST | 重试转发失败的入站消息。 |
 | `/users` | GET | 用户列表。 |
 | `/users/{user_id}/note` | POST | 保存备注。 |
-| `/users/{user_id}/block` | POST | 封禁用户。 |
-| `/users/{user_id}/unblock` | POST | 解封用户。 |
+| `/users/{user_id}/block` | POST | 封禁用户，并记录封禁原因与时间。 |
+| `/users/{user_id}/unblock` | POST | 解封用户，同时清空封禁原因与时间。 |
+| `/users/{user_id}/mute` | POST | 开启静默隔离，并记录隔离原因与时间。 |
+| `/users/{user_id}/unmute` | POST | 解除静默隔离，同时清空隔离原因与时间。 |
 | `/users/{user_id}/unverify` | POST | 取消用户验证状态。 |
+| `/users/{user_id}/fingerprints` | GET | 查看该用户的 V2 指纹与标签。 |
+| `/users/{user_id}/fingerprints/mark` | POST | 用当前备注把当前指纹标记为参考锚点。 |
+| `/fingerprint-labels/{id}/delete` | POST | 删除指纹标签及其全部参考档案。 |
 | `/users/{user_id}/topic/create` | POST | 为用户创建 Telegram 专属话题。 |
 | `/users/{user_id}/topic/rebuild` | POST | 强制重建用户专属话题。 |
 | `/users/{user_id}/topic/unbind` | POST | 解除用户和话题的绑定，不删除用户记录或 Telegram 话题。 |
 | `/users/{user_id}/delete` | POST | 删除用户及其消息、验证、验证会话、限频和回复映射数据；不删除 Telegram 话题。 |
+| `/moderation` | GET | 名单管理：封禁名单、静默隔离名单、原因说明与两种处理方式的区别。 |
+| `/moderation/{user_id}/block` | POST | 从名单页封禁用户。 |
+| `/moderation/{user_id}/unblock` | POST | 从名单页解除封禁。 |
+| `/moderation/{user_id}/mute` | POST | 从名单页开启静默隔离。 |
+| `/moderation/{user_id}/unmute` | POST | 从名单页解除静默隔离。 |
 | `/rules` | GET/POST | 查看和保存广告关键词。 |
 | `/verifications` | GET | CF 验证记录。 |
 | `/settings` | GET/POST | 后台设置。 |
@@ -508,7 +550,7 @@ Telegram 群要求：
 
 | 表 | 作用 |
 |---|---|
-| `users` | Telegram 用户资料、备注、封禁状态、验证状态、最近 HTTP/UDP/IP/ASN/设备信息和话题绑定信息。 |
+| `users` | Telegram 用户资料、备注、封禁状态与原因、静默隔离状态与原因、验证状态、最近 HTTP/UDP/IP/ASN/设备信息和话题绑定信息。 |
 | `verification_sessions` | 一次性验证 token、过期时间、验证状态和本次采集到的网络信息。 |
 | `ip_verifications` | 每次 Turnstile 通过后的验证记录。 |
 | `webrtc_identity_labels` | 管理员手动标记的 WebRTC 哈希、标签、来源用户和创建人。 |
@@ -519,6 +561,12 @@ Telegram 群要求：
 | `settings` | 管理员 Chat ID、欢迎语等后台设置。 |
 | `event_logs` | 运行事件。 |
 | `rate_events` | 用户发送频率记录。 |
+| `telegram_updates` | 已处理的 Telegram update_id，用于 Webhook 重发去重。 |
+| `fingerprint_profiles_v2` | 每用户最多 3 个滚动 V2 指纹档案。 |
+| `fingerprint_labels_v2` | 管理员建立的指纹标签及其状态（观察 / 指纹黑名单）。 |
+| `fingerprint_reference_profiles_v2` | 每个标签最多 12 个已确认的参考指纹锚点。 |
+| `fingerprint_reference_lookup_v2` | 指纹倒排索引（精确哈希、WebRTC、HTTP、SimHash 分桶、字体 MinHash 分桶）。 |
+| `fingerprint_user_labels_v2` | 每个用户当前由管理员确认的指纹标签及匹配依据。 |
 
 <a id="project-tree"></a>
 
@@ -537,6 +585,7 @@ tg-dualbot-cloudflare/
 │  ├─ npm run db:upgrade:topics：旧库补 Telegram 话题字段。
 │  ├─ npm run db:upgrade:webrtc-identity：旧库新增 WebRTC 标签与人工确认表。
 │  ├─ npm run db:upgrade:fingerprint-v2：旧库新增 V2 指纹五张表。
+│  ├─ npm run db:upgrade:moderation：旧库补封禁与静默隔离的原因、时间字段。
 │  ├─ npm run test:fingerprint：运行 V2 算法和 D1 有界性测试。
 │  ├─ npm run test:verification-client：渲染并检查验证页内嵌采集脚本。
 │  └─ npm run pages:deploy：Pages Direct Upload。
@@ -573,11 +622,17 @@ tg-dualbot-cloudflare/
 │  │  └─ 旧数据库升级到 Telegram 话题双通道版本。
 │  ├─ 0005_webrtc_identity.sql
 │  │  └─ 旧数据库新增 WebRTC 标签与人工确认表。
-│  └─ 0007_fingerprint_v2.sql
-│     └─ 旧数据库新增 V2 指纹五张表和索引。
+│  ├─ 0007_fingerprint_v2.sql
+│  │  └─ 旧数据库新增 V2 指纹五张表和索引。
+│  ├─ 0008_inbound_isolation.sql
+│  │  └─ 旧数据库新增静默隔离字段与 Telegram Webhook 幂等表。
+│  └─ 0009_moderation_reason.sql
+│     └─ 旧数据库新增封禁与静默隔离的原因、时间字段和封禁索引。
 ├─ tests/
 │  ├─ fingerprint_v2_algorithm.test.mjs
 │  ├─ fingerprint_v2_schema.test.mjs
+│  ├─ log_translation.test.mjs
+│  ├─ topic_isolation.test.mjs
 │  └─ verification_client_script.test.mjs
 └─ README.md
    └─ 功能、部署、配置、验证和排错说明。

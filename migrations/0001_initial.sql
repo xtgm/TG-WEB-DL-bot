@@ -7,6 +7,11 @@ CREATE TABLE IF NOT EXISTS users (
     language_code TEXT DEFAULT '',
     note TEXT DEFAULT '',
     blocked INTEGER DEFAULT 0,
+    block_reason TEXT DEFAULT '',
+    blocked_at TEXT DEFAULT '',
+    inbound_muted INTEGER DEFAULT 0,
+    mute_reason TEXT DEFAULT '',
+    muted_at TEXT DEFAULT '',
     verified INTEGER DEFAULT 0,
     verification_status TEXT DEFAULT 'pending',
     verification_token TEXT DEFAULT '',
@@ -89,6 +94,11 @@ CREATE TABLE IF NOT EXISTS event_logs (
 CREATE TABLE IF NOT EXISTS rate_events (
     user_id INTEGER NOT NULL,
     ts INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS telegram_updates (
+    update_id INTEGER PRIMARY KEY,
+    received_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS ip_verifications (
@@ -265,6 +275,8 @@ CREATE INDEX IF NOT EXISTS idx_rate_events_user_ts ON rate_events(user_id, ts);
 CREATE INDEX IF NOT EXISTS idx_inbox_user_created ON inbox_messages(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_inbox_created ON inbox_messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_users_topic ON users(topic_chat_id, topic_thread_id);
+CREATE INDEX IF NOT EXISTS idx_users_blocked ON users(blocked, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_users_inbound_muted ON users(inbound_muted, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_webrtc_identity_labels_source ON webrtc_identity_labels(source_user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_webrtc_identity_confirmations_label ON webrtc_identity_confirmations(label_id);
 CREATE INDEX IF NOT EXISTS idx_inbox_topic_created ON inbox_messages(topic_chat_id, topic_thread_id, created_at);
