@@ -2,6 +2,27 @@ export const FINGERPRINT_ALGORITHM_VERSION = 2;
 export const FINGERPRINT_CANDIDATE_THRESHOLD = 60;
 export const FINGERPRINT_MIN_EXACT_QUALITY = 63;
 
+// 四向量权重：A WebRTC 30% + B 公网 IP 20% + C 渲染指纹 25% + D 稳定不变量 25%。
+// 拆分 C/D 的原因：换浏览器时 Canvas/WebGL/Audio 全变（C 归零），
+// 但 OS/CPU/屏幕/字体/时区/语言这些稳定不变量仍然保留（D 维持高分），
+// 因此 D 是「同设备换浏览器」的唯一识别依据。
+export const FINGERPRINT_VECTOR_WEIGHTS = { rtc: 30, http: 20, render: 25, stable: 25 };
+
+// 各判定档位。tier 决定消息措辞与提供的按钮，不只是一个数字。
+export const FINGERPRINT_TIERS = {
+    exact: { label: "完整指纹一致", floor: 100, confirm: true },
+    rtcRender: { label: "WebRTC 与渲染指纹双重一致", floor: 98, confirm: true },
+    rtcOnly: { label: "WebRTC IP 一致", floor: 92, confirm: true },
+    rtcWeakDevice: { label: "WebRTC IP 一致但设备层偏低", floor: 92, confirm: true },
+    httpFull: { label: "公网 IP、ASN、ISP 全部一致", floor: 90, confirm: true },
+    render: { label: "渲染指纹三项一致", floor: 90, confirm: true },
+    stableNet: { label: "稳定不变量一致且网络层支撑", floor: 82, confirm: true },
+    stableOnly: { label: "稳定不变量一致但网络层无交集", floor: 62, cap: 74, confirm: false },
+    weighted: { label: "加权相似度达阈值", confirm: false },
+    networkOnly: { label: "仅网络相近，不构成同一人", cap: 55, confirm: false },
+    none: { label: "相似度不足", confirm: false },
+};
+
 export const FINGERPRINT_FONT_CATALOG = [
     "Arial", "Arial Black", "Calibri", "Cambria", "Candara", "Comic Sans MS", "Consolas", "Courier New",
     "Georgia", "Helvetica", "Impact", "Lucida Console", "Microsoft Sans Serif", "Microsoft YaHei", "Palatino Linotype", "Segoe UI",
@@ -198,36 +219,74 @@ function buildVector(device) {
     return { values, mask };
 }
 
-function hammingScore(left, right, leftMask, rightMask) {
-    if (!/^[0-9a-f]{16}$/i.test(left || "") || !/^[0-9a-f]{16}$/i.test(right || "") || pop32(leftMask & rightMask) < 4) return null;
-    const distance = popBig(BigInt(`0x${left}`) ^ BigInt(`0x${right}`));
-    if (distance <= 4) return 100;
-    if (distance > 20) return 0;
-    return Math.max(0, Math.min(99, Math.round(125 - distance * 6.25)));
-}
-
 function jaccard(left, right) {
     if (!/^[0-9a-f]{16}$/i.test(left || "") || !/^[0-9a-f]{16}$/i.test(right || "")) return null;
     const a = BigInt(`0x${left}`), b = BigInt(`0x${right}`), union = popBig(a | b);
     return union < 4 ? null : Math.round(popBig(a & b) / union * 100);
 }
 
-function gower(left, right, leftMask, rightMask) {
-    if (!Array.isArray(left) || !Array.isArray(right)) return null;
-    const ranges = [8, 9, 7360, 4080, 4, 9.75, 127, 64, 9, 9];
-    const weights = [13, 12, 13, 12, 5, 8, 7, 5, 15, 10];
-    const mask = leftMask & rightMask;
-    let used = 0, total = 0, distance = 0;
-    for (let index = 0; index < ranges.length; index += 1) {
-        if (!(mask & (1 << index)) || !Number.isFinite(left[index]) || !Number.isFinite(right[index])) continue;
-        used += 1; total += weights[index]; distance += weights[index] * Math.min(1, Math.abs(left[index] - right[index]) / ranges[index]);
-    }
-    return used < 6 || total < 60 ? null : Math.round(100 * (1 - distance / total));
-}
-
 function overlaps(left, right) {
     const set = new Set(Array.isArray(right) ? right.filter(Boolean) : []);
     return (Array.isArray(left) ? left : []).some((value) => value && set.has(value));
+}
+
+// ===== 向量距离度量 =====
+// 全部返回 [0,1] 的相似度，或 null 表示双方数据不足、该维度不参与计分。
+// 用连续距离而不是布尔相等，是为了让「换浏览器后屏幕/CPU 只轻微偏移」这类情况
+// 拿到 0.86 而不是 0，否则跨浏览器识别会因为哈希类信号归零而整体失效。
+
+// 精确相等：适用于哈希与派生 key，只能相等或不等。
+function simExact(left, right) {
+    if (!left || !right) return null;
+    return String(left) === String(right) ? 1 : 0;
+}
+
+// 两个集合的重叠：适用于 webrtcKeys 这类多值数组。
+function simOverlap(left, right) {
+    const a = (Array.isArray(left) ? left : []).filter(Boolean);
+    const b = (Array.isArray(right) ? right : []).filter(Boolean);
+    if (!a.length || !b.length) return null;
+    return overlaps(a, b) ? 1 : 0;
+}
+
+// 归一化欧氏距离：适用于 CPU、屏幕这类数值向量。indexes 指定参与的维度。
+function simNumericVector(left, right, leftMask, rightMask, indexes, ranges) {
+    if (!Array.isArray(left) || !Array.isArray(right)) return null;
+    const mask = Number(leftMask || 0) & Number(rightMask || 0);
+    let used = 0;
+    let sum = 0;
+    for (let position = 0; position < indexes.length; position += 1) {
+        const index = indexes[position];
+        if (!(mask & (1 << index))) continue;
+        const a = left[index];
+        const b = right[index];
+        if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+        const normalized = Math.min(1, Math.abs(a - b) / ranges[position]);
+        sum += normalized * normalized;
+        used += 1;
+    }
+    if (used < 2) return null;
+    return Math.max(0, Math.min(1, 1 - Math.sqrt(sum / used)));
+}
+
+// 字体位图的 Jaccard 交并比，返回 [0,1]。
+function simFontBits(left, right) {
+    const value = jaccard(left, right);
+    return value === null ? null : value / 100;
+}
+
+// 按可用维度归一的加权平均。缺失维度既不白送分也不硬扣分，
+// 只从分母里剔除，并通过 coverage 反映采集完整度。
+function vectorScore(parts) {
+    const available = parts.filter((part) => part.value !== null && part.value !== undefined);
+    const fullWeight = parts.reduce((sum, part) => sum + part.weight, 0);
+    if (!available.length || !fullWeight) return { score: null, coverage: 0, parts };
+    const usedWeight = available.reduce((sum, part) => sum + part.weight, 0);
+    return {
+        score: Math.round(available.reduce((sum, part) => sum + part.weight * part.value, 0) / usedWeight * 100),
+        coverage: Math.round(usedWeight / fullWeight * 100),
+        parts,
+    };
 }
 
 export async function buildFingerprintProfile({ clientData = {}, network = {}, metadata = {}, secret = "" } = {}) {
@@ -277,59 +336,140 @@ export async function buildFingerprintProfile({ clientData = {}, network = {}, m
             performanceClass: device.performanceClass,
             telegramPlatform: device.client.telegramPlatform,
             telegramVersion: device.client.telegramVersion,
+            // 时区与语言是跨浏览器仍然保留的稳定不变量，向量 D 需要它们独立参与比较。
+            timezone: device.client.timezone,
+            language: device.client.language,
+            engine: device.client.engine,
         },
     };
 }
 
-export function scoreFingerprintProfiles(current, reference) {
-    if (!current || !reference) return { score: 0, weightedScore: 0, networkScore: 0, deviceScore: 0, exact: false, qualifies: false, evidence: [], evidenceMask: 0 };
-    const exactQuality = Math.min(Number(current.qualityScore || 0), Number(reference.qualityScore || 0));
-    if (current.algorithmVersion === reference.algorithmVersion && current.exactHash && current.exactHash === reference.exactHash && current.httpKey && reference.httpKey && exactQuality >= FINGERPRINT_MIN_EXACT_QUALITY) {
-        return { score: 100, weightedScore: 100, networkScore: 100, deviceScore: 100, deviceCoverage: 100, exact: true, qualifies: true, webrtcIpExact: overlaps(current.webrtcKeys, reference.webrtcKeys), evidence: ["完整指纹完全一致"], evidenceMask: 1 };
-    }
-    let rtc = 0, http = 0, device = 0, available = 0, evidenceMask = 0;
-    const evidence = [];
-    const add = (condition, points, text, bit, layer) => {
-        if (!condition) return;
-        if (layer === "rtc") rtc += points; else if (layer === "http") http += points; else device += points;
-        evidence.push(text); evidenceMask |= bit;
+// 四向量比较。相比旧版最大的区别：不再用 Math.max 取单侧最高分，
+// 而是加权求和后按判定档位设下限与上限，避免「同一个 WiFi 出口的两个陌生人」
+// 因为网络层满分而被直接判成同一人。
+export function scoreFingerprintProfiles(current, reference, options = {}) {
+    const empty = {
+        score: 0, weightedScore: 0, networkScore: 0, deviceScore: 0, deviceCoverage: 0,
+        exact: false, qualifies: false, evidence: [], evidenceMask: 0,
+        tier: "none", tierLabel: FINGERPRINT_TIERS.none.label, vectors: null, webrtcIpExact: false,
     };
+    if (!current || !reference) return empty;
+
+    const summaryA = current.summary || {};
+    const summaryB = reference.summary || {};
+
+    // 向量 A：WebRTC 向量（IP 15 / ASN 5 / ISP 15）
+    const vectorRtc = vectorScore([
+        { name: "WebRTC IP", weight: 15, value: simOverlap(current.webrtcKeys, reference.webrtcKeys) },
+        { name: "WebRTC ASN", weight: 5, value: simOverlap(current.webrtcAsnKeys, reference.webrtcAsnKeys) },
+        { name: "WebRTC ISP", weight: 15, value: simOverlap(current.webrtcIspKeys, reference.webrtcIspKeys) },
+    ]);
+    // 向量 B：公网 IP 向量（IP 12 / ASN 6 / ISP 7）
+    const vectorHttp = vectorScore([
+        { name: "公网 IP", weight: 12, value: simExact(current.httpKey, reference.httpKey) },
+        { name: "IP ASN", weight: 6, value: simExact(current.httpAsnKey, reference.httpAsnKey) },
+        { name: "IP ISP", weight: 7, value: simExact(current.httpIspKey, reference.httpIspKey) },
+    ]);
+    // 向量 C：渲染指纹（换浏览器会整体失效）
+    const vectorRender = vectorScore([
+        { name: "Canvas", weight: 10, value: simExact(current.canvasKey, reference.canvasKey) },
+        { name: "WebGL", weight: 8, value: simExact(current.webglKey, reference.webglKey) },
+        { name: "Audio", weight: 7, value: simExact(current.audioKey, reference.audioKey) },
+    ]);
+    // 向量 D：稳定不变量（换浏览器仍然保留，是跨浏览器识别的唯一依据）
+    // deviceVector 索引：0 核数 1 内存 2 屏长边 3 屏短边 4 宽高比 5 dpr 6 色深 7 触点 8/9 GPU 上限
+    const vectorStable = vectorScore([
+        { name: "系统", weight: 4, value: simExact(summaryA.os, summaryB.os) },
+        { name: "CPU", weight: 5, value: simNumericVector(current.deviceVector, reference.deviceVector, current.deviceVectorMask, reference.deviceVectorMask, [0, 1, 7], [8, 9, 64]) },
+        { name: "屏幕", weight: 5, value: simNumericVector(current.deviceVector, reference.deviceVector, current.deviceVectorMask, reference.deviceVectorMask, [2, 3, 4, 6], [7360, 4080, 4, 127]) },
+        { name: "字体", weight: 6, value: simFontBits(current.fontBits, reference.fontBits) },
+        { name: "时区", weight: 4, value: simExact(summaryA.timezone, summaryB.timezone) },
+        { name: "语言", weight: 3, value: simExact(summaryA.language, summaryB.language) },
+        { name: "性能等级", weight: 2, value: simExact(summaryA.performanceClass, summaryB.performanceClass) },
+        { name: "机型", weight: 2, value: simExact(summaryA.model, summaryB.model) },
+    ]);
+
+    const vectors = { rtc: vectorRtc, http: vectorHttp, render: vectorRender, stable: vectorStable };
+    const weighted = [
+        [vectorRtc, FINGERPRINT_VECTOR_WEIGHTS.rtc],
+        [vectorHttp, FINGERPRINT_VECTOR_WEIGHTS.http],
+        [vectorRender, FINGERPRINT_VECTOR_WEIGHTS.render],
+        [vectorStable, FINGERPRINT_VECTOR_WEIGHTS.stable],
+    ].filter(([vector]) => vector.score !== null);
+    const totalWeight = weighted.reduce((sum, [, weight]) => sum + weight, 0);
+    const rawScore = totalWeight
+        ? Math.round(weighted.reduce((sum, [vector, weight]) => sum + vector.score * weight, 0) / totalWeight)
+        : 0;
+
+    const exactQuality = Math.min(Number(current.qualityScore || 0), Number(reference.qualityScore || 0));
+    const exactSame = current.algorithmVersion === reference.algorithmVersion
+        && current.exactHash && current.exactHash === reference.exactHash
+        && current.httpKey && reference.httpKey && exactQuality >= FINGERPRINT_MIN_EXACT_QUALITY;
     const webrtcIpExact = overlaps(current.webrtcKeys, reference.webrtcKeys);
-    add(webrtcIpExact, 15, "WebRTC IP一致", 2, "rtc");
-    add(overlaps(current.webrtcAsnKeys, reference.webrtcAsnKeys), 5, "WebRTC ASN一致", 4, "rtc");
-    add(overlaps(current.webrtcIspKeys, reference.webrtcIspKeys), 15, "WebRTC ISP一致", 8, "rtc");
-    add(current.httpKey && current.httpKey === reference.httpKey, 10, "HTTP IP一致", 16, "http");
-    add(current.httpAsnKey && current.httpAsnKey === reference.httpAsnKey, 5, "HTTP ASN一致", 32, "http");
-    add(current.httpIspKey && current.httpIspKey === reference.httpIspKey, 10, "HTTP ISP一致", 64, "http");
+    const renderAllSame = vectorRender.score === 100 && vectorRender.coverage === 100;
+    const httpAllSame = vectorHttp.score === 100 && vectorHttp.coverage === 100;
+    const stableHigh = vectorStable.score !== null && vectorStable.score >= 85 && vectorStable.coverage >= 70;
+    const networkSupport = (vectorRtc.score !== null && vectorRtc.score >= 50)
+        || (vectorHttp.score !== null && vectorHttp.score >= 50);
+    const deviceWeak = (vectorRender.score === null || vectorRender.score < 35)
+        && (vectorStable.score === null || vectorStable.score < 45);
 
-    const exactParts = [
-        [4, current.canvasKey && reference.canvasKey, current.canvasKey === reference.canvasKey, "Canvas一致", 128],
-        [5, current.webglKey && reference.webglKey, current.webglKey === reference.webglKey, "WebGL一致", 256],
-        [3, current.audioKey && reference.audioKey, current.audioKey === reference.audioKey, "Audio一致", 512],
-    ];
-    for (const [weight, present, matched, text, bit] of exactParts) {
-        if (!present) continue;
-        available += weight;
-        if (matched) add(true, weight, text, bit, "device");
-    }
-    const simhashScore = hammingScore(current.deviceSimhash, reference.deviceSimhash, current.deviceFeatureMask, reference.deviceFeatureMask);
-    if (simhashScore !== null) { available += 12; device += simhashScore * 0.12; if (simhashScore >= 60) { evidence.push(`设备SimHash ${simhashScore}%`); evidenceMask |= 1024; } }
-    const fontsScore = jaccard(current.fontBits, reference.fontBits);
-    if (fontsScore !== null) { available += 6; device += fontsScore * 0.06; if (fontsScore >= 60) { evidence.push(`字体Jaccard ${fontsScore}%`); evidenceMask |= 2048; } }
-    const vectorScore = gower(current.deviceVector, reference.deviceVector, current.deviceVectorMask, reference.deviceVectorMask);
-    if (vectorScore !== null) { available += 10; device += vectorScore * 0.10; if (vectorScore >= 60) { evidence.push(`设备向量 ${vectorScore}%`); evidenceMask |= 4096; } }
+    // 档位判定按证据强度从高到低，命中即停。
+    let tier = "none";
+    if (exactSame) tier = "exact";
+    else if (webrtcIpExact && renderAllSame) tier = "rtcRender";
+    else if (webrtcIpExact && deviceWeak) tier = "rtcWeakDevice";
+    else if (webrtcIpExact) tier = "rtcOnly";
+    else if (renderAllSame) tier = "render";
+    else if (httpAllSame) tier = "httpFull";
+    else if (stableHigh && networkSupport) tier = "stableNet";
+    else if (stableHigh) tier = "stableOnly";
+    else if (deviceWeak) tier = "networkOnly";
+    else if (rawScore >= FINGERPRINT_CANDIDATE_THRESHOLD) tier = "weighted";
 
-    const weightedScore = Math.min(99, Math.round(rtc + http + device));
-    const networkScore = Math.min(99, Math.round((rtc + http) / 60 * 100));
-    const deviceCoverage = Math.round(available / 40 * 100);
-    const deviceScore = available >= 24 ? Math.min(99, Math.round(device / available * 100)) : 0;
-    const score = Math.min(99, Math.max(weightedScore, networkScore, deviceScore, webrtcIpExact ? 60 : 0));
+    const spec = FINGERPRINT_TIERS[tier] || FINGERPRINT_TIERS.none;
+    let score = rawScore;
+    if (spec.floor !== undefined) score = Math.max(score, spec.floor);
+    if (spec.cap !== undefined) score = Math.min(score, spec.cap);
+    score = Math.max(0, Math.min(tier === "exact" ? 100 : 99, score));
+
+    // 逐项证据：只列出真正命中的维度，供管理员核对判定依据。
+    const evidence = [];
+    let evidenceMask = 0;
+    if (exactSame) { evidence.push("完整指纹完全一致"); evidenceMask |= 1; }
+    const pushEvidence = (part, bit) => {
+        if (part.value === null || part.value === undefined) return;
+        if (part.value >= 0.999) { evidence.push(`${part.name}一致`); evidenceMask |= bit; return; }
+        if (part.value >= 0.6) evidence.push(`${part.name} ${Math.round(part.value * 100)}%`);
+    };
+    vectorRtc.parts.forEach((part, index) => pushEvidence(part, 2 << index));
+    vectorHttp.parts.forEach((part, index) => pushEvidence(part, 16 << index));
+    vectorRender.parts.forEach((part, index) => pushEvidence(part, 128 << index));
+    vectorStable.parts.forEach((part, index) => pushEvidence(part, 1024 << index));
+
+    // 兼容旧字段名，话题消息与后台页面仍在使用。
+    const networkScore = vectorRtc.score !== null || vectorHttp.score !== null
+        ? Math.round(((vectorRtc.score ?? 0) * FINGERPRINT_VECTOR_WEIGHTS.rtc + (vectorHttp.score ?? 0) * FINGERPRINT_VECTOR_WEIGHTS.http)
+            / ((vectorRtc.score !== null ? FINGERPRINT_VECTOR_WEIGHTS.rtc : 0) + (vectorHttp.score !== null ? FINGERPRINT_VECTOR_WEIGHTS.http : 0)))
+        : 0;
+    const deviceScore = vectorRender.score !== null || vectorStable.score !== null
+        ? Math.round(((vectorRender.score ?? 0) * FINGERPRINT_VECTOR_WEIGHTS.render + (vectorStable.score ?? 0) * FINGERPRINT_VECTOR_WEIGHTS.stable)
+            / ((vectorRender.score !== null ? FINGERPRINT_VECTOR_WEIGHTS.render : 0) + (vectorStable.score !== null ? FINGERPRINT_VECTOR_WEIGHTS.stable : 0)))
+        : 0;
+    const deviceCoverage = Math.round(((vectorRender.coverage * FINGERPRINT_VECTOR_WEIGHTS.render)
+        + (vectorStable.coverage * FINGERPRINT_VECTOR_WEIGHTS.stable))
+        / (FINGERPRINT_VECTOR_WEIGHTS.render + FINGERPRINT_VECTOR_WEIGHTS.stable));
+
+    // stableOnly 档（跨浏览器且换网络）默认不作为候选，由 allowWeakSuspect 开关控制。
+    const weakSuspect = tier === "stableOnly";
+    const qualifies = spec.confirm
+        || (score >= FINGERPRINT_CANDIDATE_THRESHOLD && (!weakSuspect || options.allowWeakSuspect === true));
+
     return {
-        score, weightedScore, networkScore, deviceScore, deviceCoverage,
-        webRtcPoints: Math.round(rtc), httpPoints: Math.round(http), devicePoints: Math.round(device),
-        simhashScore, fontsScore, vectorScore, webrtcIpExact, exact: false,
-        qualifies: webrtcIpExact || score >= FINGERPRINT_CANDIDATE_THRESHOLD,
-        evidence: evidence.slice(0, 8), evidenceMask,
+        score, weightedScore: rawScore, rawScore, networkScore, deviceScore, deviceCoverage,
+        tier, tierLabel: spec.label, confirmTier: Boolean(spec.confirm), weakSuspect,
+        vectors, exact: exactSame, webrtcIpExact, renderAllSame, httpAllSame, stableHigh, deviceWeak,
+        qualifies, evidence: evidence.slice(0, 10), evidenceMask,
     };
 }
 

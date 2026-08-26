@@ -21,6 +21,7 @@ const MAX_FINGERPRINT_PROFILES_PER_USER = 3;
 const MAX_FINGERPRINT_LABELS_PER_USER = 5;
 const MAX_FINGERPRINT_REFERENCES_PER_LABEL = 12;
 const MAX_FINGERPRINT_CANDIDATES = 24;
+const FP_AUTO_BLOCK_DEFAULT_SCORE = 95;
 const USER_WITH_IDENTITY_SELECT = "SELECT u.*, c.label_id AS confirmed_identity_label_id, c.confirmed_at AS identity_confirmed_at, l.label_name AS identity_label_name, l.source_user_id AS identity_label_source_user_id, " +
     "ful.label_id AS fingerprint_confirmed_label_id, ful.weighted_score AS fingerprint_confirmed_score, ful.confirmed_at AS fingerprint_confirmed_at, " +
     "fl.label_name AS fingerprint_label_name, fl.state AS fingerprint_label_state, " +
@@ -673,6 +674,8 @@ async function fingerprintReferenceRows(env, referenceIds) {
 
 async function findFingerprintMatches(env, currentProfile) {
     if (!currentProfile?.exactHash) return [];
+    // 规则6（跨浏览器且换网络的弱证据档）默认关闭，需要在设置页开启后才纳入候选。
+    const allowWeakSuspect = await weakSuspectEnabled(env);
     const exactRows = await env.DB.prepare(
         "SELECT reference_id FROM fingerprint_reference_lookup_v2 WHERE kind=0 AND band=0 AND lookup_key=? " +
         "ORDER BY reference_id DESC LIMIT " + MAX_FINGERPRINT_CANDIDATES,
@@ -710,7 +713,7 @@ async function findFingerprintMatches(env, currentProfile) {
     const rows = await fingerprintReferenceRows(env, referenceIds);
     const bestByLabel = new Map();
     for (const row of rows) {
-        const match = scoreFingerprintProfiles(currentProfile, profileFromDatabaseRow(row));
+        const match = scoreFingerprintProfiles(currentProfile, profileFromDatabaseRow(row), { allowWeakSuspect });
         if (!match.qualifies) continue;
         const candidate = { ...match, referenceId: Number(row.id), labelId: Number(row.label_id), labelName: row.label_name, note: row.note, state: row.state, sourceUserId: Number(row.label_source_user_id || row.source_user_id) };
         const previous = bestByLabel.get(candidate.labelId);
@@ -771,7 +774,8 @@ async function confirmFingerprintMatch(env, userId, labelId, adminId, expectedPr
     ).bind(Number(labelId)).all();
     let best = null;
     for (const row of (refs.results || [])) {
-        const match = scoreFingerprintProfiles(latest.profile, profileFromDatabaseRow(row));
+        // 人工点「确认同一人」时放宽弱证据档，因为这已经是管理员的主动判断。
+        const match = scoreFingerprintProfiles(latest.profile, profileFromDatabaseRow(row), { allowWeakSuspect: true });
         if (!best || match.score > best.match.score) best = { row, match };
     }
     if (!best?.match?.qualifies) return { error: "当前指纹与该标签未达到候选门槛，不能确认。" };
@@ -840,18 +844,89 @@ async function sendFingerprintLabels(env, query, userId) {
     await sendCallbackContextMessage(env, query, lines.join("\n"), replyMarkup);
 }
 
+// 单个维度的命中标记：完全一致用 ✓，完全不同用 ✗，中间值给百分比，无数据给 －。
+function vectorPartMark(part) {
+    if (!part || part.value === null || part.value === undefined) return "－";
+    if (part.value >= 0.999) return "✓";
+    if (part.value <= 0.001) return "✗";
+    return `${Math.round(part.value * 100)}%`;
+}
+
+function vectorLine(vector) {
+    if (!vector || !Array.isArray(vector.parts)) return "无数据";
+    return vector.parts.map((part) => `${part.name} ${vectorPartMark(part)}`).join("  ");
+}
+
+function vectorHeadline(vector) {
+    if (!vector || vector.score === null) return "无数据";
+    return vector.coverage >= 100 ? `${vector.score}%` : `${vector.score}%（采集 ${vector.coverage}%）`;
+}
+
+// 四向量证据卡片。管理员据此判断「凭什么判成同一人」，而不是只看一个总分。
+function fingerprintVectorCard(match) {
+    const v = match?.vectors;
+    if (!v) return "";
+    return [
+        `设备指纹总分：${match.score}%`,
+        "",
+        `├─ 向量 A · WebRTC (30%)　${vectorHeadline(v.rtc)}`,
+        `│   ${vectorLine(v.rtc)}`,
+        `├─ 向量 B · 公网 IP (20%)　${vectorHeadline(v.http)}`,
+        `│   ${vectorLine(v.http)}`,
+        `├─ 向量 C · 渲染指纹 (25%)　${vectorHeadline(v.render)}`,
+        `│   ${vectorLine(v.render)}`,
+        `└─ 向量 D · 稳定不变量 (25%)　${vectorHeadline(v.stable)}`,
+        `    ${vectorLine(v.stable)}`,
+    ].join("\n");
+}
+
+// 档位对应的结论措辞。rtcWeakDevice 与 stableOnly 会附加风险提示。
+function fingerprintTierNote(match) {
+    const stable = match?.vectors?.stable;
+    const render = match?.vectors?.render;
+    switch (match?.tier) {
+        case "exact":
+            return "完整指纹一致，同一设备同一网络环境。";
+        case "rtcRender":
+            return "WebRTC IP 与渲染指纹三项同时一致，证据最强。";
+        case "rtcOnly":
+            return "WebRTC IP 一致。跨设备、跨平台、跨浏览器均以此为准。";
+        case "rtcWeakDevice":
+            return `WebRTC IP 一致，但设备层仅 ${render?.score ?? 0}% / ${stable?.score ?? 0}%。也可能是同一出口网络下的另一台设备，建议人工核实后再拉黑。`;
+        case "httpFull":
+            return "公网 IP、ASN、ISP 全部一致（WebRTC 未采集到）。";
+        case "render":
+            return "渲染指纹三项一致，同一台设备同一浏览器，只是换了网络。";
+        case "stableNet":
+            return "渲染指纹已变但稳定不变量高度一致，且网络层提供支撑，判定为同设备换浏览器。";
+        case "stableOnly":
+            return "仅稳定不变量一致，网络层无交集。可能是同设备换浏览器又换网络，也可能是同型号的另一台设备，两者信号无法区分。";
+        case "networkOnly":
+            return "仅网络相近，设备层证据不足，不构成同一人。";
+        default:
+            return "加权相似度达到阈值，无单项强证据。";
+    }
+}
+
 function fingerprintMatchText(matches = []) {
     if (!matches.length) return "";
-    const lines = ["指纹候选（仅供人工确认）"];
-    for (const match of matches.slice(0, 5)) {
+    const lines = ["指纹候选"];
+    for (const match of matches.slice(0, 3)) {
         const state = match.state === "blacklist" ? "指纹黑名单" : "观察标签";
-        lines.push(
-            `- ${match.labelName}：${match.score}%（${state}）`,
-            `  总分/网络/设备：${match.weightedScore}% / ${match.networkScore}% / ${match.deviceScore}%`,
-            `  依据：${match.evidence?.join("、") || "稀疏特征相似"}`,
-        );
+        lines.push("", `标签：${match.labelName}　[${state}]`, fingerprintVectorCard(match), "", `判定：${match.tierLabel || "相似"}`, `说明：${fingerprintTierNote(match)}`);
     }
     return lines.join("\n");
+}
+
+// 按档位给不同按钮：确认档给「确认并拉黑」，弱证据档只给「确认同一人」并附「忽略」。
+// 已经自动拉黑过的不再重复提供拉黑按钮。
+function fingerprintMatchButtons(userId, match, slot, prefix, alreadyBlocked = false) {
+    const confirm = { text: `确认同一人（${match.score}%）`, callback_data: `fpconfirm:${userId}:${match.labelId}:${slot}:${prefix}` };
+    if (alreadyBlocked) return [confirm];
+    if (match.confirmTier) {
+        return [confirm, { text: "确认并拉黑", callback_data: `fpban:${userId}:${match.labelId}:${slot}:${prefix}` }];
+    }
+    return [confirm];
 }
 
 function clientDataForVerificationStorage(clientData = {}, network = {}) {
@@ -1477,6 +1552,9 @@ async function settingsPage(request, env) {
     const groupId = await topicGroupId(env);
     const createPolicy = await topicCreatePolicy(env);
     const syncWebReplies = await topicSyncWebReplies(env);
+    const weakSuspect = await weakSuspectEnabled(env);
+    const autoBlock = await autoBlockEnabled(env);
+    const autoBlockScore = await autoBlockMinScore(env);
     const base = publicBaseUrl(env, request);
     const option = (value, label, selected) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`;
     const body = `<div class="card"><h2>后台设置</h2><form method="post">
@@ -1485,6 +1563,17 @@ async function settingsPage(request, env) {
 <div class="grid"><div><label for="control-mode">控制模式</label><select id="control-mode" name="control_mode">${option("web", "仅 Web 后台", mode)}${option("topic", "仅 Telegram 话题", mode)}${option("both", "Web 后台 + Telegram 话题", mode)}</select></div><div><label for="topic-group-id">Telegram 话题群 ID</label><input id="topic-group-id" name="topic_group_id" value="${h(groupId || "")}" placeholder="-1001234567890"></div></div>
 <div class="grid"><div><label for="topic-create-policy">话题创建策略</label><select id="topic-create-policy" name="topic_create_policy">${option("after_verify", "验证通过后创建", createPolicy)}${option("first_message", "用户首条消息时创建", createPolicy)}</select></div><div><label class="check-row" for="topic-sync-web"><input id="topic-sync-web" type="checkbox" name="topic_sync_web_replies" ${syncWebReplies ? "checked" : ""}> Web/私聊回复同步到话题</label></div></div>
 <div class="grid"><div><label for="public-base-url">公开地址</label><input id="public-base-url" value="${h(base)}" readonly></div><div><label for="verify-entry">验证入口</label><input id="verify-entry" value="${h(`${base}/verify/{token}`)}" readonly></div></div>
+<div class="actions"><button class="primary" type="submit">保存设置</button></div>
+<h2 style="margin-top:22px">指纹识别开关</h2>
+<p class="muted">两个开关默认关闭。关闭状态下的行为与升级前完全一致：指纹只做人工候选提示，绝不自动封禁。</p>
+<div class="grid">
+<div><label class="check-row" for="fp-weak-suspect"><input id="fp-weak-suspect" type="checkbox" name="fp_weak_suspect_enabled" ${weakSuspect ? "checked" : ""}> 启用弱证据档（规则 6）</label>
+<small class="muted">开启后，「同设备换浏览器又换网络」这类只剩稳定不变量一致的情况也会列为候选（62~74 分）。代价是同型号的另一台设备也可能进入这一档，因为两者信号分布完全相同。</small></div>
+<div><label class="check-row" for="fp-auto-block"><input id="fp-auto-block" type="checkbox" name="fp_auto_block_enabled" ${autoBlock ? "checked" : ""}> 启用指纹自动拉黑</label>
+<small class="muted">仅当命中的标签状态为「指纹黑名单」且分数达到下方阈值时才自动封禁，命中「观察标签」永不自动处理。</small>
+<label for="fp-auto-block-score" style="margin-top:10px">自动拉黑最低分数（60~100）</label>
+<input id="fp-auto-block-score" name="fp_auto_block_min_score" type="number" min="60" max="100" step="1" value="${h(autoBlockScore)}"></div>
+</div>
 <div class="actions"><button class="primary" type="submit">保存设置</button></div></form></div>
 <div class="card"><h2>Cloudflare Secrets 状态</h2>
 <div class="table-wrap responsive-wrap" style="--table-min:620px" tabindex="0" aria-label="Cloudflare Secrets 配置状态，可横向滚动"><table class="secrets-table responsive-table"><caption class="sr-only">Cloudflare Secrets 配置状态</caption><thead><tr><th scope="col">名称</th><th scope="col">状态</th><th scope="col">说明</th></tr></thead><tbody>
@@ -1521,6 +1610,12 @@ async function settingsSave(request, env) {
     await setSetting(env, "topic_group_id", String(form.get("topic_group_id") || "").trim());
     await setSetting(env, "topic_create_policy", safePolicy);
     await setSetting(env, "topic_sync_web_replies", form.get("topic_sync_web_replies") ? "true" : "false");
+    await setSetting(env, "fp_weak_suspect_enabled", form.get("fp_weak_suspect_enabled") ? "true" : "false");
+    await setSetting(env, "fp_auto_block_enabled", form.get("fp_auto_block_enabled") ? "true" : "false");
+    const minScore = Number(String(form.get("fp_auto_block_min_score") || "").trim());
+    await setSetting(env, "fp_auto_block_min_score", String(
+        Number.isFinite(minScore) && minScore >= 60 && minScore <= 100 ? Math.round(minScore) : FP_AUTO_BLOCK_DEFAULT_SCORE,
+    ));
     return redirect("/settings", request);
 }
 
@@ -2261,10 +2356,30 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         webrtcIdentitySourceUserId: Number(webrtcIdentityMatch.label?.source_user_id || 0),
         webrtcIdentityConfirmed: Boolean(webrtcIdentityMatch.label?.confirmed),
     };
+    // 自动拉黑在通知之前执行，这样话题与私聊消息里能直接带上「已自动封禁」的结论。
+    verificationInfo.autoBlocked = await maybeAutoBlockByFingerprint(env, userId, fingerprintMatches);
     const topicVerificationDelivered = await completeTopicVerification(env, userId, verificationInfo);
     await notifyVerificationSuccess(env, userId, token, verificationInfo, topicVerificationDelivered);
-    await tgSendMessage(env, userId, "验证已通过，现在可以回到 Telegram 继续聊天。").catch(() => {});
+    await tgSendMessage(env, userId, verificationInfo.autoBlocked
+        ? "验证已通过，但你的账号已被管理员规则限制，消息不会被转发。"
+        : "验证已通过，现在可以回到 Telegram 继续聊天。").catch(() => {});
     return html(verifySuccessPage());
+}
+
+// 只处理「指纹黑名单」状态的标签，且要求分数达到设定阈值。
+// 命中「观察标签」永不自动处理，避免把待观察对象直接封掉。
+async function maybeAutoBlockByFingerprint(env, userId, matches = []) {
+    if (!matches.length) return null;
+    if (!(await autoBlockEnabled(env))) return null;
+    const minScore = await autoBlockMinScore(env);
+    const hit = matches.find((match) => match.state === "blacklist" && Number(match.score || 0) >= minScore);
+    if (!hit) return null;
+    const reason = `指纹自动拉黑：${hit.labelName}（${hit.score}%，${hit.tierLabel || "指纹匹配"}）`;
+    await setBlock(env, userId, true, reason);
+    await logEvent(env, "warn", "fingerprint auto block", {
+        userId, labelId: hit.labelId, labelName: hit.labelName, score: hit.score, tier: hit.tier, minScore,
+    });
+    return { labelName: hit.labelName, score: hit.score, tier: hit.tier, tierLabel: hit.tierLabel, reason };
 }
 
 function verifyIpProbe(request) {
@@ -2390,6 +2505,26 @@ async function topicCreatePolicy(env) {
 async function topicSyncWebReplies(env) {
     const raw = await getSetting(env, "topic_sync_web_replies", env.TOPIC_SYNC_WEB_REPLIES ?? "true");
     return String(raw || "true").toLowerCase() !== "false";
+}
+
+// 规则6：跨浏览器且换网络时只剩「稳定不变量」一致，此时同型号的另一台设备
+// 与真正的同一人无法区分，因此默认不列为候选。开启后会以「弱证据」列出。
+async function weakSuspectEnabled(env) {
+    const raw = await getSetting(env, "fp_weak_suspect_enabled", env.FP_WEAK_SUSPECT_ENABLED ?? "false");
+    return String(raw || "false").toLowerCase() === "true";
+}
+
+// 自动拉黑：命中「指纹黑名单」状态的标签且分数达到 FP_AUTO_BLOCK_MIN_SCORE 时自动封禁。
+// 默认关闭，因为「WebRTC IP 一致但设备不同」也会给到 92 分，自动化有误伤风险。
+async function autoBlockEnabled(env) {
+    const raw = await getSetting(env, "fp_auto_block_enabled", env.FP_AUTO_BLOCK_ENABLED ?? "false");
+    return String(raw || "false").toLowerCase() === "true";
+}
+
+async function autoBlockMinScore(env) {
+    const raw = await getSetting(env, "fp_auto_block_min_score", env.FP_AUTO_BLOCK_MIN_SCORE ?? "");
+    const value = Number(String(raw || "").trim());
+    return Number.isFinite(value) && value >= 60 && value <= 100 ? Math.round(value) : FP_AUTO_BLOCK_DEFAULT_SCORE;
 }
 
 async function webRelayEnabled(env) {
@@ -2778,7 +2913,18 @@ function topicVerificationText(info) {
         lines.push(
             `设备型号：${info.fingerprintSummary.model || "-"}`,
             `性能等级：${info.fingerprintSummary.performanceClass || "-"}`,
+            `时区：${info.fingerprintSummary.timezone || "-"}`,
+            `语言：${info.fingerprintSummary.language || "-"}`,
             `Telegram 客户端：${[info.fingerprintSummary.telegramPlatform, info.fingerprintSummary.telegramVersion].filter(Boolean).join(" ") || "-"}`,
+        );
+    }
+    if (info.autoBlocked) {
+        lines.push(
+            "",
+            "已按指纹自动拉黑",
+            `标签：${info.autoBlocked.labelName}`,
+            `分数：${info.autoBlocked.score}%`,
+            `依据：${info.autoBlocked.tierLabel || "指纹匹配"}`,
         );
     }
     if (info.webrtcIdentityLabelId) {
@@ -2818,10 +2964,7 @@ async function completeTopicVerification(env, userId, info) {
         const fingerprintSlot = Number(info.fingerprintSlot || 0);
         const firstMatch = info.fingerprintMatches?.[0];
         if (firstMatch && fingerprintPrefix && fingerprintSlot) {
-            confirmationRows.push([{
-                text: `确认同一人（${firstMatch.score}%）`,
-                callback_data: `fpconfirm:${userId}:${firstMatch.labelId}:${fingerprintSlot}:${fingerprintPrefix}`,
-            }]);
+            confirmationRows.push(fingerprintMatchButtons(userId, firstMatch, fingerprintSlot, fingerprintPrefix, Boolean(info.autoBlocked)));
         }
         if (fingerprintPrefix && fingerprintSlot) {
             confirmationRows.push([
@@ -3518,7 +3661,27 @@ async function handleCallbackQuery(env, query) {
             return;
         }
         await answerCallbackQuery(env, query.id, "已人工确认同一人");
-        await sendCallbackContextMessage(env, query, `已人工确认\n用户 ID：${userId}\n标签：${result.label.label_name}\n相似度：${result.match.score}%\n依据：${result.match.evidence?.join("、") || "相似指纹"}`);
+        await sendCallbackContextMessage(env, query, `已人工确认\n用户 ID：${userId}\n标签：${result.label.label_name}\n相似度：${result.match.score}%\n判定：${result.match.tierLabel || "相似指纹"}\n依据：${result.match.evidence?.join("、") || "相似指纹"}`);
+        return;
+    }
+    // 确认同一人并立即拉黑，一步完成。封禁原因自动写入标签与分数。
+    if (action === "fpban") {
+        const userId = Number(rawUserId);
+        const labelId = Number(rawLabelId);
+        if (!Number.isFinite(userId) || !Number.isFinite(labelId)) {
+            await answerCallbackQuery(env, query.id, "参数错误");
+            return;
+        }
+        const result = await confirmFingerprintMatch(env, userId, labelId, adminId, String(rawPrefix || ""));
+        if (result.error) {
+            await answerCallbackQuery(env, query.id, result.error.slice(0, 180));
+            return;
+        }
+        const reason = `指纹匹配拉黑：${result.label.label_name}（${result.match.score}%，${result.match.tierLabel || "指纹匹配"}）`;
+        await setBlock(env, userId, true, reason);
+        await tgSendMessage(env, userId, "管理员已将你加入黑名单，后续消息不会被转发。").catch(() => {});
+        await answerCallbackQuery(env, query.id, "已确认并拉黑");
+        await sendCallbackContextMessage(env, query, `已确认并拉黑\n用户 ID：${userId}\n标签：${result.label.label_name}\n相似度：${result.match.score}%\n判定：${result.match.tierLabel || "指纹匹配"}\n封禁原因：${reason}`);
         return;
     }
     if (action === "rtcmark") {
@@ -3616,9 +3779,12 @@ async function notifyVerificationSuccess(env, userId, token, info, topicDelivere
         ? `\n\n${info.webrtcIdentityConfirmed ? "WebRTC 标签（管理员已确认）" : "WebRTC 标签命中（待人工确认）"}\n标签：${h(info.webrtcIdentityLabelName || "未设置")}\n来源用户 ID：<code>${info.webrtcIdentitySourceUserId || "-"}</code>\n匹配依据：WebRTC ${h(info.webrtcIdentityIpVersion || "-")} 完全相同`
         : "";
     const fingerprintMatchesText = (info.fingerprintMatches || []).length
-        ? "\n\n指纹候选（仅供人工确认）\n" + info.fingerprintMatches.slice(0, 5).map((match) => `- ${h(match.labelName)} [${match.state === "blacklist" ? "指纹黑名单" : "观察"}]：${match.score}%（总分 ${match.weightedScore}% / 网络 ${match.networkScore}% / 设备 ${match.deviceScore}%）\n  依据：${h(match.evidence?.join("、") || "稀疏特征相似")}`).join("\n")
+        ? "\n\n" + h(fingerprintMatchText(info.fingerprintMatches))
         : "";
-    const fingerprintText = `\n\n指纹 V2\n完整哈希：<code>${h(info.fingerprintHash ? info.fingerprintHash.slice(0, 24) : "-")}</code>\n质量：${Number(info.fingerprintQuality || 0)}%\n设备型号：${h(info.fingerprintSummary?.model || "-")}\n性能等级：${h(info.fingerprintSummary?.performanceClass || "-")}\nTelegram 客户端：${h([info.fingerprintSummary?.telegramPlatform, info.fingerprintSummary?.telegramVersion].filter(Boolean).join(" ") || "-")}${fingerprintMatchesText}`;
+    const autoBlockText = info.autoBlocked
+        ? `\n\n已按指纹自动拉黑\n标签：${h(info.autoBlocked.labelName)}\n分数：${info.autoBlocked.score}%\n依据：${h(info.autoBlocked.tierLabel || "指纹匹配")}`
+        : "";
+    const fingerprintText = `\n\n指纹 V2\n完整哈希：<code>${h(info.fingerprintHash ? info.fingerprintHash.slice(0, 24) : "-")}</code>\n质量：${Number(info.fingerprintQuality || 0)}%\n设备型号：${h(info.fingerprintSummary?.model || "-")}\n性能等级：${h(info.fingerprintSummary?.performanceClass || "-")}\n时区：${h(info.fingerprintSummary?.timezone || "-")}\n语言：${h(info.fingerprintSummary?.language || "-")}\nTelegram 客户端：${h([info.fingerprintSummary?.telegramPlatform, info.fingerprintSummary?.telegramVersion].filter(Boolean).join(" ") || "-")}${autoBlockText}${fingerprintMatchesText}`;
     const textValue = `新用户验证通过\n用户 ID：<code>${userId}</code>\n昵称：${h(info.fullName || "-")}\n用户名：${username}\n语言：${h(info.languageCode || "-")}\n\n本次验证信息\n设备系统：${h(info.deviceOs || "-")}\nHTTP IP：<code>${h(info.httpIp || "-")}</code>\nHTTP IP 类型：${h(info.httpIpVersion || "-")}\n公网 IPv4：<code>${h(info.httpIpv4 || "-")}</code>\n公网 IPv6：<code>${h(info.httpIpv6 || "-")}</code>\n公网 ASN：${h(info.asn || "-")}\n运营商：${h(info.asOrganization || "-")}\n国家/地区：${h(info.country || "-")}\nCloudflare 机房：${h(info.colo || "-")}\n\nUDP / WebRTC 信息\nWebRTC IPv4：<code>${h(info.webrtcIpv4 || "-")}</code>\nWebRTC IPv6：<code>${h(info.webrtcIpv6 || "-")}</code>\nWebRTC ASN：${h(info.webRtcAsn || "-")}\nWebRTC ISP：${h(info.webRtcIsp || "-")}\nUDP 状态：${h(info.udpStatus || "-")}\nCandidate 类型：${h(info.candidateType || "-")}${identityText}${fingerprintText}`;
     const keyboard = [];
     if (info.webrtcIdentityLabelId && !info.webrtcIdentityConfirmed) {
@@ -3628,7 +3794,7 @@ async function notifyVerificationSuccess(env, userId, token, info, topicDelivere
     const fingerprintSlot = Number(info.fingerprintSlot || 0);
     const firstMatch = info.fingerprintMatches?.[0];
     if (firstMatch && fingerprintPrefix && fingerprintSlot) {
-        keyboard.push([{ text: `确认同一人（${firstMatch.score}%）`, callback_data: `fpconfirm:${userId}:${firstMatch.labelId}:${fingerprintSlot}:${fingerprintPrefix}` }]);
+        keyboard.push(fingerprintMatchButtons(userId, firstMatch, fingerprintSlot, fingerprintPrefix, Boolean(info.autoBlocked)));
     }
     if (fingerprintPrefix && fingerprintSlot) {
         keyboard.push([
