@@ -22,7 +22,8 @@ const MAX_FINGERPRINT_LABELS_PER_USER = 5;
 const MAX_FINGERPRINT_REFERENCES_PER_LABEL = 12;
 const MAX_FINGERPRINT_CANDIDATES = 24;
 const FP_AUTO_BLOCK_DEFAULT_SCORE = 95;
-// 群发：每批人数与批内间隔。40 条 × 500ms ≈ 2 条/秒，远低于 Telegram 约 30 条/秒的上限。
+// 群发：每批人数与批内间隔。批内 40 条 × 500ms = 20 秒发完一批，Cron 每分钟发一批。
+// 稳态约 0.7 条/秒，远低于 Telegram 约 30 条/秒的上限；批内留 40 秒余量给网络抖动。
 const BROADCAST_BATCH_SIZE = 40;
 const BROADCAST_BATCH_INTERVAL_MS = 500;
 // 预留给消息头尾的字数，Telegram 单条上限 4096。
@@ -4411,19 +4412,19 @@ async function broadcastPage(request, env) {
 
     const runningCard = running
         ? `<div class="card"><h2>进行中的群发 #${h(String(running.id))}</h2>
-<p class="muted">范围：${h(broadcastAudienceLabel(running.audience))}，目标 ${Number(running.target_total || 0)} 人。由 Cron 每 30 秒推进一批，关掉本页不影响发送。</p>
+<p class="muted">范围：${h(broadcastAudienceLabel(running.audience))}，目标 ${Number(running.target_total || 0)} 人。由 Cron 每分钟推进一批，关掉本页不影响发送。</p>
 <dl class="kv"><dt>内容</dt><dd class="clamp clamp-2">${h(String(running.content || ""))}</dd>
 <dt>已处理</dt><dd>${Number(running.sent_count || 0) + Number(running.failed_count || 0)} / ${Number(running.target_total || 0)}</dd>
 <dt>成功</dt><dd>${Number(running.sent_count || 0)}</dd>
 <dt>失败</dt><dd>${Number(running.failed_count || 0)}</dd></dl>
 <div class="actions" style="margin-top:12px"><form method="post" action="/broadcast/cancel" onsubmit="return confirm('确定取消这次群发吗？已经发出去的消息无法撤回。')"><button class="danger" type="submit">取消这次群发</button></form></div></div>`
         : `<div class="card"><h2>发送群发通知</h2>
-<p class="muted">发给私聊过 Bot 的用户。发送过程由 Cron 分批推进，约 1.3 条/秒，几百人需要几分钟。单条失败不影响其他人，失败名单事后可查。</p>
+<p class="muted">发给私聊过 Bot 的用户。发送过程由 Cron 每分钟推进一批，约 0.7 条/秒，几百人需要十来分钟。单条失败不影响其他人，失败名单事后可查。</p>
 <form method="post" action="/broadcast">
 <label for="broadcast-content">通知内容</label><textarea id="broadcast-content" name="content" required maxlength="${BROADCAST_MAX_CONTENT}" placeholder="要发给所有用户的一段文字"></textarea>
 <div class="grid"><div><label for="broadcast-audience">发送范围</label><select id="broadcast-audience" name="audience">
 ${option("all", `全部用户（${allCount} 人）`, "all")}${option("verified", `仅已验证用户（${verifiedCount} 人）`, "verified")}</select></div>
-<div><label for="broadcast-hint">预计耗时</label><input id="broadcast-hint" value="按每 30 秒一批、每批 40 人估算" readonly></div></div>
+<div><label for="broadcast-hint">预计耗时</label><input id="broadcast-hint" value="每分钟一批 40 人，400 人约 12 分钟" readonly></div></div>
 <div class="actions"><button class="primary" type="submit" onclick="return confirm('确定发送给全部目标用户吗？消息发出后无法撤回。')">发送给目标用户</button>
 <button type="submit" formaction="/broadcast/preview">试发到我的私聊</button></div>
 </form>
@@ -4447,7 +4448,7 @@ ${option("all", `全部用户（${allCount} 人）`, "all")}${option("verified",
 
     const messages = [
         error ? `<div class="msg">出错：${h(error)}</div>` : "",
-        done ? `<div class="msg">群发任务 #${h(String(done))} 已创建，第一批正在发送。剩下的批次由 Cron 每 30 秒推进，关掉本页不影响。</div>` : "",
+        done ? `<div class="msg">群发任务 #${h(String(done))} 已创建，第一批正在发送。剩下的批次由 Cron 每分钟推进，关掉本页不影响。</div>` : "",
         previewed ? `<div class="msg">预览已发到你的私聊。确认内容无误后回到这里点「发送给目标用户」。</div>` : "",
     ].join("");
 

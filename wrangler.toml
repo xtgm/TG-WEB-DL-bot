@@ -2,10 +2,10 @@ name = "tg-dualbot-cloudflare"
 main = "worker.js"
 compatibility_date = "2026-07-08"
 
-# Cron triggers. 用来推进群发任务：每 30 秒发一批，没有进行中的任务时 handler 直接返回。
-# 秒级表达式是 6 段，不要写成 5 段的每分钟，否则第一批要多等 30 秒。
+# Cron triggers. 用来推进群发任务：每分钟发一批 40 人，没有进行中的任务时 handler 直接返回。
+# Cloudflare 只支持 5 段式 cron，不支持带秒的 6 段写法，所以最细粒度就是每分钟。
 [triggers]
-crons = ["*/30 * * * * *"]
+crons = ["* * * * *"]
 
 [[d1_databases]]
 binding = "DB"

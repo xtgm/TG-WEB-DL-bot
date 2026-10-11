@@ -202,11 +202,12 @@ npm run db:upgrade:broadcast
 
 ## Cron 触发器
 
-`wrangler.toml` 里的 `[triggers]` 配了一条 `crons = ["*/30 * * * * *"]`，用来推进群发任务：每 30 秒发一批 40 人，批内按 500ms 间隔限速，整批约 1.3 条/秒。
+`wrangler.toml` 里的 `[triggers]` 配了一条 `crons = ["* * * * *"]`，用来推进群发任务：每分钟发一批 40 人，批内按 500ms 间隔限速，整批 20 秒发完，稳态约 0.7 条/秒。400 人约 12 分钟发完。
 
-- 表达式是 6 段的秒级写法，不要改成 5 段，否则第一批要多等 30 秒。
+- Cloudflare 只支持 5 段式 cron，不支持带秒的 6 段写法，所以最细粒度就是每分钟。
 - 没有进行中的群发任务时，Cron 回调直接返回，不产生任何额外开销。
-- **修改 `wrangler.toml` 后必须重新部署一次，Cron 才会生效**；用 Dashboard 手动上传代码的话，记得在部署设置里把这段 `[triggers]` 一并带上。
+- **修改 `wrangler.toml` 后必须重新部署一次，Cron 才会生效**；用 Dashboard 手动上传代码的话，在「设置 → 触发器 → Cron Triggers」里手动添加 `* * * * *`，效果与配置文件一致。
+- Cron 配置变更需要几分钟才会生效，不是保存即跑。
 - 后台页面上的「发送」按钮会立刻发第一批，剩下的交给 Cron，所以关掉浏览器不影响发送。
 
 <a id="workers-manual"></a>
@@ -316,7 +317,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 双向消息转发 | 用户消息写入收件箱并转发给最多 3 个管理员；启用话题模式后也会同步到用户专属 Telegram 话题。 |
 | Web 后台回复 | 管理员可在 `/inbox` 页面查看消息、回复用户、重试转发失败的消息；启用话题模式后 Web 回复也可同步到话题。 |
 | 用户管理 | `/users` 展示用户资料、验证状态、备注、封禁状态、HTTP IPv4/IPv6、UDP WebRTC IPv4/IPv6、ASN、设备系统。 |
-| 全体通知 | `/broadcast` 一次性群发给私聊过 Bot 的用户，可选全部用户或仅已验证用户；由 Cron 每 30 秒发一批，单条失败不影响其他人。 |
+| 全体通知 | `/broadcast` 一次性群发给私聊过 Bot 的用户，可选全部用户或仅已验证用户；由 Cron 每分钟发一批，单条失败不影响其他人。 |
 | 广告拦截 | `/rules` 支持维护私聊关键词，命中后可自动封禁并通知管理员。 |
 | Cloudflare 验证记录 | `/verifications` 展示 Turnstile 通过记录、HTTP IP、WebRTC UDP 结果、国家、机房、ASN、User-Agent。 |
 | WebRTC 人工身份标签 | 管理员使用现有备注手动标记 WebRTC；后续 WebRTC 精确命中只显示“待人工确认”，点击“确认同一人”后才建立持久标签关联。 |
@@ -337,7 +338,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 收件箱 | `/inbox` | 显示用户入站消息、管理员出站回复、消息方向、来源（用户私聊 / 话题回复 / 管理员私聊 / Web 后台）、状态和错误；支持回复与重试。 |
 | 用户管理 | `/users` | 查看用户资料、备注标签、封禁与静默隔离状态、验证状态、HTTP IP、UDP WebRTC、V2 指纹、ASN、设备系统和话题绑定；操作区为固定 3×3 按钮网格，含封禁 / 解封、静默隔离 / 解除隔离、取消验证、指纹标签、标记指纹、创建话题、重建话题、解绑话题和删除用户。 |
 | 名单管理 | `/moderation` | 集中查看封禁名单与静默隔离名单，显示每条记录的原因、时间和当前状态，可直接解除或追加处理；页面顶部说明两种处理方式的区别与原因来源。 |
-| 群发通知 | `/broadcast` | 填写一段内容、选择发送范围后群发；Cron 每 30 秒发一批，页面显示进行中任务的进度，可试发到自己私聊确认排版、取消未完成任务、查看每个失败用户的原因。 |
+| 群发通知 | `/broadcast` | 填写一段内容、选择发送范围后群发；Cron 每分钟发一批，页面显示进行中任务的进度，可试发到自己私聊确认排版、取消未完成任务、查看每个失败用户的原因。 |
 | 广告拦截 | `/rules` | 一行一个关键词；可开关命中后自动封禁。自动封禁会把命中的关键词写入封禁原因。 |
 | CF 验证记录 | `/verifications` | 展示每次 Turnstile 通过后的 IP、UDP/WebRTC、ASN、运营商、地区、设备系统、User-Agent 和时间。 |
 | 设置 | `/settings` | 保存管理员 Chat ID、欢迎语、控制模式、话题群与话题策略、指纹识别两个开关；查看公开地址、验证入口和 Secrets 配置状态（区分必填与可选）。 |
@@ -682,7 +683,7 @@ tg-dualbot-cloudflare/
 │  ├─ name：Worker 名称。
 │  ├─ main = "worker.js"：Workers 入口。
 │  ├─ [[d1_databases]]：D1 绑定，binding 必须是 DB。
-│  ├─ [triggers]：Cron 表达式，每 30 秒推进一批群发任务，改了要重新部署才生效。
+│  ├─ [triggers]：Cron 表达式，每分钟推进一批群发任务，改了要重新部署才生效。
 │  └─ [vars]：PUBLIC_BASE_URL、TURNSTILE_SITE_KEY、ADMIN_CHAT_IDS、CONTROL_MODE、TOPIC_GROUP_ID 等普通变量。
 ├─ worker.js
 │  ├─ export default.fetch()：Workers 入口。
@@ -694,7 +695,7 @@ tg-dualbot-cloudflare/
 │  ├─ adminReplyByMessage()：管理员回复定位。
 │  ├─ verifyPage()/verifySubmit()：Turnstile 验证页和服务端校验。
 │  ├─ ensureVerificationSchema()：运行时补齐验证字段。
-│  ├─ scheduled() 和 runPendingBroadcastBatch()：Cron 推进群发任务，每 30 秒发一批。
+│  ├─ scheduled() 和 runPendingBroadcastBatch()：Cron 推进群发任务，每分钟发一批。
 │  └─ tgCall()、D1 helper、Cookie helper、日志 helper。
 ├─ fingerprint-v2.js
 │  └─ V2 HMAC、SimHash、MinHash/Jaccard、Gower、35/25/40 评分和有界 lookup 生成。
