@@ -28,6 +28,7 @@
 | Telegram Webhook 设置 | [Telegram Webhook 设置](#telegram-webhook-setup) |
 | 部署后验证 | [部署后验证](#post-deploy-check) |
 | 旧库升级 | [旧库升级](#upgrade) |
+| Cron 触发器 | [Cron 触发器](#cron) |
 | 常见问题 | [常见问题](#faq) |
 | 安全建议 | [安全建议](#security) |
 
@@ -167,6 +168,8 @@ npm run db:apply
 | `settings` | 后台保存的管理员 ID、欢迎语、控制模式等设置。 |
 | `event_logs` | 系统事件和错误日志。 |
 | `rate_events` | 用户消息限频记录。 |
+| `broadcasts` | 群发任务：内容、发送范围、目标人数、游标位置、成功与失败计数和任务状态。 |
+| `broadcast_recipients` | 每个用户对每个群发任务的送达结果，失败时记 Telegram 返回的错误原因。 |
 | `telegram_updates` | 已处理的 Telegram update_id，用于 Webhook 重发去重。 |
 | `ip_verifications` | Cloudflare Turnstile、HTTP IP、IPv4/IPv6、UDP WebRTC、ASN、设备记录。 |
 | `verification_sessions` | Telegram 用户一次性验证 token 和验证会话。 |
@@ -188,10 +191,23 @@ npm run db:upgrade:topics
 npm run db:upgrade:webrtc-identity
 npm run db:upgrade:fingerprint-v2
 npm run db:upgrade:moderation
+npm run db:upgrade:broadcast
 ```
 
 如果旧库已经运行过新版 Worker，运行时代码可能已经自动补齐字段；这时升级 SQL 遇到重复字段可以停止，不影响新版运行。
 `0009_moderation_reason.sql` 只新增封禁与隔离的原因、时间字段和一个索引，运行时也会自动补齐，可以不手工执行。
+`0010_broadcast.sql` 建的两张群发表同样会在运行时自动创建，只有在希望先手工建好表时才需要执行。
+
+<a id="cron"></a>
+
+## Cron 触发器
+
+`wrangler.toml` 里的 `[triggers]` 配了一条 `crons = ["*/30 * * * * *"]`，用来推进群发任务：每 30 秒发一批 40 人，批内按 500ms 间隔限速，整批约 1.3 条/秒。
+
+- 表达式是 6 段的秒级写法，不要改成 5 段，否则第一批要多等 30 秒。
+- 没有进行中的群发任务时，Cron 回调直接返回，不产生任何额外开销。
+- **修改 `wrangler.toml` 后必须重新部署一次，Cron 才会生效**；用 Dashboard 手动上传代码的话，记得在部署设置里把这段 `[triggers]` 一并带上。
+- 后台页面上的「发送」按钮会立刻发第一批，剩下的交给 Cron，所以关掉浏览器不影响发送。
 
 <a id="workers-manual"></a>
 
@@ -300,6 +316,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 双向消息转发 | 用户消息写入收件箱并转发给最多 3 个管理员；启用话题模式后也会同步到用户专属 Telegram 话题。 |
 | Web 后台回复 | 管理员可在 `/inbox` 页面查看消息、回复用户、重试转发失败的消息；启用话题模式后 Web 回复也可同步到话题。 |
 | 用户管理 | `/users` 展示用户资料、验证状态、备注、封禁状态、HTTP IPv4/IPv6、UDP WebRTC IPv4/IPv6、ASN、设备系统。 |
+| 全体通知 | `/broadcast` 一次性群发给私聊过 Bot 的用户，可选全部用户或仅已验证用户；由 Cron 每 30 秒发一批，单条失败不影响其他人。 |
 | 广告拦截 | `/rules` 支持维护私聊关键词，命中后可自动封禁并通知管理员。 |
 | Cloudflare 验证记录 | `/verifications` 展示 Turnstile 通过记录、HTTP IP、WebRTC UDP 结果、国家、机房、ASN、User-Agent。 |
 | WebRTC 人工身份标签 | 管理员使用现有备注手动标记 WebRTC；后续 WebRTC 精确命中只显示“待人工确认”，点击“确认同一人”后才建立持久标签关联。 |
@@ -320,6 +337,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 收件箱 | `/inbox` | 显示用户入站消息、管理员出站回复、消息方向、来源（用户私聊 / 话题回复 / 管理员私聊 / Web 后台）、状态和错误；支持回复与重试。 |
 | 用户管理 | `/users` | 查看用户资料、备注标签、封禁与静默隔离状态、验证状态、HTTP IP、UDP WebRTC、V2 指纹、ASN、设备系统和话题绑定；操作区为固定 3×3 按钮网格，含封禁 / 解封、静默隔离 / 解除隔离、取消验证、指纹标签、标记指纹、创建话题、重建话题、解绑话题和删除用户。 |
 | 名单管理 | `/moderation` | 集中查看封禁名单与静默隔离名单，显示每条记录的原因、时间和当前状态，可直接解除或追加处理；页面顶部说明两种处理方式的区别与原因来源。 |
+| 群发通知 | `/broadcast` | 填写一段内容、选择发送范围后群发；Cron 每 30 秒发一批，页面显示进行中任务的进度，可试发到自己私聊确认排版、取消未完成任务、查看每个失败用户的原因。 |
 | 广告拦截 | `/rules` | 一行一个关键词；可开关命中后自动封禁。自动封禁会把命中的关键词写入封禁原因。 |
 | CF 验证记录 | `/verifications` | 展示每次 Turnstile 通过后的 IP、UDP/WebRTC、ASN、运营商、地区、设备系统、User-Agent 和时间。 |
 | 设置 | `/settings` | 保存管理员 Chat ID、欢迎语、控制模式、话题群与话题策略、指纹识别两个开关；查看公开地址、验证入口和 Secrets 配置状态（区分必填与可选）。 |
@@ -602,6 +620,10 @@ Web 后台的用户管理页继续提供创建话题、重建话题、解绑话�
 | `/moderation/{user_id}/unblock` | POST | 从名单页解除封禁。 |
 | `/moderation/{user_id}/mute` | POST | 从名单页开启静默隔离。 |
 | `/moderation/{user_id}/unmute` | POST | 从名单页解除静默隔离。 |
+| `/broadcast` | GET | 群发通知：发送表单、进行中任务的进度和群发记录。 |
+| `/broadcast` | POST | 创建群发任务并立刻发第一批，剩余批次交给 Cron。 |
+| `/broadcast/preview` | POST | 用同一份内容先发一条到自己的私聊，不创建群发任务。 |
+| `/broadcast/cancel` | POST | 取消进行中的群发任务；已发出的消息无法撤回。 |
 | `/rules` | GET/POST | 查看和保存广告关键词。 |
 | `/verifications` | GET | CF 验证记录。 |
 | `/settings` | GET/POST | 后台设置。 |
@@ -624,6 +646,8 @@ Web 后台的用户管理页继续提供创建话题、重建话题、解绑话�
 | `settings` | 管理员 Chat ID、欢迎语等后台设置。 |
 | `event_logs` | 运行事件。 |
 | `rate_events` | 用户发送频率记录。 |
+| `broadcasts` | 群发任务：内容、发送范围、目标人数、游标位置、成功与失败计数和任务状态。 |
+| `broadcast_recipients` | 每个群发任务对每个用户的送达结果，成功时记 message_id，失败时记 Telegram 返回的错误原因。 |
 | `telegram_updates` | 已处理的 Telegram update_id，用于 Webhook 重发去重。 |
 | `fingerprint_profiles_v2` | 每用户最多 3 个滚动 V2 指纹档案。 |
 | `fingerprint_labels_v2` | 管理员建立的指纹标签及其状态（观察 / 指纹黑名单）。 |
@@ -649,13 +673,16 @@ tg-dualbot-cloudflare/
 │  ├─ npm run db:upgrade:webrtc-identity：旧库新增 WebRTC 标签与人工确认表。
 │  ├─ npm run db:upgrade:fingerprint-v2：旧库新增 V2 指纹五张表。
 │  ├─ npm run db:upgrade:moderation：旧库补封禁与静默隔离的原因、时间字段。
+│  ├─ npm run db:upgrade:broadcast：旧库新建群发任务与逐人结果两张表。
 │  ├─ npm run test:fingerprint：运行 V2 算法和 D1 有界性测试。
 │  ├─ npm run test:verification-client：渲染并检查验证页内嵌采集脚本。
+│  ├─ npm run test:broadcast：运行群发的口径、限速、游标推进和失败处理测试。
 │  └─ npm run pages:deploy：Pages Direct Upload。
 ├─ wrangler.toml
 │  ├─ name：Worker 名称。
 │  ├─ main = "worker.js"：Workers 入口。
 │  ├─ [[d1_databases]]：D1 绑定，binding 必须是 DB。
+│  ├─ [triggers]：Cron 表达式，每 30 秒推进一批群发任务，改了要重新部署才生效。
 │  └─ [vars]：PUBLIC_BASE_URL、TURNSTILE_SITE_KEY、ADMIN_CHAT_IDS、CONTROL_MODE、TOPIC_GROUP_ID 等普通变量。
 ├─ worker.js
 │  ├─ export default.fetch()：Workers 入口。
@@ -667,6 +694,7 @@ tg-dualbot-cloudflare/
 │  ├─ adminReplyByMessage()：管理员回复定位。
 │  ├─ verifyPage()/verifySubmit()：Turnstile 验证页和服务端校验。
 │  ├─ ensureVerificationSchema()：运行时补齐验证字段。
+│  ├─ scheduled() 和 runPendingBroadcastBatch()：Cron 推进群发任务，每 30 秒发一批。
 │  └─ tgCall()、D1 helper、Cookie helper、日志 helper。
 ├─ fingerprint-v2.js
 │  └─ V2 HMAC、SimHash、MinHash/Jaccard、Gower、35/25/40 评分和有界 lookup 生成。
@@ -689,9 +717,12 @@ tg-dualbot-cloudflare/
 │  │  └─ 旧数据库新增 V2 指纹五张表和索引。
 │  ├─ 0008_inbound_isolation.sql
 │  │  └─ 旧数据库新增静默隔离字段与 Telegram Webhook 幂等表。
-│  └─ 0009_moderation_reason.sql
-│     └─ 旧数据库新增封禁与静默隔离的原因、时间字段和封禁索引。
+│  ├─ 0009_moderation_reason.sql
+│  │  └─ 旧数据库新增封禁与静默隔离的原因、时间字段和封禁索引。
+│  └─ 0010_broadcast.sql
+│     └─ 新增群发任务表和逐人送达结果表。
 ├─ tests/
+│  ├─ broadcast.test.mjs
 │  ├─ fingerprint_v2_algorithm.test.mjs
 │  ├─ fingerprint_v2_schema.test.mjs
 │  ├─ log_translation.test.mjs

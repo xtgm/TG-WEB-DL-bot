@@ -22,6 +22,11 @@ const MAX_FINGERPRINT_LABELS_PER_USER = 5;
 const MAX_FINGERPRINT_REFERENCES_PER_LABEL = 12;
 const MAX_FINGERPRINT_CANDIDATES = 24;
 const FP_AUTO_BLOCK_DEFAULT_SCORE = 95;
+// 群发：每批人数与批内间隔。40 条 × 500ms ≈ 2 条/秒，远低于 Telegram 约 30 条/秒的上限。
+const BROADCAST_BATCH_SIZE = 40;
+const BROADCAST_BATCH_INTERVAL_MS = 500;
+// 预留给消息头尾的字数，Telegram 单条上限 4096。
+const BROADCAST_MAX_CONTENT = 3800;
 const USER_WITH_IDENTITY_SELECT = "SELECT u.*, c.label_id AS confirmed_identity_label_id, c.confirmed_at AS identity_confirmed_at, l.label_name AS identity_label_name, l.source_user_id AS identity_label_source_user_id, " +
     "ful.label_id AS fingerprint_confirmed_label_id, ful.weighted_score AS fingerprint_confirmed_score, ful.confirmed_at AS fingerprint_confirmed_at, " +
     "fl.label_name AS fingerprint_label_name, fl.state AS fingerprint_label_state, " +
@@ -41,6 +46,10 @@ export default {
             await logEvent(env, "error", "unhandled request error", { error: String(error?.stack || error) });
             return new Response("Internal Server Error", { status: 500 });
         }
+    },
+    // Cron 只做一件事：推进还没发完的群发任务。没有进行中的任务时直接返回。
+    async scheduled(event, env, ctx) {
+        await ctx.waitUntil(runPendingBroadcastBatch(env));
     },
 };
 
@@ -101,6 +110,10 @@ export async function handleRequest(request, env, ctx) {
     if (path === "/settings" && method === "GET") return settingsPage(request, env);
     if (path === "/settings" && method === "POST") return settingsSave(request, env);
     if (path === "/logs" && method === "GET") return logsPage(request, env);
+    if (path === "/broadcast" && method === "GET") return broadcastPage(request, env);
+    if (path === "/broadcast" && method === "POST") return broadcastSave(request, env, ctx);
+    if (path === "/broadcast/preview" && method === "POST") return broadcastPreview(request, env);
+    if (path === "/broadcast/cancel" && method === "POST") return broadcastCancel(request, env);
 
     let match = path.match(/^\/inbox\/(\d+)\/reply$/);
     if (match && method === "GET") return inboxReplyPage(request, env, Number(match[1]));
@@ -1094,6 +1107,8 @@ td{padding:12px;min-width:0}tbody tr:last-child td{border-bottom:0}tbody tr:hove
 .logs-table{table-layout:fixed}.logs-table th:nth-child(1){width:96px}.logs-table th:nth-child(3){width:132px}
 .moderation-table{table-layout:fixed}
 .moderation-table th:nth-child(1){width:180px}.moderation-table th:nth-child(2){width:128px}.moderation-table th:nth-child(4){width:132px}.moderation-table th:nth-child(5){width:280px}
+.broadcast-table{table-layout:fixed}
+.broadcast-table th:nth-child(1){width:70px}.broadcast-table th:nth-child(2){width:300px}.broadcast-table th:nth-child(3){width:130px}.broadcast-table th:nth-child(4){width:80px}.broadcast-table th:nth-child(5){width:80px}.broadcast-table th:nth-child(6){width:112px}.broadcast-table th:nth-child(7){width:150px}
 .secrets-table{table-layout:fixed}.secrets-table th:nth-child(1){width:230px}.secrets-table th:nth-child(2){width:110px}
 .fingerprints-table{table-layout:fixed}.fingerprints-table th:nth-child(1){width:80px}.fingerprints-table th:nth-child(3){width:130px}.fingerprints-table th:nth-child(4){width:110px}.fingerprints-table th:nth-child(5){width:130px}.fingerprints-table th:nth-child(6){width:110px}
 .verifications-table td:nth-child(1),.verifications-table td:nth-child(6){overflow-wrap:normal;word-break:normal}
@@ -1125,7 +1140,7 @@ code{overflow-wrap:anywhere;color:#1d4ed8}.sr-only{position:absolute;width:1px;h
 @media(max-width:420px){.metrics-grid{grid-template-columns:1fr!important}.actions{display:grid;grid-template-columns:1fr}.actions>*,.actions form,.actions button,.actions .btn{width:100%}.row-actions{grid-template-columns:1fr}.kv{grid-template-columns:1fr;gap:4px}.kv dd{margin-bottom:8px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
 </style></head><body><div class="shell"><aside class="side"><div class="brand"><span class="brand-mark">TG</span><span>TG DualBot<small>Cloudflare 控制台</small></span></div><nav aria-label="后台主导航">
-<a href="/">总览</a><a href="/inbox">收件箱</a><a href="/users">用户管理</a><a href="/moderation">名单管理</a><a href="/rules">广告拦截</a><a href="/verifications">CF 验证记录</a><a href="/settings">设置</a><a href="/logs">日志</a><a href="/logout">退出</a>
+<a href="/">总览</a><a href="/inbox">收件箱</a><a href="/users">用户管理</a><a href="/moderation">名单管理</a><a href="/broadcast">群发通知</a><a href="/rules">广告拦截</a><a href="/verifications">CF 验证记录</a><a href="/settings">设置</a><a href="/logs">日志</a><a href="/logout">退出</a>
 </nav></aside><main><div class="top"><h1>${h(title)}</h1><span class="badge">Worker + D1</span></div>${body}</main></div></body></html>`;
 }
 
@@ -4107,6 +4122,37 @@ async function ensureVerificationSchema(env) {
             received_at TEXT NOT NULL
         )`).run();
     }
+    if (!schemaObjects.has("table:broadcasts")) {
+        await env.DB.prepare(
+            "CREATE TABLE IF NOT EXISTS broadcasts (" +
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+            "content TEXT NOT NULL, " +
+            "audience TEXT NOT NULL DEFAULT 'all' CHECK(audience IN ('all','verified')), " +
+            "target_total INTEGER NOT NULL DEFAULT 0, " +
+            "cursor_user_id INTEGER NOT NULL DEFAULT 0, " +
+            "sent_count INTEGER NOT NULL DEFAULT 0, " +
+            "failed_count INTEGER NOT NULL DEFAULT 0, " +
+            "status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','done','cancelled')), " +
+            "preview_sent INTEGER NOT NULL DEFAULT 0, " +
+            "created_by_user_id INTEGER NOT NULL DEFAULT 0, " +
+            "created_at TEXT NOT NULL, " +
+            "updated_at TEXT NOT NULL, " +
+            "finished_at TEXT)",
+        ).run();
+    }
+    if (!schemaObjects.has("table:broadcast_recipients")) {
+        await env.DB.prepare(
+            "CREATE TABLE IF NOT EXISTS broadcast_recipients (" +
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+            "broadcast_id INTEGER NOT NULL REFERENCES broadcasts(id) ON DELETE CASCADE, " +
+            "user_id INTEGER NOT NULL, " +
+            "status TEXT NOT NULL DEFAULT 'sent' CHECK(status IN ('sent','failed')), " +
+            "message_id INTEGER, " +
+            "error TEXT DEFAULT '', " +
+            "sent_at TEXT, " +
+            "UNIQUE(broadcast_id, user_id))",
+        ).run();
+    }
     await ensureFingerprintV2Schema(env, schemaObjects);
     const userColumns = [
         "language_code TEXT DEFAULT ''",
@@ -4172,6 +4218,8 @@ async function ensureVerificationSchema(env) {
         { name: "idx_inbox_topic_created", sql: "CREATE INDEX IF NOT EXISTS idx_inbox_topic_created ON inbox_messages(topic_chat_id, topic_thread_id, created_at)" },
         { name: "idx_verification_sessions_user_created", sql: "CREATE INDEX IF NOT EXISTS idx_verification_sessions_user_created ON verification_sessions(user_id, created_at)" },
         { name: "idx_verification_sessions_status", sql: "CREATE INDEX IF NOT EXISTS idx_verification_sessions_status ON verification_sessions(status)" },
+        { name: "idx_broadcasts_status", sql: "CREATE INDEX IF NOT EXISTS idx_broadcasts_status ON broadcasts(status, id)" },
+        { name: "idx_broadcast_recipients_broadcast_status", sql: "CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_broadcast_status ON broadcast_recipients(broadcast_id, status)" },
     ];
     for (const index of indexes) {
         if (!schemaObjects.has(`index:${index.name}`)) await env.DB.prepare(index.sql).run();
@@ -4195,4 +4243,288 @@ async function addColumnIfMissing(env, table, columnSql) {
         const message = String(error?.message || error).toLowerCase();
         if (!message.includes("duplicate") && !message.includes("exists") && !message.includes("duplicate column")) throw error;
     }
+}
+
+// ---------- 全体通知（群发） ----------
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 目标人群恒定是「私聊过 Bot 的全部用户」，即 users 表。
+// 已封禁用户始终排除：封禁是管理员主动踢掉的，不该收到通知。
+// 静默隔离不排除：隔离的语义是管理员不看他的消息，和是否要通知他无关。
+// verified 只是把范围收窄到活跃用户，不是身份门槛。
+function broadcastAudienceFilter(audience) {
+    return audience === "verified" ? " AND verified=1" : "";
+}
+
+function broadcastAudienceLabel(audience) {
+    return audience === "verified" ? "仅已验证用户" : "全部用户";
+}
+
+async function broadcastAudienceCount(env, audience) {
+    await ensureVerificationSchema(env);
+    return scalar(env, "SELECT COUNT(*) FROM users WHERE blocked=0" + broadcastAudienceFilter(audience));
+}
+
+async function getBroadcast(env, id) {
+    return env.DB.prepare("SELECT * FROM broadcasts WHERE id=?").bind(Number(id)).first();
+}
+
+async function getRunningBroadcast(env) {
+    await ensureVerificationSchema(env);
+    return env.DB.prepare("SELECT * FROM broadcasts WHERE status='running' ORDER BY id DESC LIMIT 1").first();
+}
+
+async function broadcastHistory(env, limit = 10) {
+    await ensureVerificationSchema(env);
+    const rows = await env.DB.prepare(
+        "SELECT b.*, (SELECT COUNT(*) FROM broadcast_recipients r WHERE r.broadcast_id=b.id AND r.status='failed') AS failed_rows " +
+        "FROM broadcasts b ORDER BY b.id DESC LIMIT ?",
+    ).bind(Number(limit)).all();
+    return (rows.results || []).map((row) => ({ ...row, failed: Math.max(Number(row.failed_count || 0), Number(row.failed_rows || 0)) }));
+}
+
+async function broadcastFailedSamples(env, broadcastId, limit = 5) {
+    const rows = await env.DB.prepare(
+        "SELECT user_id, error FROM broadcast_recipients WHERE broadcast_id=? AND status='failed' ORDER BY user_id LIMIT ?",
+    ).bind(Number(broadcastId), Number(limit)).all();
+    return (rows.results || []).map((row) => row);
+}
+
+async function recordBroadcastRecipient(env, broadcastId, userId, status, messageId, error) {
+    await env.DB.prepare(
+        "INSERT OR REPLACE INTO broadcast_recipients(broadcast_id, user_id, status, message_id, error, sent_at) VALUES(?,?,?,?,?,?)",
+    ).bind(Number(broadcastId), Number(userId), status, messageId || null, String(error || "").slice(0, 500), nowIso()).run();
+}
+
+// 单条失败不中断整批。用户屏蔽 Bot 或删除对话会返回 403，这是常态不是异常。
+async function sendBroadcastToUser(env, broadcastId, userId, content) {
+    try {
+        const sent = await tgCall(env, "sendMessage", {
+            chat_id: Number(userId),
+            text: content,
+            disable_web_page_preview: true,
+        });
+        await recordBroadcastRecipient(env, broadcastId, userId, "sent", sent.result.message_id, "");
+        return true;
+    } catch (error) {
+        const raw = String(error?.message || error);
+        await recordBroadcastRecipient(env, broadcastId, userId, "failed", null, raw);
+        await logEvent(env, "warn", "broadcast send failed", { broadcastId: Number(broadcastId), userId: Number(userId), error: raw });
+        return false;
+    }
+}
+
+// Cron 入口：只推进还没发完的任务，没有进行中的任务时直接返回，几乎零成本。
+export async function runPendingBroadcastBatch(env) {
+    try {
+        await ensureVerificationSchema(env);
+        const pending = await env.DB.prepare("SELECT * FROM broadcasts WHERE status='running' ORDER BY id LIMIT 1").first();
+        if (!pending) return;
+        await runBroadcastBatch(env, pending);
+    } catch (error) {
+        await logEvent(env, "error", "failed to run broadcast batch", { error: String(error?.message || error) });
+    }
+}
+
+async function runBroadcastBatch(env, broadcast) {
+    const cursor = Number(broadcast.cursor_user_id || 0);
+    const rows = await env.DB.prepare(
+        "SELECT user_id FROM users WHERE user_id > ? AND blocked=0" + broadcastAudienceFilter(broadcast.audience) +
+        " ORDER BY user_id LIMIT ?",
+    ).bind(cursor, BROADCAST_BATCH_SIZE).all();
+    const targets = (rows.results || []).map((row) => Number(row.user_id));
+
+    if (!targets.length) {
+        await finishBroadcast(env, broadcast);
+        return;
+    }
+
+    let sent = 0;
+    let failed = 0;
+    for (let i = 0; i < targets.length; i += 1) {
+        if (await sendBroadcastToUser(env, broadcast.id, targets[i], broadcast.content)) sent += 1;
+        else failed += 1;
+        if (i < targets.length - 1) await sleep(BROADCAST_BATCH_INTERVAL_MS);
+    }
+
+    // 乐观锁：只在游标未被别的 Cron 实例推进时才生效，避免并发批次把同一批人发两遍。
+    const claimed = await env.DB.prepare(
+        "UPDATE broadcasts SET cursor_user_id=?, sent_count=sent_count+?, failed_count=failed_count+?, updated_at=? " +
+        "WHERE id=? AND cursor_user_id=? AND status='running'",
+    ).bind(targets[targets.length - 1], sent, failed, nowIso(), broadcast.id, cursor).run();
+
+    if (!claimed?.meta?.changes) {
+        await logEvent(env, "warn", "broadcast cursor already advanced", { broadcastId: Number(broadcast.id), cursor });
+        return;
+    }
+
+    if (targets.length < BROADCAST_BATCH_SIZE) await finishBroadcast(env, broadcast);
+}
+
+async function finishBroadcast(env, broadcast) {
+    await env.DB.prepare("UPDATE broadcasts SET status='done', finished_at=?, updated_at=? WHERE id=? AND status='running'")
+        .bind(nowIso(), nowIso(), broadcast.id).run();
+    const row = await getBroadcast(env, broadcast.id);
+    const failedCount = Number(row?.failed_count || broadcast.failed_count || 0);
+    const lines = [
+        `群发通知 #${broadcast.id} 已完成`,
+        `范围：${broadcastAudienceLabel(broadcast.audience)}`,
+        `目标：${Number(row?.target_total || 0)} 人`,
+        `成功：${Number(row?.sent_count || 0)}`,
+        `失败：${failedCount}`,
+    ];
+    if (failedCount > 0) {
+        const samples = await broadcastFailedSamples(env, broadcast.id);
+        if (samples.length) lines.push("失败示例：\n" + samples.map((row2) => `${row2.user_id}：${h(String(row2.error || "").slice(0, 80))}`).join("\n"));
+        lines.push(`完整名单在后台「群发通知」页查看。`);
+    }
+    await notifyAdmins(env, lines.join("\n"), {}, { force: true });
+}
+
+async function broadcastFailureCell(env, row) {
+    const failed = Number(row.failed || 0);
+    if (!failed) return '<span class="muted">-</span>';
+    const samples = await broadcastFailedSamples(env, row.id);
+    const detail = samples.map((sample) => `<span>${h(String(sample.user_id))}：${h(String(sample.error || "").slice(0, 80))}</span>`).join("");
+    return `<details><summary><span class="badge red">${failed}</span></summary><div class="cell-lines">${detail || '<span class="muted">无明细</span>'}</div></details>`;
+}
+
+async function broadcastPage(request, env) {
+    await ensureVerificationSchema(env);
+    const running = await getRunningBroadcast(env);
+    const history = await broadcastHistory(env);
+    const [allCount, verifiedCount] = await Promise.all([
+        broadcastAudienceCount(env, "all"),
+        broadcastAudienceCount(env, "verified"),
+    ]);
+    const url = new URL(request.url);
+    const error = url.searchParams.get("error");
+    const done = url.searchParams.get("done");
+    const previewed = url.searchParams.get("preview");
+
+    const option = (value, label, selected) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`;
+    const disabled = running ? " disabled" : "";
+    const disabledAttr = running ? "disabled" : "";
+
+    const runningCard = running
+        ? `<div class="card"><h2>进行中的群发 #${h(String(running.id))}</h2>
+<p class="muted">范围：${h(broadcastAudienceLabel(running.audience))}，目标 ${Number(running.target_total || 0)} 人。由 Cron 每 30 秒推进一批，关掉本页不影响发送。</p>
+<dl class="kv"><dt>内容</dt><dd class="clamp clamp-2">${h(String(running.content || ""))}</dd>
+<dt>已处理</dt><dd>${Number(running.sent_count || 0) + Number(running.failed_count || 0)} / ${Number(running.target_total || 0)}</dd>
+<dt>成功</dt><dd>${Number(running.sent_count || 0)}</dd>
+<dt>失败</dt><dd>${Number(running.failed_count || 0)}</dd></dl>
+<div class="actions" style="margin-top:12px"><form method="post" action="/broadcast/cancel" onsubmit="return confirm('确定取消这次群发吗？已经发出去的消息无法撤回。')"><button class="danger" type="submit">取消这次群发</button></form></div></div>`
+        : `<div class="card"><h2>发送群发通知</h2>
+<p class="muted">发给私聊过 Bot 的用户。发送过程由 Cron 分批推进，约 1.3 条/秒，几百人需要几分钟。单条失败不影响其他人，失败名单事后可查。</p>
+<form method="post" action="/broadcast">
+<label for="broadcast-content">通知内容</label><textarea id="broadcast-content" name="content" required maxlength="${BROADCAST_MAX_CONTENT}" placeholder="要发给所有用户的一段文字"></textarea>
+<div class="grid"><div><label for="broadcast-audience">发送范围</label><select id="broadcast-audience" name="audience">
+${option("all", `全部用户（${allCount} 人）`, "all")}${option("verified", `仅已验证用户（${verifiedCount} 人）`, "verified")}</select></div>
+<div><label for="broadcast-hint">预计耗时</label><input id="broadcast-hint" value="按每 30 秒一批、每批 40 人估算" readonly></div></div>
+<div class="actions"><button class="primary" type="submit" onclick="return confirm('确定发送给全部目标用户吗？消息发出后无法撤回。')">发送给目标用户</button>
+<button type="submit" formaction="/broadcast/preview">试发到我的私聊</button></div>
+</form>
+<p class="muted" style="margin-top:10px">「试发到我的私聊」用的是同一份内容，先发一条给你自己确认排版和措辞，不会影响正式群发。</p></div>`;
+
+    const historyRows = [];
+    for (const row of history) {
+        const statusBadge = row.status === "done"
+            ? '<span class="badge green">已完成</span>'
+            : row.status === "cancelled" ? '<span class="badge red">已取消</span>' : '<span class="badge warn">进行中</span>';
+        historyRows.push(`<tr>
+<td data-label="任务"><span class="table-id">#${h(String(row.id))}</span></td>
+<td data-label="内容"><div class="clamp clamp-2">${h(String(row.content || ""))}</div></td>
+<td data-label="范围">${h(broadcastAudienceLabel(row.audience))}</td>
+<td data-label="目标"><span class="num">${Number(row.target_total || 0)}</span></td>
+<td data-label="成功"><span class="num">${Number(row.sent_count || 0)}</span></td>
+<td data-label="失败">${await broadcastFailureCell(env, row)}</td>
+<td data-label="状态"><div class="cell">${statusBadge}${tableTime(row.finished_at || row.updated_at)}</div></td>
+</tr>`);
+    }
+
+    const messages = [
+        error ? `<div class="msg">出错：${h(error)}</div>` : "",
+        done ? `<div class="msg">群发任务 #${h(String(done))} 已创建，第一批正在发送。剩下的批次由 Cron 每 30 秒推进，关掉本页不影响。</div>` : "",
+        previewed ? `<div class="msg">预览已发到你的私聊。确认内容无误后回到这里点「发送给目标用户」。</div>` : "",
+    ].join("");
+
+    const body = `${messages}${runningCard}
+<div class="card"><h2>群发记录</h2><p class="muted">只记录群发任务本身，不会写进收件箱，因此不会污染用户往来记录。失败数可点开看前几条明细。</p>
+<div class="table-wrap responsive-wrap" style="--table-min:960px" tabindex="0" aria-label="群发记录，可横向滚动"><table class="broadcast-table responsive-table"><caption class="sr-only">群发通知记录</caption><thead><tr>
+<th scope="col">任务</th><th scope="col">内容</th><th scope="col">范围</th><th scope="col">目标</th><th scope="col">成功</th><th scope="col">失败</th><th scope="col">状态</th>
+</tr></thead><tbody>${historyRows.length ? historyRows.join("") : '<tr><td data-span="full" colspan="7" class="muted">还没有群发记录。</td></tr>'}</tbody></table></div></div>`;
+
+    return html(layout("群发通知", body));
+}
+
+async function broadcastSave(request, env, ctx) {
+    const form = await request.formData();
+    const content = String(form.get("content") || "").trim();
+    if (!content) return redirect("/broadcast?error=通知内容不能为空。", request);
+    if (content.length > BROADCAST_MAX_CONTENT) {
+        return redirect(`/broadcast?error=${encodeURIComponent(`通知内容超过 ${BROADCAST_MAX_CONTENT} 字，请精简后再发。`)}`, request);
+    }
+    const audience = String(form.get("audience") || "all").trim().toLowerCase();
+    const safeAudience = audience === "verified" ? "verified" : "all";
+
+    await ensureVerificationSchema(env);
+    const running = await env.DB.prepare("SELECT id FROM broadcasts WHERE status='running' ORDER BY id LIMIT 1").first();
+    if (running) {
+        return redirect(`/broadcast?error=${encodeURIComponent(`已有群发任务 #${running.id} 进行中，请先等它完成或取消。`)}`, request);
+    }
+
+    const targetTotal = await broadcastAudienceCount(env, safeAudience);
+    if (!targetTotal) return redirect("/broadcast?error=当前范围内没有可发送的用户。", request);
+
+    const admins = await adminChatIds(env);
+    const ts = nowIso();
+    const result = await env.DB.prepare(
+        "INSERT INTO broadcasts(content, audience, target_total, cursor_user_id, sent_count, failed_count, status, preview_sent, created_by_user_id, created_at, updated_at) " +
+        "VALUES(?,?,?,0,0,0,'running',0,?,?,?)",
+    ).bind(content, safeAudience, targetTotal, Number(admins[0] || 0), ts, ts).run();
+
+    const broadcastId = result?.meta?.last_row_id || 0;
+    await logEvent(env, "info", "broadcast created", { broadcastId, audience: safeAudience, targetTotal });
+    // 立刻发第一批，剩下的交给 Cron。用 waitUntil 而不是 await：第一批要发几十条消息，
+    // 等它跑完浏览器会一直转圈，而后面的批次本来就是 Cron 的活。
+    if (ctx?.waitUntil) ctx.waitUntil(runPendingBroadcastBatch(env));
+    return redirect(`/broadcast?done=${encodeURIComponent(String(broadcastId))}`, request);
+}
+
+async function broadcastPreview(request, env) {
+    const form = await request.formData();
+    // 预览按钮和正式发送共用同一个表单（formaction 切换端点），所以读的是同一份内容。
+    const content = String(form.get("content") || "").trim();
+    if (!content) {
+        return redirect(`/broadcast?error=${encodeURIComponent("要试发的内容不能为空。")}`, request);
+    }
+    if (content.length > BROADCAST_MAX_CONTENT) {
+        return redirect(`/broadcast?error=${encodeURIComponent(`通知内容超过 ${BROADCAST_MAX_CONTENT} 字，请精简。`)}`, request);
+    }
+    const admins = await adminChatIds(env);
+    const target = Number(admins[0] || 0);
+    if (!target) {
+        return redirect(`/broadcast?error=${encodeURIComponent("没有配置管理员 Chat ID，无法试发。请先到设置页填写。")}`, request);
+    }
+
+    try {
+        const sent = await tgCall(env, "sendMessage", { chat_id: target, text: content, disable_web_page_preview: true });
+        await logEvent(env, "info", "broadcast preview sent", { chatId: target, messageId: sent.result.message_id });
+        return redirect("/broadcast?preview=1", request);
+    } catch (error) {
+        return redirect(`/broadcast?error=${encodeURIComponent(`试发失败：${String(error?.message || error).slice(0, 200)}`)}`, request);
+    }
+}
+
+async function broadcastCancel(request, env) {
+    await ensureVerificationSchema(env);
+    const row = await env.DB.prepare("SELECT * FROM broadcasts WHERE status='running' ORDER BY id LIMIT 1").first();
+    if (!row) return redirect("/broadcast", request);
+    await env.DB.prepare("UPDATE broadcasts SET status='cancelled', finished_at=?, updated_at=? WHERE id=? AND status='running'")
+        .bind(nowIso(), nowIso(), row.id).run();
+    await logEvent(env, "warn", "broadcast cancelled", { broadcastId: Number(row.id) });
+    return redirect("/broadcast", request);
 }
