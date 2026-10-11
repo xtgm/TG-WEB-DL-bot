@@ -133,7 +133,7 @@ Pages 项目：
 npx wrangler d1 create tg-dualbot-db
 ```
 
-创建成功后，把命令输出里的 `database_id` 填进 `wrangler.toml` 的 `[[d1_databases]]`：
+创建成功后，把命令输出里的 `database_id` 填进 `wrangler.toml` 的 `[[d1_databases]]`（**这个值不要提交到公开仓库**，它是账号内部的资源标识；GitHub 自动部署走的是环境变量注入，见「配置项和密钥」）：
 
 ```toml
 [[d1_databases]]
@@ -785,7 +785,7 @@ npx wrangler login
 npx wrangler d1 create tg-dualbot-db
 ```
 
-把输出里的 `database_id` 填到 `wrangler.toml`：
+把输出里的 `database_id` 填到 `wrangler.toml`（**这个值不要提交到公开仓库**）：
 
 ```toml
 [[d1_databases]]
@@ -835,7 +835,16 @@ database_name = "tg-dualbot-db"
 database_id = "你的 D1 database_id"
 ```
 
-`name` 要和 Dashboard 上实际的 Worker 名一致，`database_id` 必须是真实的 32 位 ID，写占位符会在部署时报 `10021`。变量不要写进 `[vars]`，去 Dashboard 的「设置 → 变量和机密」填。
+`name` 要和 Dashboard 上实际的 Worker 名一致。变量不要写进 `[vars]`，去 Dashboard 的「设置 → 变量和机密」填。
+
+`database_id` 也不写进配置文件 —— 它是账号内部的资源标识，公开仓库不放这类信息。做法是在 Dashboard 的 **设置 → 构建** 里：
+
+| 项 | 填什么 |
+|---|---|
+| 构建命令 | `sed -i "s\|REPLACE_WITH_D1_DATABASE_ID\|$D1_DATABASE_ID\|" wrangler.toml && npx wrangler deploy` |
+| 环境变量 | `D1_DATABASE_ID` = 你的 32 位 database_id，**勾选加密** |
+
+本地用 CLI 部署时，可以把 `database_id` 临时写进 `wrangler.toml`，但**不要提交**（`.gitignore` 没有覆盖它）；提交前用 `git diff` 确认一下。
 
 2. 写入 Secrets：
 
