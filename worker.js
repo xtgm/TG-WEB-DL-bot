@@ -1109,7 +1109,7 @@ td{padding:12px;min-width:0}tbody tr:last-child td{border-bottom:0}tbody tr:hove
 .moderation-table{table-layout:fixed}
 .moderation-table th:nth-child(1){width:180px}.moderation-table th:nth-child(2){width:128px}.moderation-table th:nth-child(4){width:132px}.moderation-table th:nth-child(5){width:280px}
 .broadcast-table{table-layout:fixed}
-.broadcast-table th:nth-child(1){width:70px}.broadcast-table th:nth-child(2){width:300px}.broadcast-table th:nth-child(3){width:130px}.broadcast-table th:nth-child(4){width:80px}.broadcast-table th:nth-child(5){width:80px}.broadcast-table th:nth-child(6){width:112px}.broadcast-table th:nth-child(7){width:150px}
+.broadcast-table th:nth-child(1){width:70px}.broadcast-table th:nth-child(2){width:300px}.broadcast-table th:nth-child(3){width:130px}.broadcast-table th:nth-child(4){width:80px}.broadcast-table th:nth-child(5){width:80px}.broadcast-table th:nth-child(6){width:280px}.broadcast-table th:nth-child(7){width:150px}
 .secrets-table{table-layout:fixed}.secrets-table th:nth-child(1){width:230px}.secrets-table th:nth-child(2){width:110px}
 .fingerprints-table{table-layout:fixed}.fingerprints-table th:nth-child(1){width:80px}.fingerprints-table th:nth-child(3){width:130px}.fingerprints-table th:nth-child(4){width:110px}.fingerprints-table th:nth-child(5){width:130px}.fingerprints-table th:nth-child(6){width:110px}
 .verifications-table td:nth-child(1),.verifications-table td:nth-child(6){overflow-wrap:normal;word-break:normal}
@@ -1118,6 +1118,8 @@ pre{max-width:100%;max-height:min(360px,60dvh);white-space:pre-wrap;overflow:aut
 .msg{background:#eff6ff;border:1px solid #bfdbfe;border-radius:9px;padding:10px 12px;color:#1e3a8a;font-weight:750;line-height:1.55}
 .log-body{display:grid;gap:8px;min-width:0}.log-body>b{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .log-hint{min-height:44px;display:flex;align-items:center;background:#eff6ff;border:1px solid #bfdbfe;border-radius:9px;padding:9px 12px;color:#1e3a8a;font-size:12px;font-weight:750;line-height:1.5}.log-hint.empty{background:#f8fafc;border-color:var(--line);color:var(--muted);font-weight:700}
+/* 来源标注：任务号、用户 ID 等，让同名日志一眼能区分。 */
+.log-context{display:inline-block;margin:1px 0 3px;padding:3px 10px;border-radius:7px;background:#fef3c7;color:#92400e;font-size:12px;font-weight:850;line-height:1.5;overflow-wrap:anywhere;max-width:100%}
 details summary{display:flex;align-items:center;min-height:34px;cursor:pointer;font-weight:800;font-size:12px}
 code{overflow-wrap:anywhere;color:#1d4ed8}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @media(max-width:1180px){.metrics-grid{grid-template-columns:repeat(3,minmax(0,1fr))!important}}
@@ -1686,6 +1688,45 @@ const LOG_MESSAGE_TRANSLATIONS = {
     },
 };
 
+// 每条日志要展示的上下文字段。日志页只显示 message 会看不出是哪条任务、哪个用户触发的，
+// 这里给每种日志指定要从 data 里取出的字段和中文标签，渲染时拼成一行来源信息。
+const LOG_MESSAGE_CONTEXT = {
+    "broadcast send failed": [["broadcastId", "任务"], ["userId", "用户"]],
+    "broadcast created": [["broadcastId", "任务"], ["audience", "范围"], ["targetTotal", "目标数"]],
+    "broadcast cancelled": [["broadcastId", "任务"]],
+    "broadcast preview sent": [["chatId", "收件人"], ["messageId", "消息"]],
+    "broadcast cursor already advanced": [["broadcastId", "任务"], ["cursor", "游标"]],
+    "failed to relay user message": [["inboxId", "收件箱"]],
+    "partial relay failure": [["inboxId", "收件箱"]],
+    "failed to create topic from web": [["userId", "用户"]],
+    "failed to send topic intro": [["userId", "用户"]],
+    "failed to send current WebRTC identity label": [["userId", "用户"]],
+    "failed to complete topic verification": [["userId", "用户"]],
+    "failed to sync outbox to topic": [["userId", "用户"], ["source", "来源"]],
+    "failed to post notice to user topic": [["userId", "用户"]],
+    "failed to notify user": [["userId", "用户"], ["stage", "阶段"]],
+    "failed to notify admin": [["id", "管理员"]],
+    "failed to relay topic message": [["threadId", "话题"]],
+    "failed to execute Telegram command": [["command", "命令"], ["chatId", "发起者"]],
+    "failed to handle Telegram command": [["command", "命令"], ["chatId", "发起者"]],
+    "fingerprint v2 processing failed": [["userId", "用户"]],
+    "fingerprint auto block": [["userId", "用户"]],
+};
+
+// 把 data 里指定的字段拼成「任务 #1 · 用户 218855950」这样的来源行；字段全空时返回空串。
+function logEntryContext(message, parsed) {
+    const fields = LOG_MESSAGE_CONTEXT[String(message || "")];
+    if (!fields || !parsed || typeof parsed !== "object") return "";
+    const parts = [];
+    for (const [key, label] of fields) {
+        const value = parsed[key];
+        if (value === undefined || value === null || value === "") continue;
+        const text = typeof value === "boolean" ? String(value) : String(value);
+        parts.push(`${label} ${text}`);
+    }
+    return parts.join(" · ");
+}
+
 function prettyLogData(value) {
     const raw = typeof value === "string" ? value : JSON.stringify(value ?? "");
     if (!raw) return "";
@@ -1766,10 +1807,19 @@ export function localizeLogEntry(message, data = "") {
         suggestion = "稍后重试，并查看相邻日志确认是哪个外部服务超时。";
     }
 
+    // rawMessage/rawData 在下面会被格式化，来源标注要在格式化之前解析原始 JSON。
+    let parsed = null;
+    try {
+        parsed = rawData ? JSON.parse(rawData) : null;
+    } catch (parseError) {
+        parsed = null;
+    }
+
     return {
         title: base.title || rawMessage || "未命名日志",
         reason,
         suggestion,
+        context: logEntryContext(rawMessage, parsed),
         rawMessage,
         rawData: prettyLogData(rawData),
     };
@@ -1787,9 +1837,13 @@ async function logsPage(request, env) {
         const suggestion = translated.suggestion
             ? `<div class="log-hint"><b>处理建议：</b>${h(translated.suggestion)}</div>`
             : '<div class="log-hint empty">这条日志没有对应的处理建议，请查看下方原始日志。</div>';
+        // 来源标注：没有它的话，几十条同名日志看不出是哪个任务、哪个用户触发的。
+        const contextLine = translated.context
+            ? `<div class="log-context">${h(translated.context)}</div>`
+            : "";
         return `<tr>
 <td data-label="ID / 级别"><div class="cell"><span class="table-id">#${h(r.id)}</span><span class="badge ${levelClass}">${h(levelText)}</span></div></td>
-<td data-label="中文说明 / 原始日志" data-span="full"><div class="log-body"><b>${h(translated.title)}</b><div class="muted" style="font-size:12px"><b>中文说明：</b>${h(translated.reason)}</div>${suggestion}<details><summary>查看原始日志</summary><pre>${h(original)}</pre></details></div></td>
+<td data-label="中文说明 / 原始日志" data-span="full"><div class="log-body"><b>${h(translated.title)}</b>${contextLine}<div class="muted" style="font-size:12px"><b>中文说明：</b>${h(translated.reason)}</div>${suggestion}<details><summary>查看原始日志</summary><pre>${h(original)}</pre></details></div></td>
 <td data-label="时间">${tableTime(r.created_at)}</td>
 </tr>`;
     }).join("");
@@ -4389,7 +4443,8 @@ async function broadcastFailureCell(env, row) {
     const failed = Number(row.failed || 0);
     if (!failed) return '<span class="muted">-</span>';
     const samples = await broadcastFailedSamples(env, row.id);
-    const detail = samples.map((sample) => `<span>${h(String(sample.user_id))}：${h(String(sample.error || "").slice(0, 80))}</span>`).join("");
+    // 用 wrap 让长错误换行显示，否则 112px 的列会把 Telegram 返回的错误整行省略掉。
+    const detail = samples.map((sample) => `<span class="wrap">${h(String(sample.user_id))}：${h(String(sample.error || "").slice(0, 160))}</span>`).join("");
     return `<details><summary><span class="badge red">${failed}</span></summary><div class="cell-lines">${detail || '<span class="muted">无明细</span>'}</div></details>`;
 }
 
@@ -4454,7 +4509,7 @@ ${option("all", `全部用户（${allCount} 人）`, "all")}${option("verified",
 
     const body = `${messages}${runningCard}
 <div class="card"><h2>群发记录</h2><p class="muted">只记录群发任务本身，不会写进收件箱，因此不会污染用户往来记录。失败数可点开看前几条明细。</p>
-<div class="table-wrap responsive-wrap" style="--table-min:960px" tabindex="0" aria-label="群发记录，可横向滚动"><table class="broadcast-table responsive-table"><caption class="sr-only">群发通知记录</caption><thead><tr>
+<div class="table-wrap responsive-wrap" style="--table-min:1120px" tabindex="0" aria-label="群发记录，可横向滚动"><table class="broadcast-table responsive-table"><caption class="sr-only">群发通知记录</caption><thead><tr>
 <th scope="col">任务</th><th scope="col">内容</th><th scope="col">范围</th><th scope="col">目标</th><th scope="col">成功</th><th scope="col">失败</th><th scope="col">状态</th>
 </tr></thead><tbody>${historyRows.length ? historyRows.join("") : '<tr><td data-span="full" colspan="7" class="muted">还没有群发记录。</td></tr>'}</tbody></table></div></div>`;
 
