@@ -1,4 +1,4 @@
-name = "tg-dualbot-cloudflare"
+name = "tc044"
 main = "worker.js"
 compatibility_date = "2026-07-08"
 
@@ -7,32 +7,12 @@ compatibility_date = "2026-07-08"
 [triggers]
 crons = ["* * * * *"]
 
+# D1 绑定。database_id 必须是真实的，写成占位符会导致 wrangler deploy 报 10021。
 [[d1_databases]]
 binding = "DB"
 database_name = "tg-dualbot-db"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "fce83635-4b57-4d04-bf5e-8392007f7446"
 
-[vars]
-# Set this after deployment, for example:
-# PUBLIC_BASE_URL = "https://tg-dualbot-cloudflare.your-subdomain.workers.dev"
-PUBLIC_BASE_URL = ""
-
-# Cloudflare Turnstile site key. The secret key must be set with:
-# wrangler secret put TURNSTILE_SECRET_KEY
-TURNSTILE_SITE_KEY = ""
-
-# Optional fallback. Prefer editing admin IDs from the panel after first deploy,
-# or set as a secret with: wrangler secret put ADMIN_CHAT_IDS
-ADMIN_CHAT_IDS = ""
-
-# Message control mode: web, topic, or both.
-CONTROL_MODE = "web"
-
-# Telegram supergroup ID with Topics/Forum enabled, for CONTROL_MODE=topic/both.
-TOPIC_GROUP_ID = ""
-
-# Topic creation policy: after_verify or first_message.
-TOPIC_CREATE_POLICY = "after_verify"
-
-# Sync Web panel and private admin replies into the user's Telegram topic.
-TOPIC_SYNC_WEB_REPLIES = "true"
+# 这里刻意不写 [vars]。PUBLIC_BASE_URL、TURNSTILE_SITE_KEY、ADMIN_CHAT_IDS 等变量
+# 全部在 Cloudflare Dashboard 的「设置 → 变量和机密」里维护。
+# wrangler deploy 会用配置文件里的值覆盖 Dashboard 上的同名变量，写进来就会把线上配置清空。

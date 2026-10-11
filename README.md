@@ -46,7 +46,7 @@
 
 ### 普通变量
 
-普通变量可以直接放在 `wrangler.toml` 的 `[vars]`，也可以在 Cloudflare Dashboard 的项目环境变量里添加。
+普通变量全部在 Cloudflare Dashboard 的「设置 → 变量和机密」里填写，本项目的 `wrangler.toml` 刻意不写 `[vars]`。
 
 | 变量名 | 示例 | 必填 | 使用方法 |
 |---|---|---|---|
@@ -61,18 +61,9 @@
 | `FP_AUTO_BLOCK_ENABLED` | `false` | 否 | 指纹自动拉黑开关，默认关闭。仅对「指纹黑名单」状态的标签生效。后台设置页保存的值优先。 |
 | `FP_AUTO_BLOCK_MIN_SCORE` | `95` | 否 | 自动拉黑的最低分数，取值 60~100。仅在自动拉黑开启时生效。 |
 
-`wrangler.toml` 示例：
+Dashboard 填写位置：Worker → **设置** → **变量和机密**，键名用上表的变量名，值照着示例列填。
 
-```toml
-[vars]
-PUBLIC_BASE_URL = "https://你的-worker或pages地址"
-TURNSTILE_SITE_KEY = "0x4AAAAA_example"
-ADMIN_CHAT_IDS = "123456789"
-CONTROL_MODE = "both"
-TOPIC_GROUP_ID = "-1001234567890"
-TOPIC_CREATE_POLICY = "after_verify"
-TOPIC_SYNC_WEB_REPLIES = "true"
-```
+`wrangler.toml` 里不要加 `[vars]`：`wrangler deploy` 会用配置文件里的值覆盖 Dashboard 上的同名变量。写成空值就会把线上配置清空，机器人会因为缺少 `PUBLIC_BASE_URL` 和 `TURNSTILE_SITE_KEY` 而直接失效，而且不会报任何错。
 
 ### Secrets
 
@@ -684,7 +675,7 @@ tg-dualbot-cloudflare/
 │  ├─ main = "worker.js"：Workers 入口。
 │  ├─ [[d1_databases]]：D1 绑定，binding 必须是 DB。
 │  ├─ [triggers]：Cron 表达式，每分钟推进一批群发任务，改了要重新部署才生效。
-│  └─ [vars]：PUBLIC_BASE_URL、TURNSTILE_SITE_KEY、ADMIN_CHAT_IDS、CONTROL_MODE、TOPIC_GROUP_ID 等普通变量。
+│  └─ 不写 [vars]：普通变量全部在 Cloudflare Dashboard 的「设置 → 变量和机密」里维护。
 ├─ worker.js
 │  ├─ export default.fetch()：Workers 入口。
 │  ├─ handleRequest()：统一路由分发。
@@ -737,7 +728,9 @@ tg-dualbot-cloudflare/
 
 ## 配置项和密钥
 
-### `wrangler.toml` 普通变量
+### 普通变量（在 Dashboard 配置）
+
+这些变量不写进 `wrangler.toml`，全部在 Cloudflare Dashboard 的「设置 → 变量和机密」里维护。
 
 | 名称 | 示例 | 说明 |
 |---|---|---|
@@ -807,7 +800,7 @@ database_id = "这里填 Cloudflare 输出的 database_id"
 2. 进入 `Turnstile`。
 3. 创建 Widget。
 4. Hostname 填你的 Workers、Pages 或自定义域名。
-5. 复制 Site Key 到 `wrangler.toml` 的 `TURNSTILE_SITE_KEY`。
+5. 复制 Site Key 到 Dashboard 的 `TURNSTILE_SITE_KEY` 变量（Worker → 设置 → 变量和机密）。
 6. Secret Key 后面用 `wrangler secret put TURNSTILE_SECRET_KEY` 写入。
 
 初始化 D1：
@@ -829,24 +822,20 @@ npm run check
 1. 修改 `wrangler.toml`：
 
 ```toml
-name = "tg-dualbot-cloudflare"
+name = "tc044"
 main = "worker.js"
 compatibility_date = "2026-07-08"
+
+[triggers]
+crons = ["* * * * *"]
 
 [[d1_databases]]
 binding = "DB"
 database_name = "tg-dualbot-db"
 database_id = "你的 D1 database_id"
-
-[vars]
-PUBLIC_BASE_URL = "https://你的-worker地址"
-TURNSTILE_SITE_KEY = "你的 Turnstile Site Key"
-ADMIN_CHAT_IDS = "123456789"
-CONTROL_MODE = "both"
-TOPIC_GROUP_ID = "-1001234567890"
-TOPIC_CREATE_POLICY = "after_verify"
-TOPIC_SYNC_WEB_REPLIES = "true"
 ```
+
+`name` 要和 Dashboard 上实际的 Worker 名一致，`database_id` 必须是真实的 32 位 ID，写占位符会在部署时报 `10021`。变量不要写进 `[vars]`，去 Dashboard 的「设置 → 变量和机密」填。
 
 2. 写入 Secrets：
 
@@ -1088,7 +1077,7 @@ npm run db:upgrade:fingerprint-v2
 ## 安全建议
 
 - 不要把 `BOT_TOKEN`、`PANEL_PASSWORD`、`PANEL_SECRET`、`TELEGRAM_SECRET_TOKEN`、`TURNSTILE_SECRET_KEY` 写入 README 或提交到 GitHub。
-- `wrangler.toml` 只放普通变量；敏感值使用 Cloudflare Secrets。
+- 普通变量和敏感值都放 Cloudflare Dashboard，`wrangler.toml` 不写 `[vars]`，避免部署时把线上配置覆盖成空值。
 - `PANEL_SECRET` 建议使用随机长字符串。
 - D1 Binding 名称必须是 `DB`，不要改成其他名称。
 - `TELEGRAM_SECRET_TOKEN` 建议使用随机字符串，并在设置 Webhook 时同步传入。
