@@ -2,6 +2,10 @@ name = "tc044"
 main = "worker.js"
 compatibility_date = "2026-07-08"
 
+# keep_vars 必须为 true。wrangler deploy 默认会用配置文件覆盖云端变量，配置里没有的会被删除；
+# 没有这一行，Dashboard 上的 PUBLIC_BASE_URL、TURNSTILE_SITE_KEY、ADMIN_CHAT_IDS 等会被清空。
+keep_vars = true
+
 # Cron triggers. 用来推进群发任务：每分钟发一批 40 人，没有进行中的任务时 handler 直接返回。
 # Cloudflare 只支持 5 段式 cron，不支持带秒的 6 段写法，所以最细粒度就是每分钟。
 [triggers]
