@@ -2226,9 +2226,13 @@ function detectClientOs() {
 }
 function detectBrowserEngine() {
     const ua = String(navigator.userAgent || "");
-    if (/Firefox\//i.test(ua)) return "Gecko";
-    if (/Edg\//i.test(ua) || /Chrome\//i.test(ua) || /Chromium\//i.test(ua)) return "Blink";
-    if (/Safari\//i.test(ua) && !/Chrome\//i.test(ua)) return "WebKit";
+    // 这段脚本整体位于模板字符串内，正则里的斜杠必须写成 \\/ 才能在浏览器里得到 \/。
+    // 只写 \/ 会被模板字符串求值成 /，渲染出去变成 /Firefox//i.test(ua)——
+    // 语法仍合法（正则除以标识符 i），但一执行就抛 ReferenceError，
+    // 连带整个设备指纹采集一起失败，所以这里不能写成单反斜杠。
+    if (/Firefox\\//i.test(ua)) return "Gecko";
+    if (/Edg\\//i.test(ua) || /Chrome\\//i.test(ua) || /Chromium\\//i.test(ua)) return "Blink";
+    if (/Safari\\//i.test(ua) && !/Chrome\\//i.test(ua)) return "WebKit";
     return "Unknown";
 }
 function collectCanvasDigest() {
