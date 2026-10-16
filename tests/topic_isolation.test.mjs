@@ -313,6 +313,10 @@ const inboundEnv = {
                 async first() {
                     if (sql.includes("SELECT value FROM settings WHERE key=?")) return null;
                     if (sql.includes("SELECT * FROM users WHERE user_id=?")) return inboundUser;
+                    // 长窗口限流与重复内容闸各多一条计数查询，这里统一给「未超限」的返回值，
+                    // 本用例要验的是转发与话题隔离，不是限流本身（限流由 antispam.test.mjs 覆盖）。
+                    if (sql.includes("AS long_hits")) return { long_hits: 1 };
+                    if (sql.includes("AS repeat_hits")) return { repeat_hits: 0 };
                     if (sql.includes("SELECT COUNT(*) FROM rate_events")) return { count: 1 };
                     if (sql.includes("SELECT * FROM inbox_messages WHERE id=?")) return inboxRow;
                     if (sql.includes("FROM users u LEFT JOIN")) return inboundUser;

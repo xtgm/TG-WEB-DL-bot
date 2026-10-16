@@ -310,6 +310,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 用户管理 | `/users` 展示用户资料、验证状态、备注、封禁状态、HTTP IPv4/IPv6、UDP WebRTC IPv4/IPv6、ASN、设备系统。 |
 | 全体通知 | `/broadcast` 一次性群发给私聊过 Bot 的用户，可选全部用户或仅已验证用户；由 Cron 每分钟发一批，单条失败不影响其他人。 |
 | 广告拦截 | `/rules` 支持维护私聊关键词，命中后可自动封禁并通知管理员。 |
+| 刷屏拦截 | 两道自动闸：限流分短窗口（10 秒 4 条）与长窗口（1 小时 30 条），专门拦「每条隔一两分钟、慢慢刷十几个小时」这种躲开短窗口的节奏；同一段文本 1 小时内重复 5 次即判刷屏，直接封禁并通知管理员。阈值走后台设置，可随时调。 |
 | Cloudflare 验证记录 | `/verifications` 展示 Turnstile 通过记录、HTTP IP、WebRTC UDP 结果、国家、机房、ASN、User-Agent。 |
 | WebRTC 人工身份标签 | 管理员使用现有备注手动标记 WebRTC；后续 WebRTC 精确命中只显示“待人工确认”，点击“确认同一人”后才建立持久标签关联。 |
 | V2 设备与网络指纹 | 验证页采集 Canvas、WebGL、Audio、字体、CPU/屏幕、UA-CH、时区语言、Telegram 客户端和 HTTP/WebRTC 网络层；四向量加权比较，覆盖跨浏览器、跨设备、跨平台识别；默认只生成候选，标记与确认都必须由管理员手动完成，自动拉黑需另行开启。 |
@@ -670,6 +671,7 @@ tg-dualbot-cloudflare/
 │  ├─ npm run test:verification-client：渲染并检查验证页内嵌采集脚本。
 │  ├─ npm run test:broadcast：运行群发的口径、限速、游标推进和失败处理测试。
 │  ├─ npm run test:topic-isolation：运行话题归属、Webhook 幂等与静默隔离测试。
+│  ├─ npm run test:antispam：运行限流双档与重复内容刷屏拦截测试。
 │  ├─ npm run test:log-translation：运行日志翻译、来源标注与分类切页测试。
 │  └─ npm run pages:deploy：Pages Direct Upload。
 ├─ wrangler.toml

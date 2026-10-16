@@ -1672,6 +1672,7 @@ const LOG_MESSAGE_GROUPS = {
     "unhandled request error": "system",
     "BOT_TOKEN is missing": "system",
     "failed to run broadcast batch": "system",
+    "repetitive spam blocked": "system",
 };
 
 // 标签顺序即页面上的展示顺序：先看业务（群发、转发、话题），再看校验与系统。
@@ -1713,6 +1714,10 @@ const LOG_PAGE_LIMIT_STEP = 100;
 const LOG_PAGE_LIMIT_MAX = 500;
 
 const LOG_MESSAGE_TRANSLATIONS = {
+    "repetitive spam blocked": {
+        title: "重复内容刷屏已拦截",
+        reason: "同一用户在短时间内反复发送同一段内容，已停止转发并自动拉黑。",
+    },
     "unhandled request error": {
         title: "请求处理异常",
         reason: "Worker 处理请求时出现了未捕获异常。",
@@ -1834,6 +1839,7 @@ const LOG_MESSAGE_CONTEXT = {
     "failed to handle Telegram command": [["command", "命令"], ["chatId", "发起者"]],
     "fingerprint v2 processing failed": [["userId", "用户"]],
     "fingerprint auto block": [["userId", "用户"]],
+    "repetitive spam blocked": [["userId", "用户"], ["repeatCount", "重复次数"]],
 };
 
 // 把 data 里指定的字段拼成「任务 #1 · 用户 218855950」这样的来源行；字段全空时返回空串。
@@ -3410,8 +3416,24 @@ async function relayUserMessage(env, message) {
         await sendUserNoticeSafely(env, message.chat.id, "发送太快了，请稍后再试。", { userId: user.id, stage: "rate-limit" });
         return;
     }
-    const inboxId = await createInboxMessage(env, message);
     const textValue = messageText(message);
+    // 重复内容闸。慢速刷屏（每条隔一两分钟）能躲开所有按速率设的闸门，
+    // 但躲不开「内容是同一句」这个特征，所以这一闸按内容判而不是按频率判。
+    const repeatCount = await repetitiveSpamCount(env, user.id, textValue);
+    if (repeatCount) {
+        await setBlock(env, user.id, true, `重复刷屏：${repeatCount} 次相同内容`);
+        const repeatNotice = `[重复刷屏已拉黑]\nuser_id: <code>${user.id}</code>\n重复次数：${repeatCount}\n内容：${h(textValue.slice(0, 300))}`;
+        await notifyAdmins(env, repeatNotice);
+        // 纯 topic 模式下 notifyAdmins 会跳过，改往该用户已有话题补一条，避免自动拉黑无人知情。
+        if (!(await webRelayEnabled(env))) {
+            const posted = await postToExistingUserTopic(env, Number(user.id), `[重复刷屏已拉黑]\nuser_id: ${user.id}\n重复次数：${repeatCount}\n内容：${textValue.slice(0, 300)}`);
+            if (!posted) await notifyAdmins(env, repeatNotice, {}, { force: true });
+        }
+        await logEvent(env, "warn", "repetitive spam blocked", { userId: Number(user.id), repeatCount });
+        await sendUserNoticeSafely(env, message.chat.id, "检测到重复内容刷屏，已停止转发。", { userId: user.id, stage: "repeat-spam" });
+        return;
+    }
+    const inboxId = await createInboxMessage(env, message);
     const hits = await spamHits(env, textValue);
     const autoBlock = await getSetting(env, "spam_auto_block", "true");
     if (hits.length && autoBlock !== "false") {
@@ -3752,14 +3774,33 @@ async function spamHits(env, textValue) {
     return words.filter((word) => word && textLower.includes(word.toLowerCase()));
 }
 
+// 两档限流。只做短窗口时，每 90 秒发一条的骚扰永远落在 10 秒窗口之外，
+// 能连续刷十几个小时不被拦，所以长窗口这一档是必需的。
+// 表按长窗口清理、短窗口计数带 ts 条件筛，否则短窗口的清理会把长窗口的记录一起删掉。
 async function rateLimited(env, userId) {
     const windowSeconds = Number(await getSetting(env, "rate_window_seconds", "10"));
     const maxMessages = Number(await getSetting(env, "rate_max_messages", "4"));
+    const longWindowSeconds = Number(await getSetting(env, "rate_long_window_seconds", "3600"));
+    const longMaxMessages = Number(await getSetting(env, "rate_long_max_messages", "30"));
     const now = Math.floor(Date.now() / 1000);
-    await env.DB.prepare("DELETE FROM rate_events WHERE user_id=? AND ts<?").bind(userId, now - windowSeconds).run();
+    await env.DB.prepare("DELETE FROM rate_events WHERE user_id=? AND ts<?").bind(userId, now - longWindowSeconds).run();
     await env.DB.prepare("INSERT INTO rate_events(user_id, ts) VALUES(?, ?)").bind(userId, now).run();
-    const count = await scalar(env, "SELECT COUNT(*) FROM rate_events WHERE user_id=?", userId);
-    return count > maxMessages;
+    const count = await scalar(env, "SELECT COUNT(*) FROM rate_events WHERE user_id=? AND ts>=?", userId, now - windowSeconds);
+    if (count > maxMessages) return true;
+    const longCount = await scalar(env, "SELECT COUNT(*) AS long_hits FROM rate_events WHERE user_id=? AND ts>=?", userId, now - longWindowSeconds);
+    return longCount > longMaxMessages;
+}
+
+// 同一段文本反复发。调用点在写入 inbox 之前，所以这里查到的是「之前已经发过几次」，
+// 达到上限就说明当前这条又是同一句，直接拦掉。
+async function repetitiveSpamCount(env, userId, textValue) {
+    const text = String(textValue || "").trim();
+    if (text.length < 2) return 0;
+    const windowMinutes = Number(await getSetting(env, "repeat_window_minutes", "60"));
+    const maxRepeat = Number(await getSetting(env, "repeat_max_messages", "5"));
+    const since = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+    const count = await scalar(env, "SELECT COUNT(*) AS repeat_hits FROM inbox_messages WHERE user_id=? AND text=? AND created_at>=?", userId, text, since);
+    return count >= maxRepeat ? count : 0;
 }
 
 async function getSetting(env, key, fallback = "") {
