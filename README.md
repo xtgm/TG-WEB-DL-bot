@@ -316,7 +316,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | Telegram 话题控制 | `CONTROL_MODE=topic/both` 时，验证通过后可自动创建用户专属群话题，管理员在话题里回复会回到用户。 |
 | 多管理员 | `ADMIN_CHAT_IDS` 最多取 3 个管理员 ID，可通过后台设置或 Cloudflare 环境变量配置；话题回复也只允许这些 ID。 |
 | 后台登录 | `/login` 使用用户名、密码和 Cookie Session；密码、Bot Token 等敏感值通过 Cloudflare Secrets 保存。 |
-| 日志与健康检查 | `/logs` 查看运行事件；`/health` 返回 `ok`。 |
+| 日志与健康检查 | `/logs` 按类型切页查看运行事件，每条附中文说明与处理建议；`/health` 返回 `ok`。 |
 
 <a id="web-panel"></a>
 
@@ -333,7 +333,7 @@ Pages 模式使用 `functions/[[path]].js`，它会把所有请求交给 `worker
 | 广告拦截 | `/rules` | 一行一个关键词；可开关命中后自动封禁。自动封禁会把命中的关键词写入封禁原因。 |
 | CF 验证记录 | `/verifications` | 展示每次 Turnstile 通过后的 IP、UDP/WebRTC、ASN、运营商、地区、设备系统、User-Agent 和时间。 |
 | 设置 | `/settings` | 保存管理员 Chat ID、欢迎语、控制模式、话题群与话题策略、指纹识别两个开关；查看公开地址、验证入口和 Secrets 配置状态（区分必填与可选）。 |
-| 日志 | `/logs` | 查看最近事件并附中文说明与处理建议，例如转发失败、通知失败、Turnstile 校验失败。 |
+| 日志 | `/logs` | 按类型切页查看：全部 / 群发 / 消息转发 / 话题 / 验证与指纹 / 命令 / 系统；窗口内存在未收录的历史日志时另出「其他」。每类独立取最近 100 条并可加载更多，所以一次群发产生的几十条发送失败不会把其他类型挤掉。每条日志都有中文说明与处理建议。 |
 | 退出 | `/logout` | 清除后台 Cookie。 |
 
 <a id="moderation"></a>
@@ -669,6 +669,8 @@ tg-dualbot-cloudflare/
 │  ├─ npm run test:fingerprint：运行 V2 算法和 D1 有界性测试。
 │  ├─ npm run test:verification-client：渲染并检查验证页内嵌采集脚本。
 │  ├─ npm run test:broadcast：运行群发的口径、限速、游标推进和失败处理测试。
+│  ├─ npm run test:topic-isolation：运行话题归属、Webhook 幂等与静默隔离测试。
+│  ├─ npm run test:log-translation：运行日志翻译、来源标注与分类切页测试。
 │  └─ npm run pages:deploy：Pages Direct Upload。
 ├─ wrangler.toml
 │  ├─ name：Worker 名称。

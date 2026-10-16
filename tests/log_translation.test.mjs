@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { handleRequest, localizeLogEntry } from "../worker.js";
 
 const chatNotFound = localizeLogEntry(
@@ -80,6 +81,9 @@ const logResponse = await handleRequest(new Request("https://example.test/logs",
         prepare(sql) {
             assert.match(String(sql), /FROM event_logs/);
             return {
+                bind() {
+                    return this;
+                },
                 async all() {
                     return {
                         results: [{
@@ -105,5 +109,105 @@ assert.match(logHtml, /chat not found/);
 // 来源标注必须出现在日志页上，否则几十条同名日志分不清是哪条触发的。
 assert.match(logHtml, /log-context/);
 assert.match(logHtml, /用户 987654321/);
+
+// ===== 分类切页（方案 C）：全量日志必须先归类、先有中文标题 =====
+{
+    const workerSource = readFileSync(new URL("../worker.js", import.meta.url), "utf8");
+    const usedMessages = [...workerSource.matchAll(/logEvent\(\s*env\s*,\s*"[a-z]+"\s*,\s*"([^"]+)"/g)].map((match) => match[1]);
+    assert.ok(usedMessages.length >= 20, "应能从 worker.js 提取到日志消息名，实际 " + usedMessages.length);
+    for (const message of new Set(usedMessages)) {
+        const entry = localizeLogEntry(message, "{}");
+        assert.ok(entry.category && entry.category !== "other", "日志缺少分类：" + message);
+        assert.notEqual(entry.title, message, "日志缺少中文标题：" + message);
+    }
+}
+
+const groupRows = [
+    {
+        id: 3,
+        level: "warn",
+        message: "broadcast send failed",
+        data: JSON.stringify({ broadcastId: 2, userId: 218855950, error: "Forbidden: bot was blocked by the user" }),
+        created_at: "2026-10-16T04:00:36.875Z",
+    },
+    {
+        id: 2,
+        level: "info",
+        message: "broadcast created",
+        data: JSON.stringify({ broadcastId: 2, audience: "verified", targetTotal: 337 }),
+        created_at: "2026-10-16T03:58:12.004Z",
+    },
+];
+
+function logsEnv(sink, extraStats = []) {
+    return {
+        PANEL_USER: panelUser,
+        PANEL_SECRET: panelSecret,
+        DB: {
+            prepare(sqlValue) {
+                const sql = String(sqlValue);
+                sink.push(sql);
+                return {
+                    bind() { return this; },
+                    async first() { return null; },
+                    async all() {
+                        if (sql.includes("GROUP BY message")) {
+                            return {
+                                results: [
+                                    { message: "broadcast send failed", c: 37 },
+                                    { message: "broadcast created", c: 1 },
+                                    ...extraStats,
+                                ],
+                            };
+                        }
+                        if (sql.includes("FROM event_logs")) return { results: groupRows };
+                        return { results: [] };
+                    },
+                };
+            },
+        },
+    };
+}
+
+// 会话 Cookie 与上面日志页渲染用的是同一个 token。
+const logRequest = (path) => new Request("https://example.test" + path, {
+    headers: { Cookie: "tg_dualbot_session=" + sessionToken },
+});
+
+const allSink = [];
+const allLogResponse = await handleRequest(logRequest("/logs"), logsEnv(allSink), {});
+assert.equal(allLogResponse.status, 200);
+const allLogHtml = await allLogResponse.text();
+assert.match(allLogHtml, /按类型切换查看/);
+for (const label of ["全部", "群发", "消息转发", "话题", "验证与指纹", "命令", "系统"]) {
+    assert.ok(allLogHtml.includes(label), "日志页缺少类型标签：" + label);
+}
+for (const header of ["级别", "事件", "说明与处理建议", "时间"]) {
+    assert.ok(allLogHtml.includes(header), "日志表缺少列：" + header);
+}
+assert.ok(allLogHtml.includes("群发单条发送失败"), "群发失败日志应显示中文标题");
+assert.ok(allSink.some((sql) => sql.includes("GROUP BY message")), "应统计各类型条数");
+assert.equal(allSink.some((sql) => sql.includes("message IN (")), false, "“全部”不应按类型过滤");
+
+const typeSink = [];
+const typeLogResponse = await handleRequest(logRequest("/logs?type=broadcast&limit=2"), logsEnv(typeSink), {});
+assert.equal(typeLogResponse.status, 200);
+const typeLogHtml = await typeLogResponse.text();
+assert.ok(typeSink.some((sql) => sql.includes("message IN (")), "选中类型后应只查该类型");
+assert.ok(typeSink.some((sql) => sql.includes("LIMIT ?")), "列表查询应带条数上限");
+assert.match(typeLogHtml, /加载更多/);
+
+// 历史遗留、当前代码已不再写入的日志落进「其他」，并单独出一个标签，
+// 这样“全部”的计数与各标签之和始终一致，不会有日志在页面上看不到。
+const otherSink = [];
+const otherLogResponse = await handleRequest(
+    logRequest("/logs?type=other"),
+    logsEnv(otherSink, [{ message: "legacy old event name", c: 5 }]),
+    {},
+);
+assert.equal(otherLogResponse.status, 200);
+assert.ok(otherSink.some((sql) => sql.includes("message NOT IN (")), "“其他”应按未收录 message 反向过滤");
+const otherLogHtml = await otherLogResponse.text();
+assert.ok(otherLogHtml.includes("其他"), "存在未收录日志时应出现“其他”标签");
 
 console.log("log translation tests passed");

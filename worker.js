@@ -1105,7 +1105,7 @@ td{padding:12px;min-width:0}tbody tr:last-child td{border-bottom:0}tbody tr:hove
 .verifications-table{table-layout:fixed}
 .verifications-table th:nth-child(1){width:76px}.verifications-table th:nth-child(2){width:162px}.verifications-table th:nth-child(3){width:230px}
 .verifications-table th:nth-child(4){width:192px}.verifications-table th:nth-child(6){width:132px}
-.logs-table{table-layout:fixed}.logs-table th:nth-child(1){width:96px}.logs-table th:nth-child(3){width:132px}
+.logs-table{table-layout:fixed}.logs-table th:nth-child(1){width:92px}.logs-table th:nth-child(3){width:400px}.logs-table th:nth-child(4){width:126px}
 .moderation-table{table-layout:fixed}
 .moderation-table th:nth-child(1){width:180px}.moderation-table th:nth-child(2){width:128px}.moderation-table th:nth-child(4){width:132px}.moderation-table th:nth-child(5){width:280px}
 .broadcast-table{table-layout:fixed}
@@ -1117,9 +1117,17 @@ td{padding:12px;min-width:0}tbody tr:last-child td{border-bottom:0}tbody tr:hove
 pre{max-width:100%;max-height:min(360px,60dvh);white-space:pre-wrap;overflow:auto;overflow-wrap:anywhere;background:#0d1729;color:#e5edf8;border-radius:10px;padding:13px;font-size:12px;line-height:1.55}
 .msg{background:#eff6ff;border:1px solid #bfdbfe;border-radius:9px;padding:10px 12px;color:#1e3a8a;font-weight:750;line-height:1.55}
 .log-body{display:grid;gap:8px;min-width:0}.log-body>b{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.log-hint{min-height:44px;display:flex;align-items:center;background:#eff6ff;border:1px solid #bfdbfe;border-radius:9px;padding:9px 12px;color:#1e3a8a;font-size:12px;font-weight:750;line-height:1.5}.log-hint.empty{background:#f8fafc;border-color:var(--line);color:var(--muted);font-weight:700}
+/* 处理建议块整块排版：长建议换行后左边缘与“处理建议：”对齐，不再出现标签与正文错位。 */
+.log-hint{min-height:44px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:9px;padding:10px 12px;color:#1e3a8a;font-size:12px;font-weight:750;line-height:1.65}.log-hint.empty{background:#f8fafc;border-color:var(--line);color:var(--muted);font-weight:700}
 /* 来源标注：任务号、用户 ID 等，让同名日志一眼能区分。 */
 .log-context{display:inline-block;margin:1px 0 3px;padding:3px 10px;border-radius:7px;background:#fef3c7;color:#92400e;font-size:12px;font-weight:850;line-height:1.5;overflow-wrap:anywhere;max-width:100%}
+.log-msg{color:#475467;font-size:12px;line-height:1.6}.log-msg b{color:#344054}
+/* 日志页类型标签：一次只显示一类，条数跟在类型名后面。 */
+.tabs{display:flex;gap:6px;flex-wrap:wrap;padding:2px 2px 0;border-bottom:2px solid var(--line);margin-bottom:16px}
+.tab{display:inline-flex;align-items:center;gap:8px;padding:11px 14px;border:2px solid transparent;border-bottom:0;border-radius:10px 10px 0 0;color:#475467;font-size:13px;font-weight:900;text-decoration:none}
+.tab:hover{background:#f2f5fa}
+.tab.on{background:#fff;border-color:var(--line);color:var(--blue);box-shadow:inset 0 -3px 0 0 var(--blue)}
+.tab .num{color:#94a3b8;font-weight:900;font-variant-numeric:tabular-nums}.tab.on .num{color:var(--blue)}
 details summary{display:flex;align-items:center;min-height:34px;cursor:pointer;font-weight:800;font-size:12px}
 code{overflow-wrap:anywhere;color:#1d4ed8}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @media(max-width:1180px){.metrics-grid{grid-template-columns:repeat(3,minmax(0,1fr))!important}}
@@ -1637,6 +1645,73 @@ async function settingsSave(request, env) {
     return redirect("/settings", request);
 }
 
+// 日志分类（按类型切页）。键是 logEvent 的 message，值是类型键；未收录的一律归入 other，
+// 保证旧版本写入、现在代码里已不存在的历史日志也能在“全部”里看到而不丢。
+const LOG_MESSAGE_GROUPS = {
+    "broadcast created": "broadcast",
+    "broadcast preview sent": "broadcast",
+    "broadcast cancelled": "broadcast",
+    "broadcast send failed": "broadcast",
+    "broadcast cursor already advanced": "broadcast",
+    "failed to relay user message": "relay",
+    "partial relay failure": "relay",
+    "failed to notify admin": "relay",
+    "failed to notify user": "relay",
+    "failed to relay topic message": "relay",
+    "failed to create topic from web": "topic",
+    "failed to send topic intro": "topic",
+    "failed to send current WebRTC identity label": "topic",
+    "failed to sync outbox to topic": "topic",
+    "failed to post notice to user topic": "topic",
+    "failed to complete topic verification": "topic",
+    "turnstile verification failed": "verify",
+    "fingerprint v2 processing failed": "verify",
+    "fingerprint auto block": "verify",
+    "failed to handle Telegram command": "command",
+    "failed to execute Telegram command": "command",
+    "unhandled request error": "system",
+    "BOT_TOKEN is missing": "system",
+    "failed to run broadcast batch": "system",
+};
+
+// 标签顺序即页面上的展示顺序：先看业务（群发、转发、话题），再看校验与系统。
+const LOG_GROUP_ORDER = ["broadcast", "relay", "topic", "verify", "command", "system"];
+
+const LOG_GROUP_LABELS = {
+    broadcast: "群发",
+    relay: "消息转发",
+    topic: "话题",
+    verify: "验证与指纹",
+    command: "命令",
+    system: "系统",
+    other: "其他",
+};
+
+// 每个类型的一句话说明，显示在列表上方。
+const LOG_GROUP_HINTS = {
+    broadcast: "任务创建、进度推进与逐条发送结果。",
+    relay: "用户入站消息与话题回复转发失败的记录。",
+    topic: "用户专属话题的创建、说明发送与同步失败。",
+    verify: "Turnstile 校验、指纹比对与自动拉黑。",
+    command: "Telegram 命令执行失败。",
+    system: "未捕获异常、配置缺失与 Cron 批次失败。",
+    other: "尚未归类的日志。",
+};
+
+// 反查表：类型键 → 该类型的全部 message，用于按类型过滤查询。
+const LOG_GROUP_MESSAGES = LOG_GROUP_ORDER.reduce((acc, key) => {
+    acc[key] = Object.keys(LOG_MESSAGE_GROUPS).filter((message) => LOG_MESSAGE_GROUPS[message] === key);
+    return acc;
+}, {});
+
+// 已收录的 message 全集，用于「其他」标签的反向过滤。
+const LOG_KNOWN_MESSAGES = Object.keys(LOG_MESSAGE_GROUPS);
+
+// 计数只统计最近这些条。日志表只增不删，用固定窗口统计可以避免每次打开页面都全表扫描。
+const LOG_STATS_WINDOW = 500;
+const LOG_PAGE_LIMIT_STEP = 100;
+const LOG_PAGE_LIMIT_MAX = 500;
+
 const LOG_MESSAGE_TRANSLATIONS = {
     "unhandled request error": {
         title: "请求处理异常",
@@ -1685,6 +1760,54 @@ const LOG_MESSAGE_TRANSLATIONS = {
     "failed to notify admin": {
         title: "通知管理员失败",
         reason: "机器人未能向某个管理员账号发送通知。",
+    },
+    "broadcast created": {
+        title: "群发任务已创建",
+        reason: "已创建群发任务，第一批立刻发送，其余由 Cron 每分钟推进一批。",
+    },
+    "broadcast preview sent": {
+        title: "群发预览已发送",
+        reason: "预览内容已发到管理员私聊，没有创建正式任务。",
+    },
+    "broadcast cancelled": {
+        title: "群发任务已取消",
+        reason: "管理员取消了进行中的群发任务，已经发出的消息无法撤回。",
+    },
+    "broadcast send failed": {
+        title: "群发单条发送失败",
+        reason: "该用户这一条没有发出去，其余用户不受影响。",
+    },
+    "broadcast cursor already advanced": {
+        title: "群发游标已被其他实例推进",
+        reason: "本批没有抢到乐观锁，说明同一时刻有另一个 Cron 实例在推进同一个任务。",
+    },
+    "failed to run broadcast batch": {
+        title: "群发批次执行失败",
+        reason: "Cron 推进群发任务时整体出错，本批没有发出，任务仍停留在进行中。",
+    },
+    "failed to notify user": {
+        title: "通知用户失败",
+        reason: "机器人向用户发送提示消息时失败，通常是对方屏蔽了机器人或已删除会话。",
+    },
+    "failed to post notice to user topic": {
+        title: "向用户话题补发通知失败",
+        reason: "该用户的话题当前不可用，通知没能补发进话题里。",
+    },
+    "failed to handle Telegram command": {
+        title: "Telegram 命令处理异常",
+        reason: "命令在分发阶段抛出了未捕获的错误。",
+    },
+    "failed to execute Telegram command": {
+        title: "Telegram 命令执行失败",
+        reason: "命令已经识别，但执行过程中出错，多为参数不对或目标用户不存在。",
+    },
+    "fingerprint v2 processing failed": {
+        title: "指纹 V2 处理失败",
+        reason: "本次验证的设备或网络指纹没能完成计算与落库，验证本身仍然通过。",
+    },
+    "fingerprint auto block": {
+        title: "命中指纹并自动拉黑",
+        reason: "该用户当前指纹命中了状态为“指纹黑名单”的标签，且分数达到自动拉黑阈值。",
     },
 };
 
@@ -1820,14 +1943,57 @@ export function localizeLogEntry(message, data = "") {
         reason,
         suggestion,
         context: logEntryContext(rawMessage, parsed),
+        // 分类键用于日志页按类型切页；未收录的 message 归入 other。
+        category: LOG_MESSAGE_GROUPS[rawMessage] || "other",
         rawMessage,
         rawData: prettyLogData(rawData),
     };
 }
 
+// 日志页：顶部按类型切换，一次只显示一类，每类独立取自己的条数，
+// 因此高频事件（例如一次群发产生的几十条发送失败）不会把其他类型挤出去。
 async function logsPage(request, env) {
-    const rows = await env.DB.prepare("SELECT * FROM event_logs ORDER BY id DESC LIMIT 200").all();
-    const bodyRows = (rows.results || []).map((r) => {
+    const url = new URL(request.url);
+    const requested = String(url.searchParams.get("type") || "").toLowerCase();
+    const activeType = requested === "all" || requested === "other" || LOG_GROUP_ORDER.includes(requested) ? requested : "all";
+    const requestedLimit = Number(url.searchParams.get("limit"));
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+        ? Math.min(Math.round(requestedLimit), LOG_PAGE_LIMIT_MAX)
+        : LOG_PAGE_LIMIT_STEP;
+
+    // 计数只在固定窗口内统计，避免日志表长期增长后每次打开页面都全表扫描。
+    const statRows = await env.DB.prepare(
+        "SELECT message, COUNT(*) AS c FROM (SELECT message FROM event_logs ORDER BY id DESC LIMIT ?) GROUP BY message",
+    ).bind(LOG_STATS_WINDOW).all();
+    const counts = { all: 0, other: 0 };
+    for (const key of LOG_GROUP_ORDER) counts[key] = 0;
+    for (const row of (statRows.results || [])) {
+        const category = LOG_MESSAGE_GROUPS[String(row.message || "")] || "other";
+        const value = Number(row.c || 0);
+        counts.all += value;
+        counts[category] += value;
+    }
+    const activeCount = activeType === "all" ? counts.all : (counts[activeType] || 0);
+
+    // 列表与计数共用同一个窗口，保证“共 X 条”和实际列出的条数对得上。
+    let listSql = `SELECT * FROM (SELECT * FROM event_logs ORDER BY id DESC LIMIT ${LOG_STATS_WINDOW})`;
+    const listBindings = [];
+    if (activeType === "other") {
+        // 历史遗留、当前代码已不再写入的 message 落在这里，用反向过滤取出。
+        listSql += ` WHERE message NOT IN (${LOG_KNOWN_MESSAGES.map(() => "?").join(",")})`;
+        listBindings.push(...LOG_KNOWN_MESSAGES);
+    } else {
+        const messages = LOG_GROUP_MESSAGES[activeType];
+        if (messages) {
+            listSql += ` WHERE message IN (${messages.map(() => "?").join(",")})`;
+            listBindings.push(...messages);
+        }
+    }
+    listBindings.push(limit);
+    const rows = await env.DB.prepare(listSql + " ORDER BY id DESC LIMIT ?").bind(...listBindings).all();
+    const entries = rows.results || [];
+
+    const bodyRows = entries.map((r) => {
         const translated = localizeLogEntry(r.message, r.data);
         const level = String(r.level || "").toLowerCase();
         const levelText = level === "error" ? "错误" : level === "warn" ? "警告" : level === "info" ? "信息" : (r.level || "日志");
@@ -1842,12 +2008,33 @@ async function logsPage(request, env) {
             ? `<div class="log-context">${h(translated.context)}</div>`
             : "";
         return `<tr>
-<td data-label="ID / 级别"><div class="cell"><span class="table-id">#${h(r.id)}</span><span class="badge ${levelClass}">${h(levelText)}</span></div></td>
-<td data-label="中文说明 / 原始日志" data-span="full"><div class="log-body"><b>${h(translated.title)}</b>${contextLine}<div class="muted" style="font-size:12px"><b>中文说明：</b>${h(translated.reason)}</div>${suggestion}<details><summary>查看原始日志</summary><pre>${h(original)}</pre></details></div></td>
+<td data-label="级别"><div class="cell"><span class="table-id">#${h(r.id)}</span><span class="badge ${levelClass}">${h(levelText)}</span></div></td>
+<td data-label="事件"><div class="log-body"><b>${h(translated.title)}</b>${contextLine}<div class="log-msg"><b>中文说明：</b>${h(translated.reason)}</div><details><summary>查看原始日志</summary><pre>${h(original)}</pre></details></div></td>
+<td data-label="说明与处理建议">${suggestion}</td>
 <td data-label="时间">${tableTime(r.created_at)}</td>
 </tr>`;
     }).join("");
-    return html(layout("日志", `<div class="card"><h2>最近日志</h2><p class="muted">系统会在页面中翻译常见错误并给出处理建议；原始日志完整保留在“查看原始日志”中。</p><div class="table-wrap responsive-wrap" style="--table-min:900px" tabindex="0" aria-label="最近系统日志，可横向滚动"><table class="logs-table responsive-table"><caption class="sr-only">最近系统日志</caption><thead><tr><th scope="col">ID / 级别</th><th scope="col">中文说明 / 原始日志</th><th scope="col">时间</th></tr></thead><tbody>${bodyRows || '<tr><td data-span="full" colspan="3" class="muted">暂无日志记录。</td></tr>'}</tbody></table></div></div>`));
+
+    const tab = (key, label, count) => {
+        const href = key === "all" ? "/logs" : `/logs?type=${key}`;
+        return `<a class="tab${activeType === key ? " on" : ""}" href="${href}">${h(label)}<span class="num">${Number(count || 0)}</span></a>`;
+    };
+    // 「其他」只在窗口内真的存在未收录日志时才出现，避免常驻一个永远为 0 的空标签。
+    const tabs = [
+        tab("all", "全部", counts.all),
+        ...LOG_GROUP_ORDER.map((key) => tab(key, LOG_GROUP_LABELS[key], counts[key])),
+        ...(counts.other > 0 ? [tab("other", LOG_GROUP_LABELS.other, counts.other)] : []),
+    ].join("");
+    const activeLabel = activeType === "all" ? "全部类型" : LOG_GROUP_LABELS[activeType];
+    const more = entries.length >= limit && limit < LOG_PAGE_LIMIT_MAX
+        ? `<a class="btn" href="/logs?type=${activeType}&limit=${limit + LOG_PAGE_LIMIT_STEP}">加载更多</a>`
+        : "";
+
+    const body = `<div class="card"><h2>按类型切换查看</h2><p class="muted">顶部标签一次只显示一类，每类独立取最近 ${limit} 条，不会被高频事件挤掉。计数基于最近 ${LOG_STATS_WINDOW} 条日志。原始日志完整保留在“查看原始日志”中。</p>
+<div class="tabs">${tabs}</div></div>
+<div class="card"><div class="toolbar"><div><h2>${h(activeLabel)}</h2><p class="muted">${h(LOG_GROUP_HINTS[activeType] || "")}共 ${activeCount} 条，当前显示 ${entries.length} 条。</p></div>${more}</div>
+<div class="table-wrap responsive-wrap" style="--table-min:1180px" tabindex="0" aria-label="系统日志，可横向滚动"><table class="logs-table responsive-table"><caption class="sr-only">系统日志</caption><thead><tr><th scope="col">级别</th><th scope="col">事件</th><th scope="col">说明与处理建议</th><th scope="col">时间</th></tr></thead><tbody>${bodyRows || '<tr><td data-span="full" colspan="4" class="muted">这一类暂时没有日志记录。</td></tr>'}</tbody></table></div></div>`;
+    return html(layout("日志", body));
 }
 
 async function verifyPage(request, env, token = "", error = "") {
