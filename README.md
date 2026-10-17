@@ -841,14 +841,9 @@ database_id = "你的 D1 database_id"
 
 `name` 要和 Dashboard 上实际的 Worker 名一致。变量不要写进 `[vars]`，去 Dashboard 的「设置 → 变量和机密」填。
 
-`database_id` 也不写进配置文件 —— 它是账号内部的资源标识，公开仓库不放这类信息。做法是在 Dashboard 的 **设置 → 构建** 里：
+`database_id` 直接写进 `wrangler.toml`。它只是资源编号，拿到也调不了任何 API —— 能调用账号的凭据是 Token / Global API Key，那些只放在 Dashboard 的 Secrets 里，不进仓库。写死还有一个原因：早先是靠构建命令里的 `sed` 从环境变量注入的，那条命令一旦在 Dashboard 上丢了，`REPLACE_WITH_D1_DATABASE_ID` 这个占位符就会原样进部署请求，报 `10021 binding DB of type d1 must have a valid database_id specified` 构建失败。写在文件里，部署路径就只剩 `npx wrangler deploy` 一步，不再有第二个环节可以丢。
 
-| 项 | 填什么 |
-|---|---|
-| 构建命令 | `sed -i "s\|REPLACE_WITH_D1_DATABASE_ID\|$D1_DATABASE_ID\|" wrangler.toml && npx wrangler deploy` |
-| 环境变量 | `D1_DATABASE_ID` = 你的 32 位 database_id，**勾选加密** |
-
-本地用 CLI 部署时，可以把 `database_id` 临时写进 `wrangler.toml`，但**不要提交**（`.gitignore` 没有覆盖它）；提交前用 `git diff` 确认一下。
+本地部署同理，不需要额外设置环境变量，`npx wrangler deploy` 直接用文件里的值。
 
 2. 写入 Secrets：
 
