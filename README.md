@@ -913,6 +913,14 @@ curl.exe "https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo"
 
 `allowed_updates` 必须包含 `callback_query`，否则管理员通知里的 inline 按钮无法回调。`my_chat_member` 用于接收“用户屏蔽/解除屏蔽机器人”的实时事件，屏蔽提醒与一键拉黑按钮依赖它；删掉这一项后屏蔽提醒不会再出现。
 
+如果 Webhook 已经设好、只是 `allowed_updates` 漏了这一项，不用重新跑上面的 curl，打开这个地址即可：
+
+```
+https://<PUBLIC_BASE_URL>/init/<TELEGRAM_SECRET_TOKEN>
+```
+
+页面会先读出当前订阅项，缺 `my_chat_member` 就补齐，再把 Telegram 返回的结果显示出来。它只增不改：Webhook 地址一律沿用 Telegram 里已存的原值，绝不自造新地址，所以最坏结果只是「没有变化」。已有这一项、或订阅项为空（空表示接收全部更新）时，页面只报告「无需改动」，不写任何东西。这个地址的密钥就是 `TELEGRAM_SECRET_TOKEN`，等同于后台凭据，不要外传。
+
 ### Telegram Mini App 验证
 
 验证提示默认优先使用 Telegram Mini App，并保留普通浏览器备用入口：
@@ -1084,6 +1092,10 @@ npm run db:upgrade:fingerprint-v2
 ### inline 按钮没有反应
 
 重新设置 Telegram Webhook，并确保 `allowed_updates` 包含 `callback_query`。
+
+### 屏蔽提醒不出现
+
+先确认 Webhook 的 `allowed_updates` 里有 `my_chat_member`，缺了就用 [Telegram Webhook 设置](#telegram-webhook-setup) 里的初始化地址补一次。补齐之后 Telegram 不会补推历史事件，需要再用账号屏蔽机器人一次才能看到提示。
 
 ### `PUBLIC_BASE_URL` 留空会怎样
 

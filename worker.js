@@ -65,6 +65,11 @@ export async function handleRequest(request, env, ctx) {
     if (path === "/health") {
         return text("ok");
     }
+    // 初始化 / 运维端点：路径里的密钥就是 TELEGRAM_SECRET_TOKEN，无需登录。
+    // 用途：把 Telegram Webhook 的订阅项补齐（漏掉 my_chat_member 时屏蔽提醒收不到）。
+    if (env.TELEGRAM_SECRET_TOKEN && path === `/init/${env.TELEGRAM_SECRET_TOKEN}`) {
+        return html(await webhookSubscriptionPage(env));
+    }
     if (path === "/telegram/webhook" && method === "POST") {
         return telegramWebhook(request, env);
     }
@@ -1034,6 +1039,58 @@ async function loginSubmit(request, env) {
     return response;
 }
 
+// 初始化端点：把 Telegram Webhook 的订阅项补齐（目前是为了 my_chat_member）。
+// 只增不改：url 一律用 getWebhookInfo 读到的原值回传，也绝不在没有 Webhook 时凭空造一个，
+// 所以最坏结果只是「没有变化」，不会把 Webhook 指到别的地址上。
+async function webhookSubscriptionPage(env) {
+    const REQUIRED = "my_chat_member";
+    let info;
+    try {
+        info = await tgCall(env, "getWebhookInfo");
+    } catch (error) {
+        return layout("Webhook 订阅检查", `<div class="card"><h2>无法查询 Webhook 信息</h2><p class="muted">${h(String(error?.message || error))}</p></div>`);
+    }
+    const result = info?.result || {};
+    const currentUrl = String(result.url || "");
+    const current = Array.isArray(result.allowed_updates) ? result.allowed_updates.map(String) : [];
+
+    if (!currentUrl) {
+        return layout("Webhook 订阅检查", `<div class="card"><h2>尚未设置 Webhook</h2><p class="muted">Telegram 侧还没有 Webhook 地址，请先按 README 的「Telegram Webhook 设置」完成一次设置，再回到本页检查。</p></div>`);
+    }
+
+    const head = `<div class="card"><h2>当前状态</h2><dl class="kv"><dt>Webhook 地址</dt><dd>${h(currentUrl)}</dd><dt>订阅项</dt><dd>${current.length ? h(current.join("、")) : "全部（未限定）"}</dd></dl></div>`;
+    const nextStep = `<p class="muted">下一层验证：用任意账号把机器人屏蔽一次，看该用户话题里是否出现「🚫 用户屏蔽了机器人」提示与「🚫 拉黑该用户」按钮。Telegram 不会补推历史事件，所以这一步必须真的屏蔽一次。</p>`;
+
+    // 空数组表示「接收全部更新」，my_chat_member 本来就在其中，无需改动。
+    if (current.length === 0 || current.includes(REQUIRED)) {
+        const why = current.length === 0 ? "当前订阅全部更新" : `当前订阅项已包含 ${h(REQUIRED)}`;
+        return layout("Webhook 订阅检查", `${head}<div class="card"><h2>无需改动 ✅</h2><p class="muted">${why}，屏蔽提醒可以直接工作。</p>${nextStep}</div>`);
+    }
+
+    const desired = [...current, REQUIRED];
+    try {
+        await tgCall(env, "setWebhook", {
+            url: currentUrl,
+            secret_token: env.TELEGRAM_SECRET_TOKEN || "",
+            allowed_updates: desired,
+        });
+    } catch (error) {
+        return layout("Webhook 订阅检查", `${head}<div class="card"><h2>补齐失败</h2><p class="muted">${h(String(error?.message || error))}</p><p class="muted">Webhook 保持原样，没有改动。</p></div>`);
+    }
+
+    // 复读一次，用 Telegram 的返回值确认结果，而不是相信自己刚发出去的请求。
+    let after = desired;
+    try {
+        const recheck = await tgCall(env, "getWebhookInfo");
+        if (Array.isArray(recheck?.result?.allowed_updates)) after = recheck.result.allowed_updates.map(String);
+    } catch (error) {
+        // 复读失败不影响结论：setWebhook 已经返回成功。
+    }
+    const repaired = after.includes(REQUIRED);
+    await logEvent(env, "info", "webhook subscription repaired", { before: current, after });
+    return layout("Webhook 订阅检查", `${head}<div class="card"><h2>${repaired ? "已补齐 ✅" : "可能未生效"}</h2><dl class="kv"><dt>补前</dt><dd>${h(current.join("、"))}</dd><dt>补后</dt><dd>${h(after.join("、"))}</dd></dl>${nextStep}</div>`);
+}
+
 function loginPage(error = "") {
     return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>登录 · TG DualBot</title><style>
@@ -1675,6 +1732,7 @@ const LOG_MESSAGE_GROUPS = {
     "repetitive spam blocked": "system",
     "user blocked the bot": "system",
     "user unblocked the bot": "system",
+    "webhook subscription repaired": "system",
 };
 
 // 标签顺序即页面上的展示顺序：先看业务（群发、转发、话题），再看校验与系统。
@@ -1727,6 +1785,10 @@ const LOG_MESSAGE_TRANSLATIONS = {
     "user unblocked the bot": {
         title: "用户解除屏蔽机器人",
         reason: "用户重新允许机器人发送消息，此前因屏蔽而失败的通知可以再次送达。",
+    },
+    "webhook subscription repaired": {
+        title: "补齐 Telegram Webhook 订阅",
+        reason: "通过初始化端点把 Webhook 的订阅项补齐，新增了此前缺失的更新类型（例如 my_chat_member）。",
     },
     "unhandled request error": {
         title: "请求处理异常",
