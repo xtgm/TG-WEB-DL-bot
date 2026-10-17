@@ -97,12 +97,20 @@ function makeDb(state) {
                         return { meta: { changes: 1 } };
                     }
                     if (sql.includes("UPDATE broadcasts SET cursor_user_id=?")) {
-                        const [cursor, sent, failed, , id, expectedCursor] = bindings;
+                        // 认领式（只推进游标）：绑定是 [新游标, 时间, id, 期望游标]。
+                        const [cursor, , id, expectedCursor] = bindings;
                         const b = state.broadcasts.find((x) => x.id === Number(id));
                         if (!b || b.cursor_user_id !== Number(expectedCursor) || b.status !== "running") {
                             return { meta: { changes: 0 } };
                         }
                         b.cursor_user_id = Number(cursor);
+                        return { meta: { changes: 1 } };
+                    }
+                    if (sql.includes("UPDATE broadcasts SET sent_count=sent_count+?")) {
+                        // 计数累加：认领之后本批的成败单独累加，不带游标条件。
+                        const [sent, failed, , id] = bindings;
+                        const b = state.broadcasts.find((x) => x.id === Number(id));
+                        if (!b) return { meta: { changes: 0 } };
                         b.sent_count += Number(sent);
                         b.failed_count += Number(failed);
                         return { meta: { changes: 1 } };
@@ -117,7 +125,7 @@ function makeDb(state) {
                         return { meta: { changes: 0 } };
                     }
                     if (sql.includes("INSERT INTO event_logs")) {
-                        state.logs.push(JSON.parse(bindings[2] || "{}"));
+                        state.logs.push({ level: bindings[0], message: bindings[1], data: JSON.parse(bindings[2] || "{}") });
                         return { meta: { changes: 1 } };
                     }
                     throw new Error("unexpected write: " + sql);
@@ -265,7 +273,7 @@ await ok("单条 403 记为失败并继续发，失败名单落在 recipients", 
     assert.deepEqual(sent, [1001, 1003, 1005]);
 });
 
-await ok("游标已被别的实例推进时，本批不再重复推进", async () => {
+await ok("另一个实例已认领同一批时，本批一条都不发", async () => {
     const users = buildUsers(3);
     const state = makeState(users);
     const broadcast = {
@@ -284,21 +292,38 @@ await ok("游标已被别的实例推进时，本批不再重复推进", async (
     const sentIds = [];
     globalThis.fetch = makeFetch(new Set(), sentIds);
 
-    // 模拟本批发送期间另一个 Cron 实例已经把游标推到了末尾。
-    const originalFetchCall = globalThis.fetch;
-    globalThis.fetch = async (...args) => {
-        broadcast.cursor_user_id = 1003;
-        return originalFetchCall(...args);
+    // 模拟：本实例读出这一批人之后、认领之前，另一个执行体已经把同一批认领走了（游标推到末尾）。
+    // 真实事故（2026-10-11 与 10-16 两次群发）：两个执行体读到同一个游标，同一批人各发一遍，
+    // 用户收到两条同样的通知，而且后一个实例的计数被一并丢弃、失败数少报。
+    const db = makeDb(state);
+    const originalPrepare = db.prepare.bind(db);
+    db.prepare = (sqlValue) => {
+        const statement = originalPrepare(sqlValue);
+        if (String(sqlValue).includes("SELECT user_id FROM users WHERE user_id > ?")) {
+            const originalAll = statement.all.bind(statement);
+            statement.all = async (...args) => {
+                const result = await originalAll(...args);
+                broadcast.cursor_user_id = 1003;
+                return result;
+            };
+        }
+        return statement;
     };
 
-    await runOnce(state, { DB: makeDb(state), ADMIN_CHAT_IDS: String(ADMIN_ID), BOT_TOKEN: "test-token" });
+    await runOnce(state, { DB: db, ADMIN_CHAT_IDS: String(ADMIN_ID), BOT_TOKEN: "test-token" });
 
-    assert.equal(sentIds.length, 3);
-    // 乐观锁没抢到，游标保持别人写入的值，计数不叠加。
+    // 关键：抢不到认领就一条都不发 —— 用户不会收到第二条同样的通知。
+    assert.equal(sentIds.length, 0);
+    assert.equal(state.recipients.length, 0);
+    // 游标保持别人写入的值，计数不叠加。
     assert.equal(broadcast.cursor_user_id, 1003);
     assert.equal(broadcast.sent_count, 0);
+    assert.equal(broadcast.failed_count, 0);
     assert.equal(broadcast.status, "running");
-    assert.ok(state.logs.some((entry) => entry.broadcastId === 4));
+    assert.ok(
+        state.logs.some((entry) => entry.message === "broadcast cursor already advanced"),
+        "抢不到认领时应留下 broadcast cursor already advanced 日志",
+    );
 });
 
 await ok("没有进行中的任务时 Cron 直接返回，不碰数据库发送逻辑", async () => {

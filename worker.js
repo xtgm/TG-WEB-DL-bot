@@ -1842,7 +1842,7 @@ const LOG_MESSAGE_CONTEXT = {
     "repetitive spam blocked": [["userId", "用户"], ["repeatCount", "重复次数"]],
 };
 
-// 把 data 里指定的字段拼成「任务 #1 · 用户 218855950」这样的来源行；字段全空时返回空串。
+// 把 data 里指定的字段拼成「任务 #1 · 用户 24680」这样的来源行；字段全空时返回空串。
 function logEntryContext(message, parsed) {
     const fields = LOG_MESSAGE_CONTEXT[String(message || "")];
     if (!fields || !parsed || typeof parsed !== "object") return "";
@@ -1895,6 +1895,11 @@ export function localizeLogEntry(message, data = "") {
     } else if (combined.includes("bot was blocked by the user")) {
         reason = "目标用户已经屏蔽机器人，因此机器人无法向其发送消息。";
         suggestion = "让用户重新打开机器人并点击 /start，解除屏蔽后再发送。";
+    } else if (combined.includes("user is deactivated")) {
+        // 和「屏蔽」同为 403，但原因完全不同：账号已注销，用户自己也没法恢复。
+        // 缺这条映射时页面会退回兜底文案，看日志的人分不清是屏蔽、注销还是配置问题。
+        reason = "目标用户的 Telegram 账号已经注销，机器人无法再向该账号发送任何消息。";
+        suggestion = "账号已不存在，无需处理；想让名单干净可以在用户管理里清理这类账号。";
     } else if (combined.includes("can't initiate conversation")) {
         reason = "用户尚未主动启动机器人，Telegram 不允许 Bot 主动发起私聊。";
         suggestion = "让用户先打开机器人并发送 /start。";
@@ -4629,6 +4634,20 @@ async function runBroadcastBatch(env, broadcast) {
         return;
     }
 
+    // 先认领这一批，再发送：把游标推进到本批最后一人，条件是游标仍是我们刚刚读到的值。
+    // 抢不到说明另一个执行体已经在处理同一批（创建时 waitUntil 与 Cron 会撞在一起），
+    // 这时必须一条都不发 —— 2026-10-11 与 10-16 两次群发就是这样把同一批人各发了一遍，
+    // 用户收到两条同样的通知；而且旧写法把计数和游标写在同一条 UPDATE 里，抢不到时计数一并被丢弃，
+    // 那两次任务的失败数分别少报了 2 条和 3 条。
+    const claimed = await env.DB.prepare(
+        "UPDATE broadcasts SET cursor_user_id=?, updated_at=? WHERE id=? AND cursor_user_id=? AND status='running'",
+    ).bind(targets[targets.length - 1], nowIso(), broadcast.id, cursor).run();
+
+    if (!claimed?.meta?.changes) {
+        await logEvent(env, "warn", "broadcast cursor already advanced", { broadcastId: Number(broadcast.id), cursor });
+        return;
+    }
+
     let sent = 0;
     let failed = 0;
     for (let i = 0; i < targets.length; i += 1) {
@@ -4637,16 +4656,10 @@ async function runBroadcastBatch(env, broadcast) {
         if (i < targets.length - 1) await sleep(BROADCAST_BATCH_INTERVAL_MS);
     }
 
-    // 乐观锁：只在游标未被别的 Cron 实例推进时才生效，避免并发批次把同一批人发两遍。
-    const claimed = await env.DB.prepare(
-        "UPDATE broadcasts SET cursor_user_id=?, sent_count=sent_count+?, failed_count=failed_count+?, updated_at=? " +
-        "WHERE id=? AND cursor_user_id=? AND status='running'",
-    ).bind(targets[targets.length - 1], sent, failed, nowIso(), broadcast.id, cursor).run();
-
-    if (!claimed?.meta?.changes) {
-        await logEvent(env, "warn", "broadcast cursor already advanced", { broadcastId: Number(broadcast.id), cursor });
-        return;
-    }
+    // 计数独立累加，不再带游标条件：认领之后这一批的成败只归本次执行，不会再被并发判断丢掉。
+    await env.DB.prepare(
+        "UPDATE broadcasts SET sent_count=sent_count+?, failed_count=failed_count+?, updated_at=? WHERE id=?",
+    ).bind(sent, failed, nowIso(), broadcast.id).run();
 
     if (targets.length < BROADCAST_BATCH_SIZE) await finishBroadcast(env, broadcast);
 }

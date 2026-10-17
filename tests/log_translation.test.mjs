@@ -19,12 +19,25 @@ const broadcastFailed = localizeLogEntry(
     "broadcast send failed",
     JSON.stringify({
         broadcastId: 7,
-        userId: 218855950,
+        userId: 24680,
         error: 'Telegram sendMessage failed: {"ok":false,"error_code":403,"description":"Forbidden: bot was blocked by the user"}',
     }),
 );
-assert.equal(broadcastFailed.context, "任务 7 · 用户 218855950");
+assert.equal(broadcastFailed.context, "任务 7 · 用户 24680");
 assert.match(broadcastFailed.reason, /屏蔽机器人/);
+
+// 账号已注销是另一种 403：没有专属映射时页面只会显示「这条日志没有对应的处理建议」，
+// 看的人会以为是屏蔽或配置问题。这两种原因的处置完全不同，必须分开翻译。
+const broadcastDeactivated = localizeLogEntry(
+    "broadcast send failed",
+    JSON.stringify({
+        broadcastId: 2,
+        userId: 24680,
+        error: 'Telegram sendMessage failed: {"ok":false,"error_code":403,"description":"Forbidden: user is deactivated"}',
+    }),
+);
+assert.match(broadcastDeactivated.reason, /注销|停用/);
+assert.match(broadcastDeactivated.suggestion, /账号|名单/);
 
 // 字段缺失的跳过，不产出空标签。
 const broadcastCreated = localizeLogEntry(
@@ -127,7 +140,7 @@ const groupRows = [
         id: 3,
         level: "warn",
         message: "broadcast send failed",
-        data: JSON.stringify({ broadcastId: 2, userId: 218855950, error: "Forbidden: bot was blocked by the user" }),
+        data: JSON.stringify({ broadcastId: 2, userId: 24680, error: "Forbidden: bot was blocked by the user" }),
         created_at: "2026-10-16T04:00:36.875Z",
     },
     {
