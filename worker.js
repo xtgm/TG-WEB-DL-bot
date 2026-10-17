@@ -1039,9 +1039,15 @@ async function loginSubmit(request, env) {
     return response;
 }
 
-// 初始化端点：把 Telegram Webhook 的订阅项补齐（目前是为了 my_chat_member）。
-// 只增不改：url 一律用 getWebhookInfo 读到的原值回传，也绝不在没有 Webhook 时凭空造一个，
-// 所以最坏结果只是「没有变化」，不会把 Webhook 指到别的地址上。
+// 运维端点：把 Telegram Webhook 的订阅项补齐（目前是为了 my_chat_member）。
+// 原则是「只增不改」：
+//   1) url 一律用 getWebhookInfo 读到的原值回传，也绝不在没有 Webhook 时凭空造一个；
+//   2) getWebhookInfo 能读回来的字段（max_connections、ip_address）原样带回 —— setWebhook
+//      是覆盖式语义，没传的字段可能被重置（文档只对 allowed_updates 写明「不传则沿用上次」，
+//      max_connections 则直接写着默认 40），带回去才能保证线上设置不被悄悄改动；
+//   3) 读不回来的不猜：getWebhookInfo 不返回证书本体，所以线上有自签证书就直接拒绝执行、
+//      提示手动处理，宁可不动也不把 Webhook 弄挂；
+//   4) 绝不传 drop_pending_updates（传 True 会丢掉还没推给机器人的更新）。
 async function webhookSubscriptionPage(env) {
     const REQUIRED = "my_chat_member";
     let info;
@@ -1053,12 +1059,25 @@ async function webhookSubscriptionPage(env) {
     const result = info?.result || {};
     const currentUrl = String(result.url || "");
     const current = Array.isArray(result.allowed_updates) ? result.allowed_updates.map(String) : [];
+    const maxConnections = Number(result.max_connections);
+    const hasMaxConnections = Number.isFinite(maxConnections) && maxConnections > 0;
+    const ipAddress = String(result.ip_address || "");
+    const customCert = result.has_custom_certificate === true;
 
     if (!currentUrl) {
         return layout("Webhook 订阅检查", `<div class="card"><h2>尚未设置 Webhook</h2><p class="muted">Telegram 侧还没有 Webhook 地址，请先按 README 的「Telegram Webhook 设置」完成一次设置，再回到本页检查。</p></div>`);
     }
 
-    const head = `<div class="card"><h2>当前状态</h2><dl class="kv"><dt>Webhook 地址</dt><dd>${h(currentUrl)}</dd><dt>订阅项</dt><dd>${current.length ? h(current.join("、")) : "全部（未限定）"}</dd></dl></div>`;
+    const rows = [
+        `<dt>Webhook 地址</dt><dd>${h(currentUrl)}</dd>`,
+        `<dt>订阅项</dt><dd>${current.length ? h(current.join("、")) : "全部（未限定）"}</dd>`,
+        `<dt>最大连接数</dt><dd>${hasMaxConnections ? maxConnections : "默认（40）"}</dd>`,
+        `<dt>固定 IP</dt><dd>${ipAddress ? h(ipAddress) : "未设置"}</dd>`,
+        `<dt>自签证书</dt><dd>${customCert ? "有" : "无"}</dd>`,
+        `<dt>待处理更新</dt><dd>${Number(result.pending_update_count) || 0} 条</dd>`,
+    ];
+    if (result.last_error_message) rows.push(`<dt>上次错误</dt><dd>${h(String(result.last_error_message))}</dd>`);
+    const head = `<div class="card"><h2>当前状态</h2><dl class="kv">${rows.join("")}</dl></div>`;
     const nextStep = `<p class="muted">下一层验证：用任意账号把机器人屏蔽一次，看该用户话题里是否出现「🚫 用户屏蔽了机器人」提示与「🚫 拉黑该用户」按钮。Telegram 不会补推历史事件，所以这一步必须真的屏蔽一次。</p>`;
 
     // 空数组表示「接收全部更新」，my_chat_member 本来就在其中，无需改动。
@@ -1067,19 +1086,29 @@ async function webhookSubscriptionPage(env) {
         return layout("Webhook 订阅检查", `${head}<div class="card"><h2>无需改动 ✅</h2><p class="muted">${why}，屏蔽提醒可以直接工作。</p>${nextStep}</div>`);
     }
 
-    const desired = [...current, REQUIRED];
+    // 自签证书：证书本体读不回来，重新 setWebhook 时无法原样带回，调用会把证书清掉、Webhook 直接失效。
+    if (customCert) {
+        return layout("Webhook 订阅检查", `${head}<div class="card"><h2>未做改动 ⚠️</h2><p class="muted">线上 Webhook 使用了自签证书。getWebhookInfo 不返回证书本体，重新 setWebhook 时无法原样带回，自动调用会把证书清掉、Webhook 立刻失效，所以这里不处理。请按 README 的「Telegram Webhook 设置」手动执行一次，并在命令里带上 certificate 证书文件。</p></div>`);
+    }
+
+    const payload = {
+        url: currentUrl,
+        secret_token: env.TELEGRAM_SECRET_TOKEN || "",
+        allowed_updates: [...current, REQUIRED],
+    };
+    // 读到了才带：读到什么原样回传，没读到就不写，免得把「默认」写成一个具体值。
+    if (hasMaxConnections) payload.max_connections = maxConnections;
+    if (ipAddress) payload.ip_address = ipAddress;
+    const carried = Object.keys(payload).filter((key) => key !== "allowed_updates");
+
     try {
-        await tgCall(env, "setWebhook", {
-            url: currentUrl,
-            secret_token: env.TELEGRAM_SECRET_TOKEN || "",
-            allowed_updates: desired,
-        });
+        await tgCall(env, "setWebhook", payload);
     } catch (error) {
         return layout("Webhook 订阅检查", `${head}<div class="card"><h2>补齐失败</h2><p class="muted">${h(String(error?.message || error))}</p><p class="muted">Webhook 保持原样，没有改动。</p></div>`);
     }
 
     // 复读一次，用 Telegram 的返回值确认结果，而不是相信自己刚发出去的请求。
-    let after = desired;
+    let after = payload.allowed_updates;
     try {
         const recheck = await tgCall(env, "getWebhookInfo");
         if (Array.isArray(recheck?.result?.allowed_updates)) after = recheck.result.allowed_updates.map(String);
@@ -1088,7 +1117,7 @@ async function webhookSubscriptionPage(env) {
     }
     const repaired = after.includes(REQUIRED);
     await logEvent(env, "info", "webhook subscription repaired", { before: current, after });
-    return layout("Webhook 订阅检查", `${head}<div class="card"><h2>${repaired ? "已补齐 ✅" : "可能未生效"}</h2><dl class="kv"><dt>补前</dt><dd>${h(current.join("、"))}</dd><dt>补后</dt><dd>${h(after.join("、"))}</dd></dl>${nextStep}</div>`);
+    return layout("Webhook 订阅检查", `${head}<div class="card"><h2>${repaired ? "已补齐 ✅" : "可能未生效"}</h2><dl class="kv"><dt>补前订阅项</dt><dd>${h(current.join("、"))}</dd><dt>补后订阅项</dt><dd>${h(after.join("、"))}</dd><dt>原样带走</dt><dd>${h(carried.join("、"))}</dd></dl>${nextStep}</div>`);
 }
 
 function loginPage(error = "") {

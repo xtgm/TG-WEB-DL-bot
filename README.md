@@ -919,7 +919,11 @@ curl.exe "https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo"
 https://<PUBLIC_BASE_URL>/init/<TELEGRAM_SECRET_TOKEN>
 ```
 
-页面会先读出当前订阅项，缺 `my_chat_member` 就补齐，再把 Telegram 返回的结果显示出来。它只增不改：Webhook 地址一律沿用 Telegram 里已存的原值，绝不自造新地址，所以最坏结果只是「没有变化」。已有这一项、或订阅项为空（空表示接收全部更新）时，页面只报告「无需改动」，不写任何东西。这个地址的密钥就是 `TELEGRAM_SECRET_TOKEN`，等同于后台凭据，不要外传。
+页面会先读出 Webhook 的完整现状（地址、订阅项、最大连接数、固定 IP、有无自签证书、待处理更新数），缺 `my_chat_member` 才补齐，再把 Telegram 返回的结果显示出来。
+
+它只增不改：地址一律沿用 Telegram 里已存的原值，绝不自造；`max_connections` 与 `ip_address` 读到什么就原样带回（`setWebhook` 是覆盖式语义，漏传的字段可能被重置成默认值）；也绝不传 `drop_pending_updates`，不会丢掉还没推给机器人的更新。如果线上用了自签证书，因为证书本体读不回来、无法原样带回，页面会拒绝执行并提示手动处理，不会把证书清掉。已有 `my_chat_member`、或订阅项为空（空表示接收全部更新）时，页面只报告「无需改动」，不写任何东西。
+
+这个地址的密钥就是 `TELEGRAM_SECRET_TOKEN`，等同于后台凭据，不要外传。
 
 ### Telegram Mini App 验证
 
