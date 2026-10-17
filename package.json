@@ -15,6 +15,7 @@
     "test:topic-isolation": "node tests/topic_isolation.test.mjs",
     "test:broadcast": "node tests/broadcast.test.mjs",
     "test:antispam": "node tests/antispam.test.mjs",
+    "test:bot-block-notice": "node tests/bot_block_notice.test.mjs",
     "db:apply": "wrangler d1 execute tg-dualbot-db --file=./migrations/0001_initial.sql --remote",
     "db:upgrade:verification": "wrangler d1 execute tg-dualbot-db --file=./migrations/0002_verification_gate.sql --remote",
     "db:upgrade:topics": "wrangler d1 execute tg-dualbot-db --file=./migrations/0003_topic_mode.sql --remote",

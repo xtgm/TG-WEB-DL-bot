@@ -569,6 +569,8 @@ Telegram 群要求：
 
 Web 后台的用户管理页继续提供创建话题、重建话题、解绑话题、静默隔离和删除用户操作；名单管理页可查看封禁与隔离原因并直接解除。
 
+用户屏蔽机器人时，该用户话题里（尚未创建话题则发到管理员私聊）会实时出现「🚫 用户屏蔽了机器人」提示和「🚫 拉黑该用户」按钮，点一下即可拉黑；解除屏蔽不会触发提示。该功能依赖 Webhook 订阅 `my_chat_member`。
+
 <a id="routes"></a>
 
 ## 路由表
@@ -900,7 +902,7 @@ npm run pages:deploy
 curl.exe -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" `
   -F "url=<PUBLIC_BASE_URL>/telegram/webhook" `
   -F "secret_token=<TELEGRAM_SECRET_TOKEN>" `
-  -F "allowed_updates=[`"message`",`"edited_message`",`"callback_query`"]"
+  -F "allowed_updates=[`"message`",`"edited_message`",`"callback_query`",`"my_chat_member`"]"
 ```
 
 检查 Webhook：
@@ -909,7 +911,7 @@ curl.exe -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" `
 curl.exe "https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo"
 ```
 
-`allowed_updates` 必须包含 `callback_query`，否则管理员通知里的 inline 按钮无法回调。
+`allowed_updates` 必须包含 `callback_query`，否则管理员通知里的 inline 按钮无法回调。`my_chat_member` 用于接收“用户屏蔽/解除屏蔽机器人”的实时事件，屏蔽提醒与一键拉黑按钮依赖它；删掉这一项后屏蔽提醒不会再出现。
 
 ### Telegram Mini App 验证
 
@@ -996,6 +998,13 @@ npx wrangler d1 execute tg-dualbot-db --remote --command "SELECT user_id,verifie
 ```powershell
 npx wrangler d1 execute tg-dualbot-db --remote --command "SELECT id,user_id,http_ip,http_ip_version,udp_status,asn,created_at FROM ip_verifications ORDER BY id DESC LIMIT 10"
 ```
+
+### 8. 屏蔽提醒与一键拉黑
+
+1. 用任意账号打开机器人，然后把机器人屏蔽。
+2. 该用户的话题里会立刻出现「🚫 用户屏蔽了机器人」提示和「🚫 拉黑该用户」按钮（尚未创建话题的用户则发到管理员私聊）。
+3. 点按钮后用户进入黑名单。
+4. 用户解除屏蔽时不会产生提示。
 
 <a id="upgrade"></a>
 

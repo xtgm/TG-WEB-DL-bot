@@ -1673,6 +1673,8 @@ const LOG_MESSAGE_GROUPS = {
     "BOT_TOKEN is missing": "system",
     "failed to run broadcast batch": "system",
     "repetitive spam blocked": "system",
+    "user blocked the bot": "system",
+    "user unblocked the bot": "system",
 };
 
 // 标签顺序即页面上的展示顺序：先看业务（群发、转发、话题），再看校验与系统。
@@ -1717,6 +1719,14 @@ const LOG_MESSAGE_TRANSLATIONS = {
     "repetitive spam blocked": {
         title: "重复内容刷屏已拦截",
         reason: "同一用户在短时间内反复发送同一段内容，已停止转发并自动拉黑。",
+    },
+    "user blocked the bot": {
+        title: "用户屏蔽了机器人",
+        reason: "用户主动屏蔽了机器人，之后机器人无法再向该用户发送任何消息。",
+    },
+    "user unblocked the bot": {
+        title: "用户解除屏蔽机器人",
+        reason: "用户重新允许机器人发送消息，此前因屏蔽而失败的通知可以再次送达。",
     },
     "unhandled request error": {
         title: "请求处理异常",
@@ -2714,6 +2724,10 @@ async function isSilentlyIsolatedPrivateUpdate(env, update) {
 }
 
 async function processTelegramUpdate(env, update) {
+    if (update.my_chat_member) {
+        await handleBotChatMemberUpdate(env, update.my_chat_member);
+        return;
+    }
     if (update.callback_query) {
         await handleCallbackQuery(env, update.callback_query);
         return;
@@ -2754,6 +2768,39 @@ async function processTelegramUpdate(env, update) {
     await relayUserMessage(env, message);
 }
 
+// 用户屏蔽/解除屏蔽机器人时，Telegram 会推送 my_chat_member（仅私聊场景）。
+// 私聊里 bot 与用户的关系只有「member（正常）」与「非 member（被屏蔽）」两种，
+// 所以判据取「新状态不是 member」：不依赖 Telegram 具体用哪个字符串
+// （kicked / restricted / left 都能覆盖），也天然把「解除屏蔽」排除在外，不会误报。
+async function handleBotChatMemberUpdate(env, updated) {
+    const chat = updated?.chat;
+    if (chat?.type !== "private") return;
+    const userId = Number(chat.id);
+    if (!Number.isSafeInteger(userId) || userId <= 0) return;
+    const oldStatus = String(updated?.old_chat_member?.status || "");
+    const newStatus = String(updated?.new_chat_member?.status || "");
+    const blocked = newStatus !== "member";
+    // 原始状态一并留痕：日后若出现意料之外的取值，日志里能直接查到。
+    await logEvent(env, "info", blocked ? "user blocked the bot" : "user unblocked the bot", { userId, oldStatus, newStatus });
+    if (!blocked) return;
+
+    const user = await getUser(env, userId);
+    // 已经在黑名单里就不再重复打扰，但上面那条日志照写，便于回看屏蔽时间线。
+    if (user?.blocked) return;
+
+    const text = [
+        "🚫 用户屏蔽了机器人",
+        `用户 ID：<code>${h(userId)}</code>`,
+        `昵称：${h(user?.full_name || "-")}`,
+        `用户名：${user?.username ? "@" + h(user.username) : "无"}`,
+        "",
+        "该用户此后收不到机器人的任何消息。点下面的按钮可以把他加入黑名单。",
+    ].join("\n");
+    const replyMarkup = { inline_keyboard: [[{ text: "🚫 拉黑该用户", callback_data: `topicadmin:ban:${userId}` }]] };
+    // 通知只给管理员：已有话题就发进该用户的话题；从未交互过、没有话题的就退回管理员私聊。
+    const posted = await postToExistingUserTopic(env, userId, text, { reply_markup: replyMarkup, parse_mode: "HTML" });
+    if (!posted) await notifyAdmins(env, text, { reply_markup: replyMarkup });
+}
 
 async function controlMode(env) {
     const fromDb = await getSetting(env, "control_mode", "");
@@ -3548,7 +3595,8 @@ async function notifyAdmins(env, textValue, extraPayload = {}, options = {}) {
 }
 
 // 只往已经存在的话题发通知；不创建、不重建、不解绑任何话题，也不写入消息记录表。
-async function postToExistingUserTopic(env, userId, textValue) {
+// extraPayload 用于附加按钮等可选字段；不传时行为与原先完全一致。
+async function postToExistingUserTopic(env, userId, textValue, extraPayload = {}) {
     if (!(await topicEnabled(env))) return false;
     const user = await getUser(env, userId);
     const chatId = Number(user?.topic_chat_id || 0);
@@ -3560,6 +3608,7 @@ async function postToExistingUserTopic(env, userId, textValue) {
             message_thread_id: threadId,
             text: String(textValue || "").slice(0, 3900),
             disable_web_page_preview: true,
+            ...extraPayload,
         });
         return true;
     } catch (error) {
