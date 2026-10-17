@@ -2873,24 +2873,49 @@ async function handleBotChatMemberUpdate(env, updated) {
     const blocked = newStatus !== "member";
     // 原始状态一并留痕：日后若出现意料之外的取值，日志里能直接查到。
     await logEvent(env, "info", blocked ? "user blocked the bot" : "user unblocked the bot", { userId, oldStatus, newStatus });
-    if (!blocked) return;
 
     const user = await getUser(env, userId);
-    // 已经在黑名单里就不再重复打扰，但上面那条日志照写，便于回看屏蔽时间线。
-    if (user?.blocked) return;
-
-    const text = [
-        "🚫 用户屏蔽了机器人",
+    const who = [
         `用户 ID：<code>${h(userId)}</code>`,
         `昵称：${h(user?.full_name || "-")}`,
         `用户名：${user?.username ? "@" + h(user.username) : "无"}`,
+    ];
+
+    if (blocked) {
+        // 已经在黑名单里就不再重复打扰，但上面那条日志照写，便于回看屏蔽时间线。
+        if (user?.blocked) return;
+        const text = [
+            "🚫 用户屏蔽了机器人",
+            ...who,
+            "",
+            "该用户此后收不到机器人的任何消息。点下面的按钮可以把他加入黑名单。",
+        ].join("\n");
+        const replyMarkup = { inline_keyboard: [[{ text: "🚫 拉黑该用户", callback_data: `topicadmin:ban:${userId}` }]] };
+        // 通知只给管理员：已有话题就发进该用户的话题；从未交互过、没有话题的就退回管理员私聊。
+        const posted = await postToExistingUserTopic(env, userId, text, { reply_markup: replyMarkup, parse_mode: "HTML" });
+        if (!posted) await notifyAdmins(env, text, { reply_markup: replyMarkup });
+        return;
+    }
+
+    // 解除屏蔽：与屏蔽对称地发一条通知。Telegram 对同一个 my_chat_member 事件推两次
+    // （实测屏蔽是 member→kicked、解除屏蔽是 kicked→member），这里不依赖客户端是否自动补发
+    // /start —— 走 /start 那条路会漏掉不会触发它的用户。
+    // 按钮只在确实处于黑名单时才挂：屏蔽→拉黑→解封是最常见的顺序，那一刻正好需要一键放出来。
+    const text = [
+        "✅ 用户解除了对机器人的屏蔽",
+        ...who,
         "",
-        "该用户此后收不到机器人的任何消息。点下面的按钮可以把他加入黑名单。",
+        user?.blocked
+            ? "该用户现在可以重新收到机器人的消息，但他仍在黑名单里。点下面的按钮可以把他移出黑名单。"
+            : "该用户现在可以重新收到机器人的消息。",
     ].join("\n");
-    const replyMarkup = { inline_keyboard: [[{ text: "🚫 拉黑该用户", callback_data: `topicadmin:ban:${userId}` }]] };
-    // 通知只给管理员：已有话题就发进该用户的话题；从未交互过、没有话题的就退回管理员私聊。
-    const posted = await postToExistingUserTopic(env, userId, text, { reply_markup: replyMarkup, parse_mode: "HTML" });
-    if (!posted) await notifyAdmins(env, text, { reply_markup: replyMarkup });
+    const unbanMarkup = user?.blocked
+        ? { inline_keyboard: [[{ text: "♻️ 取消拉黑", callback_data: `topicadmin:unban:${userId}` }]] }
+        : null;
+    const extra = { parse_mode: "HTML" };
+    if (unbanMarkup) extra.reply_markup = unbanMarkup;
+    const posted = await postToExistingUserTopic(env, userId, text, extra);
+    if (!posted) await notifyAdmins(env, text, unbanMarkup ? { reply_markup: unbanMarkup } : {});
 }
 
 async function controlMode(env) {

@@ -104,7 +104,8 @@ const originalFetch = globalThis.fetch;
     );
 }
 
-// 2. 解除屏蔽：同一个事件也会推，但绝不能当成屏蔽来通知。
+// 2. 解除屏蔽：也发通知，但内容必须与屏蔽区分开，且不能误判成屏蔽。
+//    这个用户不在黑名单里，所以不该挂「取消拉黑」按钮。
 {
     const state = baseState({
         user_id: USER_ID,
@@ -121,7 +122,12 @@ const originalFetch = globalThis.fetch;
         globalThis.fetch = originalFetch;
     }
 
-    assert.equal(state.calls.filter((call) => call.method === "sendMessage").length, 0);
+    const notices = state.calls.filter((call) => call.method === "sendMessage");
+    assert.equal(notices.length, 1, "解除屏蔽应发出通知");
+    assert.equal(Number(notices[0].payload.chat_id), TOPIC_GROUP);
+    assert.equal(Number(notices[0].payload.message_thread_id), 4242);
+    assert.match(notices[0].payload.text, /解除/);
+    assert.equal(notices[0].payload.reply_markup, undefined, "不在黑名单时不该挂按钮");
     assert.ok(
         state.logs.some((entry) => entry.message === "user unblocked the bot"),
         "解除屏蔽应写入 user unblocked the bot 日志",
@@ -193,6 +199,57 @@ const originalFetch = globalThis.fetch;
 
     assert.equal(state.calls.length, 0);
     assert.ok(state.logs.some((entry) => entry.message === "user blocked the bot"));
+}
+
+// 6. 解除屏蔽时他还在黑名单里（屏蔽→拉黑→解封这个常见顺序）：通知上挂「取消拉黑」按钮。
+//    按钮复用现成的 topicadmin:unban 回调，不新增任何回调代码。
+{
+    const state = baseState({
+        user_id: USER_ID,
+        username: "blocked_user",
+        full_name: "Blocked User",
+        blocked: 1,
+        topic_chat_id: TOPIC_GROUP,
+        topic_thread_id: 4242,
+    });
+    globalThis.fetch = makeFetch(state);
+    try {
+        await handleTelegramUpdate(makeEnv(state), blockUpdate(7006, "member", "kicked"));
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+
+    const notice = state.calls.find((call) => call.method === "sendMessage");
+    assert.ok(notice, "在黑名单里时解除屏蔽也要发通知");
+    const button = notice.payload.reply_markup.inline_keyboard.flat()[0];
+    assert.equal(button.callback_data, `topicadmin:unban:${USER_ID}`);
+    assert.ok(
+        state.logs.some((entry) => entry.message === "user unblocked the bot"),
+        "解除屏蔽仍要留痕",
+    );
+}
+
+// 7. 解除屏蔽 + 从没交互过、没有话题：退回管理员私聊，按钮照挂（他在黑名单里时）。
+{
+    const state = baseState({
+        user_id: USER_ID,
+        username: "blocked_user",
+        full_name: "Blocked User",
+        blocked: 1,
+        topic_chat_id: null,
+        topic_thread_id: null,
+    });
+    globalThis.fetch = makeFetch(state);
+    try {
+        await handleTelegramUpdate(makeEnv(state), blockUpdate(7007, "member", "kicked"));
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+
+    const notice = state.calls.find((call) => call.method === "sendMessage");
+    assert.ok(notice, "没有话题时应退回管理员私聊通知");
+    assert.equal(Number(notice.payload.chat_id), ADMIN_ID);
+    assert.equal(notice.payload.reply_markup.inline_keyboard.flat()[0].callback_data, `topicadmin:unban:${USER_ID}`);
 }
 
 console.log("bot block notice tests passed");
